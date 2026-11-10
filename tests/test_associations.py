@@ -1137,6 +1137,11 @@ def test_a_read_only_store_can_rank_but_refuses_maintenance_and_reset(tmp_path: 
     with pytest.raises(AssociationStoreError, match="open read-only"):
         write_meta(reader, META_LAST_SCAN_MS, "1")
     with pytest.raises(AssociationStoreError, match="open read-only"):
+        recompute_associations(reader)
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        delete_association_database(reader)
+    assert path.exists(), "a read-only handle never deletes the database file"
+    with pytest.raises(AssociationStoreError, match="open read-only"):
         backfill(reader, str(tmp_path / "state.db"))
     reader.close()
 

@@ -949,14 +949,6 @@ def _open_alias(store: AssociationStore, skill_id: int, name: str, at_ms: int) -
     )
 
 
-def _close_aliases(store: AssociationStore, skill_id: int, at_ms: int) -> None:
-    """Close every open alias row of one skill."""
-    store.conn.execute(
-        "UPDATE skill_alias SET valid_to_ms = ? WHERE skill_id = ? AND valid_to_ms IS NULL",
-        (at_ms, skill_id),
-    )
-
-
 def _ensure_open_alias(store: AssociationStore, skill_id: int, name: str, at_ms: int) -> None:
     """Open an alias row for a name only when no open one exists."""
     row = store.conn.execute(
@@ -1282,6 +1274,7 @@ def recompute_associations(store: AssociationStore) -> int:
     they were inserted in, so the result is bit-identical to the incremental path rather than merely
     close to it.
     """
+    _require_writable(store)
     rows = store.conn.execute(
         """SELECT le.skill_id AS skill_id, le.prompt_event_id AS prompt_id,
                   le.observed_ms AS observed_ms, le.strength AS strength, pe.terms AS terms
@@ -1540,8 +1533,11 @@ def delete_association_database(store: AssociationStore) -> None:
     """Delete the association database itself: the file, its WAL and its shared-memory sibling.
 
     This is the documented reset that loses only learned data. The store is closed by the call and
-    must not be used afterwards; reopening the path creates an empty version-1 database.
+    must not be used afterwards; reopening the path creates an empty version-1 database. A read-only
+    handle refuses, because opening read-only is a promise not to destroy the file: open the store
+    writable to delete it, which is what every other mutating entry point asks for.
     """
+    _require_writable(store)
     path = store.path
     store.close()
     for candidate in (path, path + "-wal", path + "-shm"):
