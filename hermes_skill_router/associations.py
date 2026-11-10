@@ -8,9 +8,10 @@ attribution rule is section 2.4 and 6.2 of the pre-reranker routing research.
 
 What the file holds is learned evidence, not conversation. A prompt is stored as its normalised
 terms plus a hash of those terms, never as text, and every load keeps its evidence kind, its
-session provenance (`human`, `automation` or `subagent`), its source (`live` or `backfill`) and the
-prompt event it was attributed to. The raw prompt stays in the Hermes store where it already lives,
-which is why debugging a bad association means reading that store, not this database.
+session provenance (`human`, `automation`, `subagent`, or `unknown` for a source this build does
+not classify), its source (`live` or `backfill`) and the prompt event it was attributed to. The raw
+prompt stays in the Hermes store where it already lives, which is why debugging a bad association
+means reading that store, not this database.
 
 Isolation is by file first and by column second. Every writer checks ``meta.harness`` against its
 own harness name on open, so a copied file cannot silently mix two harnesses' evidence, and this
@@ -32,7 +33,8 @@ Two Hermes facts shape the port:
   (kanban, cron, oneshot, subagent), so automation provenance is kept and flagged instead of
   excluded: their prompts are real task descriptions, and the ablation measures their contribution.
   A subagent session contributes nothing in the first release, because its prompt is the brief its
-  parent wrote.
+  parent wrote; a source this build does not classify answers ``unknown`` and is refused the same
+  way rather than being recorded as a subagent.
 
 The association database sits beside the vector index, at
 ``/home/wilder/.cache/hermes-skill-router/associations.db`` by default, and deleting it loses only
@@ -143,6 +145,9 @@ AUTOMATION_SOURCES = frozenset({"kanban", "cron", "oneshot"})
 
 #: Session sources whose "prompt" is its parent's brief, which contributes nothing.
 SUBAGENT_SOURCES = frozenset({"subagent"})
+
+#: The path segment that marks a file inside a skill's ``references/`` directory.
+REFERENCE_SEGMENT = "/references/"
 
 #: One condition of the gate, in the order the design lists them.
 GATE_CONDITIONS: Tuple[str, ...] = (
@@ -817,7 +822,12 @@ def _require_compatible(conn: sqlite3.Connection, harness: str) -> None:
             "refuses to write it"
         )
     version = _read_user_version(conn)
-    declared = int(meta.get(META_SCHEMA_VERSION, str(version)))
+    try:
+        declared = int(meta.get(META_SCHEMA_VERSION, str(version)))
+    except (TypeError, ValueError):
+        raise AssociationStoreError(
+            "associations: the file is not a version-1 database (meta.schema_version is not a number)"
+        ) from None
     if declared < 1:
         raise AssociationStoreError("associations: the file is not a version-1 database")
     if declared != version:
@@ -862,6 +872,15 @@ def read_meta(store: AssociationStore, key: str) -> Optional[str]:
 def write_meta(store: AssociationStore, key: str, value: str) -> None:
     """Write one ``meta`` value."""
     store.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+
+def _meta_int(store: AssociationStore, key: str, default: int = 0) -> int:
+    """Return one ``meta`` value as an int, or *default* when it is absent or unparseable."""
+    raw = read_meta(store, key)
+    try:
+        return int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _skill_row(row: sqlite3.Row) -> SkillRow:
@@ -941,6 +960,24 @@ def is_synthetic_path(path: str) -> bool:
     return path.startswith("hermes:")
 
 
+def _available_path(
+    store: AssociationStore, name: str, wanted: str, owner: Optional[SkillRow]
+) -> str:
+    """Return *wanted* when no other skill row holds it, else the name-keyed fallback.
+
+    Hermes identity is the name, but the schema keeps T1's ``UNIQUE (harness, path)``. Two names
+    can reveal or carry one path (a renamed skill, a plugin dir shared by aliases), and the second
+    must not collide with the first: the path falls back to the synthetic one so the name keeps its
+    own row, its own history, and the write never aborts the session.
+    """
+    if is_synthetic_path(wanted):
+        return wanted
+    holder = resolve_skill_path(store, wanted)
+    if holder is None or (owner is not None and holder.id == owner.id):
+        return wanted
+    return catalog_path(name)
+
+
 def ensure_skill(
     store: AssociationStore, name: str, path: Optional[str], observed_ms: int
 ) -> SkillRow:
@@ -951,7 +988,7 @@ def ensure_skill(
     catalog carries no path to key on.
     """
     existing = resolve_skill_name(store, name)
-    wanted = path if path else catalog_path(name)
+    wanted = _available_path(store, name, path if path else catalog_path(name), existing)
     if existing is not None:
         if is_synthetic_path(existing.path) and not is_synthetic_path(wanted):
             store.conn.execute(
@@ -1007,8 +1044,8 @@ def reconcile_catalog(
         if skill.name in names:
             continue
         names.add(skill.name)
-        wanted = skill.resolved_path()
         existing = resolve_skill_name(store, skill.name)
+        wanted = _available_path(store, skill.name, skill.resolved_path(), existing)
         if existing is None:
             cursor = store.conn.execute(
                 """INSERT INTO skill (harness, name, path, first_seen_ms, last_seen_ms, deleted_at_ms)
@@ -1379,8 +1416,11 @@ def maintenance(
 
     Nothing on a request path may call this. The purge removes a soft-deleted skill and its rows only
     after :data:`DELETED_SKILL_RETENTION_MS`, and prompts older than :data:`PROMPT_RETENTION_MS`;
-    ``association`` is then rebuilt from what remains.
+    ``association`` is then rebuilt from what remains. A read-only open refuses here, because the
+    rebuild always writes and ``sqlite3`` would otherwise raise its own ``OperationalError``.
     """
+    if store.read_only:
+        raise AssociationStoreError("associations: maintenance needs a writable store")
     stamp = _now() if now_ms is None else int(now_ms)
     reconciled = None if catalog is None else reconcile_catalog(store, catalog, stamp)
     counts = {"deleted": 0, "prompts": 0}
@@ -1418,8 +1458,11 @@ def reset_associations(
 
     The vector index is not touched and is not even known to this module: the association file is the
     only thing a reset may change. Named skills keep their ``skill`` row, because that row is catalog
-    state rather than learned evidence.
+    state rather than learned evidence. A read-only open refuses here, for the same reason
+    :func:`maintenance` does.
     """
+    if store.read_only:
+        raise AssociationStoreError("associations: reset needs a writable store")
     counts = {"skills": 0, "load_events_removed": 0, "association_rows_removed": 0}
     if skills is None:
 
@@ -1549,8 +1592,8 @@ class BackfillReport:
     ms: int = 0
 
 
-#: Why a session row was not read. Every one of them is counted, never thrown.
-SKIP_REASONS: Tuple[str, ...] = ("no-messages", "unreadable")
+#: Why a session row was not read or written. Every one of them is counted, never thrown.
+SKIP_REASONS: Tuple[str, ...] = ("no-messages", "unreadable", "write-failed")
 
 
 @dataclass
@@ -1636,6 +1679,25 @@ class _Resolver:
         parent = os.path.basename(directory)
         return self.by_name(parent) if parent else None
 
+    def by_reference_path(self, path: str) -> Optional[Tuple[str, str]]:
+        """Return the identity a read of a file under ``references/`` resolves to, or ``None``.
+
+        The file lives at ``<skill dir>/references/<file>``, so the directory named before that
+        segment is the skill's directory and, for Hermes, its name. The catalog answers first when
+        it carries that path; the store and its aliases answer for a skill the catalog dropped.
+        A path with no resolvable skill is ignored rather than counted, exactly as T1 returns
+        without appending when its directory lookup misses.
+        """
+        normalised = os.path.normpath(path)
+        head, segment, _tail = normalised.rpartition(REFERENCE_SEGMENT)
+        if not head or not segment:
+            return None
+        hit = self._by_dir.get(head)
+        if hit is not None:
+            return hit
+        name = os.path.basename(head)
+        return self.by_name(name) if name else None
+
 
 def backfill(
     store: AssociationStore,
@@ -1652,10 +1714,11 @@ def backfill(
     for the ``hermes`` harness; this function reconciles a non-empty *catalog* into it, then writes
     only loads that pass the gate.
 
-    The run is idempotent, skips an unreadable or message-less session and counts it, and rewrites
-    nothing it already stored: uniqueness in the store, not a check here, is what makes a second run
-    insert nothing. ``max_sessions`` reads only the newest sessions and leaves the scan watermark
-    alone, because a bounded run must not make a later incremental pass skip the rest.
+    The run is idempotent, skips an unreadable or message-less session, and a session whose write
+    fails, counting each under its skip reason instead of aborting the pass, and rewrites nothing it
+    already stored: uniqueness in the store, not a check here, is what makes a second run insert
+    nothing. ``max_sessions`` reads only the newest sessions and leaves the scan watermark alone,
+    because a bounded run must not make a later incremental pass skip the rest.
 
     Privacy: prompt text exists only in this function's memory. What reaches the store is the
     normalised terms and a hash of them, so a database read cannot recover what the user typed.
@@ -1685,11 +1748,18 @@ def backfill(
                 report.skip_reasons["no-messages"] += 1
                 report.sessions_skipped += 1
                 continue
+            try:
+                scan = _scan_session(session, rows, resolver)
+                _write_session(store, session, scan, report)
+            except sqlite3.Error:
+                # One odd session must not stop a store-wide backfill: its transaction already
+                # rolled back, so count it as skipped and keep walking.
+                report.skip_reasons["write-failed"] += 1
+                report.sessions_skipped += 1
+                continue
+            report.unreadable_results += scan["unreadable"]
             report.sessions_scanned += 1
             report.last_scan_ms = max(report.last_scan_ms, session.stamp_ms)
-            scan = _scan_session(session, rows, resolver)
-            report.unreadable_results += scan["unreadable"]
-            _write_session(store, session, scan, report)
     finally:
         source.close()
 
@@ -1697,7 +1767,7 @@ def backfill(
     # session is in, and only for the loads this run inserted.
     report.ambient_loads = _count_ambient_loads(store, before, stamp)
     if report.last_scan_ms > 0 and max_sessions is None:
-        previous = int(read_meta(store, META_LAST_SCAN_MS) or 0)
+        previous = _meta_int(store, META_LAST_SCAN_MS)
         if report.last_scan_ms > previous:
             write_meta(store, META_LAST_SCAN_MS, str(report.last_scan_ms))
     report.ms = int((time.perf_counter() - started) * 1000)
@@ -1757,15 +1827,18 @@ def provenance_of(source: str) -> str:
     """Classify a session source into the provenance the gate and the store record.
 
     Automation sources (kanban, cron, oneshot) keep their evidence and are flagged, because 84% of
-    the store is automation and its prompts are real task descriptions. A subagent session and a
-    source this build does not know are both refused by the gate, because a prompt that is a
-    parent's brief or an unclassified row is not evidence the channel can explain.
+    the store is automation and its prompts are real task descriptions. A subagent session is
+    refused, because its prompt is the parent's brief. A source this build does not know answers
+    ``unknown`` and fails closed at the gate, and the store never records a provenance the session
+    does not have by mislabelling it ``subagent``.
     """
     if source in HUMAN_SOURCES:
         return "human"
     if source in AUTOMATION_SOURCES:
         return "automation"
-    return "subagent"
+    if source in SUBAGENT_SOURCES:
+        return "subagent"
+    return "unknown"
 
 
 def _scan_session(
@@ -1917,15 +1990,30 @@ def _pending_calls(
                 "stamp": stamp,
             }
         elif name == "read_file":
-            file_path = arguments.get("file_path")
-            if isinstance(file_path, str) and file_path.endswith("/SKILL.md"):
-                pending[call_id] = {
-                    "kind": "read_file",
-                    "file_path": file_path,
-                    "position": position,
-                    "stamp": stamp,
-                }
+            entry = _read_file_pending(arguments)
+            if entry is not None:
+                pending[call_id] = {**entry, "position": position, "stamp": stamp}
     return pending
+
+
+def _read_file_pending(arguments: Any) -> Optional[Dict[str, Any]]:
+    """Return the pending entry for a ``read_file`` worth following, or ``None``.
+
+    The live Hermes store writes the argument as ``path``; older rows and the test fixture may
+    carry ``file_path``, so both are read and neither is trusted alone. A ``SKILL.md`` read is a
+    full-strength load and a read under ``references/`` is the follow-on form; any other file is not
+    a skill load and is dropped here rather than turned into evidence.
+    """
+    file_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    if file_path.endswith("/SKILL.md"):
+        kind = "read_file"
+    elif REFERENCE_SEGMENT in file_path:
+        kind = "read_reference"
+    else:
+        return None
+    return {"kind": kind, "file_path": file_path}
 
 
 def _tool_calls(raw: Any) -> List[Dict[str, Any]]:
@@ -1978,17 +2066,21 @@ def _resolve_tool_result(
     A ``skill_view`` by name is the harness's tool call, so it carries the ``tool`` evidence kind,
     exactly as a DSH ``skill`` call would; a ``read_file`` of a ``SKILL.md`` path carries
     ``skill_md_read``. The two are the design's "both count equally" case: one strength, two
-    provenance kinds, so a ranking can say which one produced it. A reference read carries ``tool``
-    at the follow-on strength and needs the same skill's ``SKILL.md`` earlier in the session. A
-    ``read_file`` call is a load on its own, at the path it read, so it needs no result body.
+    provenance kinds, so a ranking can say which one produced it. A read of a file under
+    ``references/`` carries ``tool`` at the follow-on strength and needs the same skill's
+    ``SKILL.md`` earlier in the session; a reference read that resolves to no skill is ignored, as
+    T1 returns without appending. A ``read_file`` call is a load on its own, at the path it read, so
+    it needs no result body.
 
     A reference read in the same prompt window as its skill's ``SKILL.md`` load is absorbed by that
     load, because ``load_event.dedup_key`` covers the skill and the evidence kind and the design
     says a skill loaded twice in one turn counts once. The follow-on weight is what a reference read
     carries when it is the window's only evidence.
     """
-    if call["kind"] == "read_file":
-        loads.append(_read_file_load(call, resolver, skill_md_seen))
+    if call["kind"] in ("read_file", "read_reference"):
+        load = _read_file_load(call, resolver, skill_md_seen)
+        if load is not None:
+            loads.append(load)
         return 0
     payload = _result_json(row["content"])
     if payload is None:
@@ -2002,8 +2094,24 @@ def _resolve_tool_result(
     return 0
 
 
-def _read_file_load(call: Dict[str, Any], resolver: _Resolver, skill_md_seen: set) -> _Load:
-    """Return the load a ``read_file`` of a ``SKILL.md`` path represents."""
+def _read_file_load(
+    call: Dict[str, Any], resolver: _Resolver, skill_md_seen: set
+) -> Optional[_Load]:
+    """Return the load a ``read_file`` represents, or ``None`` when a reference read resolves none."""
+    if call["kind"] == "read_reference":
+        resolved = resolver.by_reference_path(call["file_path"])
+        if resolved is None:
+            return None
+        return _Load(
+            evidence="tool",
+            strength=FOLLOW_ON_STRENGTH,
+            after_skill_md=resolved[0] in skill_md_seen,
+            name=resolved[0],
+            path=resolved[1],
+            skill_path=call["file_path"],
+            index=call["position"],
+            observed_ms=call["stamp"],
+        )
     resolved = resolver.by_read_path(call["file_path"])
     if resolved is not None:
         skill_md_seen.add(resolved[0])
@@ -2077,11 +2185,14 @@ def _write_session(
     """Gate one session's loads, store the admitted ones, and record the counts.
 
     The ubiquity denominator is every eligible prompt, not only the ones that loaded something. A
-    subagent session contributes neither, since the whole session is excluded.
+    subagent or unclassified session contributes neither prompt nor load, since the whole session is
+    excluded; its origin is still classified truthfully. Counts reach *report* only after every
+    write in the session succeeded, so a failed write is not reported as stored evidence.
     """
     origin = scan["origin"]
-    if origin != "subagent" and scan["eligible"]:
-        report.prompts += upsert_prompts(
+    stored_prompts = 0
+    if origin in ("human", "automation") and scan["eligible"]:
+        stored_prompts = upsert_prompts(
             store,
             [
                 PromptEventInput(
@@ -2099,7 +2210,7 @@ def _write_session(
         if event is not None:
             events.append(event)
     upserted = upsert_events(store, events)
-    report.prompts += upserted.prompts
+    report.prompts += stored_prompts + upserted.prompts
     report.loads += upserted.loads
     report.duplicates += upserted.duplicates
 
@@ -2184,8 +2295,8 @@ def _count_ambient_loads(store: AssociationStore, watermark: int, now_ms: int) -
 
     They stay in ``load_event``; the gate suppresses their rank, and the ratio that marks a skill
     ambient stays computable from the same rows. They are reported as ``ambient_loads``, not as a
-    gate rejection: they were stored, and a second run must report the same number rather than move
-    them between counts.
+    gate rejection: they were stored. The count covers this run's inserts only (``id > watermark``):
+    the report describes one run, so a rerun reports 0 rather than the same number again.
     """
     ambient = ambient_skill_ids(store, now_ms)
     if not ambient:

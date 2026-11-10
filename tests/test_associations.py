@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pathlib
 import sqlite3
 import sys
 import time
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hermes_skill_router import associations as associations_module  # noqa: E402
 from hermes_skill_router.associations import (  # noqa: E402
     ASSOCIATION_DB_NAME,
     ASSOCIATION_HALF_LIFE_MS,
@@ -266,9 +268,13 @@ class HermesStoreFixture:
         self.result(session_id, call_id, "skill_view", json.dumps(payload), ms + 100)
 
     def read_file(self, session_id: str, file_path: str, ms: int) -> None:
-        """Store one ``read_file`` call and a text result."""
-        call_id = self.calls(session_id, [("read_file", {"file_path": file_path})], ms)[0]
+        """Store one ``read_file`` call and a text result, with the live store's ``path`` key."""
+        call_id = self.calls(session_id, [("read_file", {"path": file_path})], ms)[0]
         self.result(session_id, call_id, "read_file", "# loaded\n", ms + 100)
+
+    def read_reference(self, session_id: str, file_path: str, ms: int) -> None:
+        """Store one ``read_file`` of a file under a skill's ``references/`` directory."""
+        self.read_file(session_id, file_path, ms)
 
     def raw_messages(self, session_id: str, tool_calls: str, ms: int) -> None:
         """Store one assistant row with a raw ``tool_calls`` string, for a malformed-record test."""
@@ -312,6 +318,46 @@ def load_rows(store):
                ORDER BY le.id"""
         ).fetchall()
     ]
+
+
+def _read_file_skill_md_paths(raw: str) -> List[str]:
+    """Return the ``SKILL.md`` paths of one raw ``tool_calls`` column, or none when it is malformed."""
+    try:
+        calls = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    paths: List[str] = []
+    for call in calls or ():
+        function = (call or {}).get("function") or {}
+        if function.get("name") != "read_file":
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except ValueError:
+            continue
+        path = arguments.get("path") if isinstance(arguments, dict) else None
+        if isinstance(path, str) and path.endswith("/SKILL.md"):
+            paths.append(path)
+    return paths
+
+
+def live_skill_md_read_paths(state_path: Path) -> List[str]:
+    """Return the paths of the live store's ``read_file`` calls for a ``SKILL.md``.
+
+    Hermes writes the argument as ``path``; this reads the live file in place, read-only, and never
+    copies it. The live test uses it to check that the backfill recognises the shape Hermes really
+    produces rather than the one a fixture finds convenient.
+    """
+    conn = sqlite3.connect(pathlib.Path(state_path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        paths: List[str] = []
+        for (raw,) in conn.execute(
+            "SELECT tool_calls FROM messages WHERE tool_calls LIKE '%read_file%'"
+        ):
+            paths.extend(_read_file_skill_md_paths(raw))
+        return paths
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------------------------------
@@ -840,6 +886,8 @@ def test_backfill_is_idempotent(hermes, tmp_path: Path):
     assert second.loads == 0, "the rerun stored nothing new"
     assert second.duplicates == first.loads
     assert second.prompts == 0
+    assert first.ambient_loads == 1, "the only load sits above the ambient threshold"
+    assert second.ambient_loads == 0, "the report counts this run's inserts, not the first run's"
     assert association_stats(store) == before
     store.close()
 
@@ -1030,10 +1078,182 @@ def test_backfill_reads_the_live_hermes_store_whole_and_records_its_wall_time(tm
     assert report.sessions_scanned > 250
     assert report.loads > 0, "the live store carries skill_view evidence"
     assert report.ms < 60_000, f"the whole-store pass cost {report.ms} ms"
+    catalog_names = {skill.name for skill in catalog}
+    reads = live_skill_md_read_paths(state)
+    resolvable = [path for path in reads if Path(path).parent.name in catalog_names]
+    stored_kinds = sorted({row["evidence"] for row in load_rows(store)})
+    if resolvable:
+        assert "skill_md_read" in stored_kinds, (
+            f"{len(resolvable)} live SKILL.md reads resolve to the catalog, so the backfill stores "
+            f"them; it stored {stored_kinds}"
+        )
     print(
         f"\nlive Hermes backfill: {report.sessions_found} sessions, "
         f"{report.sessions_scanned} scanned, {report.sessions_skipped} skipped, "
         f"{report.prompts} prompts, {report.loads} loads, {report.duplicates} duplicates, "
-        f"{report.ambient_loads} ambient, {report.ms} ms"
+        f"{report.ambient_loads} ambient, {report.ms} ms, "
+        f"{len(reads)} SKILL.md reads ({len(resolvable)} resolvable), evidence {stored_kinds}"
     )
+    store.close()
+
+
+# --------------------------------------------------------------------------------------------------
+# Review round 1 fixes: the live read shape, path collisions, write failures and edge provenance
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_store_refuses_a_schema_version_that_is_not_a_number(tmp_path: Path):
+    path = str(tmp_path / "odd-version.db")
+    store = open_store(path)
+    write_meta(store, META_SCHEMA_VERSION, "not-a-number")
+    store.close()
+    with pytest.raises(AssociationStoreError, match="not a version-1 database"):
+        open_store(path)
+
+
+def test_a_read_only_store_can_rank_but_refuses_maintenance_and_reset(tmp_path: Path):
+    path = tmp_path / "read-only.db"
+    store = open_store(str(path))
+    reconcile_catalog(store, CATALOG, T0)
+    seed_prompts(store, 10)
+    upsert_events(store, [load_of(0)])
+    store.close()
+
+    reader = open_store(str(path), read_only=True)
+    assert reader.read_only is True
+    assert decayed_weights(reader, ["review"], T0 + DAY), "a read-only store still ranks"
+    with pytest.raises(AssociationStoreError, match="maintenance needs a writable store"):
+        maintenance(reader, now_ms=T0 + 2 * DAY)
+    with pytest.raises(AssociationStoreError, match="reset needs a writable store"):
+        reset_associations(reader)
+    reader.close()
+
+
+def test_two_names_that_reveal_one_path_do_not_abort_the_backfill(hermes, tmp_path: Path):
+    shared = "/home/wilder/.hermes/skills/renamed/SKILL.md"
+    hermes.session("s-one")
+    hermes.user("s-one", SUBSTANTIVE, T0 + 1000)
+    first = hermes.calls("s-one", [("skill_view", {"name": "code-review"})], T0 + 2000)[0]
+    hermes.result(
+        "s-one",
+        first,
+        "skill_view",
+        json.dumps({"success": True, "name": "code-review", "_source_path": shared}),
+        T0 + 2100,
+    )
+    hermes.session("s-two", started_ms=T0 + 1000)
+    hermes.user("s-two", SUBSTANTIVE, T0 + 2000)
+    second = hermes.calls("s-two", [("skill_view", {"name": "handoff-doc"})], T0 + 3000)[0]
+    hermes.result(
+        "s-two",
+        second,
+        "skill_view",
+        json.dumps({"success": True, "name": "handoff-doc", "_source_path": shared}),
+        T0 + 3100,
+    )
+    hermes.commit()
+
+    store = temp_store(tmp_path, "collision")
+    report = backfilled(store, hermes.path)
+    assert report.loads == 2
+    assert report.sessions_scanned == 2
+    assert report.skip_reasons["write-failed"] == 0, "one shared path is not a write failure"
+    assert rows(store, "SELECT name, path FROM skill ORDER BY name") == [
+        ("code-review", catalog_path("code-review")),
+        ("handoff-doc", shared),
+        ("writing", catalog_path("writing")),
+    ], "the first name keeps the revealed path and the second keeps its name-keyed path"
+
+
+def test_backfill_counts_a_session_whose_write_fails_instead_of_aborting(
+    hermes, tmp_path: Path, monkeypatch
+):
+    hermes.session("s-good")
+    hermes.user("s-good", SUBSTANTIVE, T0 + 1000)
+    hermes.skill_view("s-good", "code-review", T0 + 2000)
+    hermes.session("s-bad", started_ms=T0 + 1000)
+    hermes.user("s-bad", "Review the writing skill reference material now", T0 + 2000)
+    hermes.skill_view("s-bad", "writing", T0 + 3000)
+    hermes.commit()
+
+    real = associations_module.upsert_events
+
+    def flaky(store, events):
+        if any(event.session_id == "s-bad" for event in events):
+            raise sqlite3.OperationalError("database is locked")
+        return real(store, events)
+
+    monkeypatch.setattr(associations_module, "upsert_events", flaky)
+    store = temp_store(tmp_path, "write-failed")
+    report = backfilled(store, hermes.path)
+    assert report.skip_reasons["write-failed"] == 1
+    assert report.sessions_skipped == 1
+    assert report.sessions_scanned == 1
+    assert report.loads == 1, "the healthy session was still stored"
+    assert [row["skill_name"] for row in load_rows(store)] == ["code-review"]
+
+
+def test_a_compacted_row_resets_attribution_until_the_next_typed_prompt(hermes, tmp_path: Path):
+    hermes.session("s-stopped")
+    hermes.user("s-stopped", SUBSTANTIVE, T0 + 1000)
+    hermes.user(
+        "s-stopped", "Summary of the compacted conversation so far", T0 + 2000, compacted=1
+    )
+    hermes.skill_view("s-stopped", "code-review", T0 + 3000)
+
+    hermes.session("s-resumed", started_ms=T0 + 1000)
+    hermes.user("s-resumed", SUBSTANTIVE, T0 + 1000)
+    hermes.user(
+        "s-resumed", "Summary of the compacted conversation so far", T0 + 2000, compacted=1
+    )
+    hermes.user("s-resumed", "Now read the writing skill reference material", T0 + 3000)
+    hermes.skill_view("s-resumed", "writing", T0 + 4000)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "compacted")
+    report = backfilled(store, hermes.path)
+    assert report.loads == 1, "the load after the compaction is dropped, the later prompt's is kept"
+    assert report.rejected["typed-prompt"] == 1
+    assert [(row["skill_name"], row["terms"]) for row in load_rows(store)] == [
+        ("writing", "read writing skill reference material")
+    ]
+
+
+def test_a_read_file_under_references_is_a_follow_on_load(hermes, tmp_path: Path):
+    hermes.session("s-ref")
+    hermes.user("s-ref", SUBSTANTIVE, T0 + 1000)
+    hermes.read_file("s-ref", "/home/wilder/.hermes/skills/code-review/SKILL.md", T0 + 2000)
+    hermes.user("s-ref", "Read the rules reference for the same skill now", T0 + 3000)
+    hermes.read_reference(
+        "s-ref", "/home/wilder/.hermes/skills/code-review/references/rules.md", T0 + 4000
+    )
+
+    hermes.session("s-ref-orphan", started_ms=T0 + 1000)
+    hermes.user("s-ref-orphan", "Read the association reference before anything else", T0 + 2000)
+    hermes.read_reference(
+        "s-ref-orphan", "/home/wilder/.hermes/skills/code-review/references/rules.md", T0 + 3000
+    )
+    hermes.commit()
+
+    store = temp_store(tmp_path, "reference")
+    report = backfilled(store, hermes.path)
+    assert report.rejected["explicit-load"] == 1, "a reference read with no earlier SKILL.md is not a load"
+    assert [(row["skill_name"], row["evidence"], row["strength"]) for row in load_rows(store)] == [
+        ("code-review", "skill_md_read", 1.0),
+        ("code-review", "tool", 0.5),
+    ]
+
+
+def test_an_unclassified_session_source_is_refused_and_stores_no_prompt(hermes, tmp_path: Path):
+    hermes.session("s-imported", source="imported")
+    hermes.user("s-imported", SUBSTANTIVE, T0 + 1000)
+    hermes.skill_view("s-imported", "code-review", T0 + 2000)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "unknown-source")
+    report = backfilled(store, hermes.path)
+    assert report.rejected["session-provenance"] == 1, "an unknown source fails closed"
+    assert report.loads == 0
+    assert report.prompts == 0, "an unclassified session does not enter the ubiquity denominator"
+    assert rows(store, "SELECT count(*) FROM load_event")[0][0] == 0
     store.close()
