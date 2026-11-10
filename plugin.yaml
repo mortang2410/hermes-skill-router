@@ -1,0 +1,122 @@
+manifest_version: 2
+api_version: 1
+name: hermes-skill-router
+version: "0.1.0"
+description: >-
+  Removes the always-on skill catalog from each Chat Completions request and
+  injects a short reranked shortlist of skill names and descriptions instead.
+requires_hermes: ">=0.22.2"
+provides_tools: []
+provides_hooks: []
+# Catalog capability, required by `hermes plugins validate` for the middleware register() adds.
+# This build's manifest parser does not know the key and logs one unknown-field warning per load.
+provides_middleware: ["llm_request"]
+license: MIT
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "Master switch. False changes nothing."
+  eagerSkills:
+    type: list
+    items: str
+    default: []
+    description: "Skill names that are always listed and never routed."
+  embedBaseUrl:
+    type: str
+    default: "http://127.0.0.1:8012"
+    description: "Embeddings endpoint root. http is accepted only for a loopback host; any other host must use https, and URL credentials are rejected."
+  embedPath:
+    type: str
+    default: "/v1/embeddings"
+    description: "Endpoint path appended to the embeddings base URL."
+  embedModelId:
+    type: str
+    default: "bge-m3"
+    description: "model field sent to the embeddings endpoint."
+  embedTimeoutMs:
+    type: int
+    default: 6000
+    minimum: 100
+    maximum: 60000
+    description: "Per-request embeddings timeout in milliseconds (100..60000)."
+  rerankBaseUrl:
+    type: str
+    default: "http://127.0.0.1:8010"
+    description: "Rerank endpoint root. http is accepted only for a loopback host; any other host must use https, and URL credentials are rejected."
+  rerankPath:
+    type: str
+    default: "/v1/rerank"
+    description: "Endpoint path appended to the rerank base URL."
+  rerankModel:
+    type: str
+    default: "tasksource-decider-nano"
+    description: "model field sent to the rerank endpoint."
+  rerankProvider:
+    type: str
+    default: "cohere"
+    values: [cohere]
+    description: "Request and response shape of the rerank endpoint (only cohere)."
+  documentPrefix:
+    type: str
+    default: "This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: "
+    description: "Exact text before <name> - <description> in a rerank document."
+  deferredSkills:
+    type: list
+    items: str
+    default: []
+    description: "Routable skill names. Empty means every non-eager skill is routable."
+  rerankTimeoutMs:
+    type: int
+    default: 20000
+    minimum: 100
+    maximum: 60000
+    description: "Per-request rerank timeout in milliseconds (100..60000)."
+  shortlistSize:
+    type: int
+    default: 50
+    minimum: 1
+    maximum: 383
+    description: "Candidates carried from embeddings into rerank (1..383)."
+  cutoff:
+    type: float
+    default: 0.01
+    minimum: 0.0
+    maximum: 1.0
+    description: "Rerank relevance_score a candidate needs, compared inclusively (0..1)."
+  maxSuggestions:
+    type: int
+    default: 8
+    minimum: 0
+    maximum: 50
+    description: "Hard cap on suggested rows; 0 selects none while kept rows are still listed (0..50)."
+  maxDisplayNames:
+    type: int
+    default: 12
+    minimum: 1
+    maximum: 50
+    description: "Names the pane and the TUI widget list (1..50)."
+  maxDescriptionChars:
+    type: int
+    default: 400
+    minimum: 3
+    maximum: 4000
+    description: "Description characters kept per row (3..4000)."
+  cachePath:
+    type: str
+    default: "~/.cache/hermes-skill-router/index.json"
+    description: "Persisted index; empty disables persistence."
+  showSuggestions:
+    type: bool
+    default: true
+    description: "Let the desktop pane and the TUI widget show the last suggestion names. False removes an existing record."
+  suggestionsPath:
+    type: str
+    default: "~/.cache/hermes-skill-router/suggestions.json"
+    description: "Display record both surfaces read; names only, never request text."
+  healthCheckMs:
+    type: int
+    default: 60000
+    minimum: 0
+    maximum: 3600000
+    description: "Minimum gap between endpoint health probes in milliseconds; 0 probes every request (0..3600000)."

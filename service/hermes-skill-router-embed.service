@@ -1,0 +1,27 @@
+[Unit]
+Description=Hermes skill-router embeddings server (BGE-M3 ONNX, OpenAI-compatible, loopback, CPU)
+Documentation=file:/home/wilder/git-repos/hermes-skill-router/service/embed_server.py
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wilder/git-repos/hermes-skill-router
+# Settings are read from the environment; these match the live host defaults.
+Environment=HSR_MODEL_DIR=/home/wilder/git-repos/skill-router-and-jev/.scratch/hf_local/BAAI/bge-m3
+Environment=HSR_PORT=8012
+Environment=HSR_MODEL_ID=bge-m3
+Environment=HSR_MAX_LENGTH=512
+Environment=HF_HUB_OFFLINE=1
+Environment=OMP_NUM_THREADS=8
+Environment=OMP_WAIT_POLICY=PASSIVE
+Environment=PYTHONUNBUFFERED=1
+# Request logs are also written to ~/.cache/hermes-skill-router/embed.log by
+# the service; journal keeps startup output and crash breadcrumbs.
+ExecStart=/home/wilder/miniforge3/bin/python -m service.embed_server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

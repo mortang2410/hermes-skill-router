@@ -1,0 +1,7 @@
+{
+  "name": "hermes-skill-router",
+  "api": "plugin_api.py",
+  "tab": {
+    "hidden": true
+  }
+}
