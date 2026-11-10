@@ -775,6 +775,17 @@ def _close_quietly(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _require_writable(store: AssociationStore) -> None:
+    """Refuse a write on a store opened read-only, with the module's own error.
+
+    SQLite would otherwise raise ``OperationalError('attempt to write a readonly database')`` from
+    whichever statement happens to run first. A caller of a write path should see the module's
+    contract break here, at the entry point, rather than a database message from the middle.
+    """
+    if store.read_only:
+        raise AssociationStoreError("associations: this store is open read-only")
+
+
 def _migrate(conn: sqlite3.Connection, harness: str) -> None:
     """Create schema version 1 on a fresh file and stamp its meta rows and user_version.
 
@@ -871,6 +882,7 @@ def read_meta(store: AssociationStore, key: str) -> Optional[str]:
 
 def write_meta(store: AssociationStore, key: str, value: str) -> None:
     """Write one ``meta`` value."""
+    _require_writable(store)
     store.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
 
@@ -1033,6 +1045,7 @@ def reconcile_catalog(
     skill, and reusing a name never merges two histories. A fingerprint in ``meta`` skips the pass
     when the catalog has not changed.
     """
+    _require_writable(store)
     stamp = _now() if now_ms is None else int(now_ms)
     fingerprint = catalog_fingerprint(catalog)
     if read_meta(store, META_CATALOG_FINGERPRINT) == fingerprint:
@@ -1124,6 +1137,7 @@ def upsert_prompts(store: AssociationStore, prompts: Sequence[PromptEventInput])
     denominator and mark ordinary skills ambient. These rows carry terms and a hash, exactly like a
     prompt that did load something, so the privacy boundary is unchanged.
     """
+    _require_writable(store)
     count = 0
 
     def work() -> None:
@@ -1146,6 +1160,7 @@ def upsert_events(store: AssociationStore, events: Sequence[AssociationEvent]) -
     """
     if not events:
         return UpsertReport()
+    _require_writable(store)
     result = {"prompts": 0, "loads": 0, "duplicates": 0}
 
     def work() -> None:
@@ -1723,6 +1738,7 @@ def backfill(
     Privacy: prompt text exists only in this function's memory. What reaches the store is the
     normalised terms and a hash of them, so a database read cannot recover what the user typed.
     """
+    _require_writable(store)
     started = time.perf_counter()
     stamp = _now() if now_ms is None else int(now_ms)
     if catalog:
@@ -2186,13 +2202,14 @@ def _write_session(
 
     The ubiquity denominator is every eligible prompt, not only the ones that loaded something. A
     subagent or unclassified session contributes neither prompt nor load, since the whole session is
-    excluded; its origin is still classified truthfully. Counts reach *report* only after every
-    write in the session succeeded, so a failed write is not reported as stored evidence.
+    excluded; its origin is still classified truthfully. A prompt row is reported as soon as it
+    commits, because it is stored evidence even if the session's event write then fails; the load,
+    duplicate and rejection tallies are applied only after that write succeeds, so a failed session
+    is not reported as evidence it does not have.
     """
     origin = scan["origin"]
-    stored_prompts = 0
     if origin in ("human", "automation") and scan["eligible"]:
-        stored_prompts = upsert_prompts(
+        report.prompts += upsert_prompts(
             store,
             [
                 PromptEventInput(
@@ -2204,15 +2221,18 @@ def _write_session(
                 for prompt in scan["eligible"]
             ],
         )
+    rejected: Dict[str, int] = {}
     events: List[AssociationEvent] = []
     for load, nearest in _attributions(scan["prompts"], scan["loads"], scan["resets"]):
-        event = _admitted_event(store, session, load, nearest, origin, report)
+        event = _admitted_event(store, session, load, nearest, origin, rejected)
         if event is not None:
             events.append(event)
     upserted = upsert_events(store, events)
-    report.prompts += stored_prompts + upserted.prompts
+    report.prompts += upserted.prompts
     report.loads += upserted.loads
     report.duplicates += upserted.duplicates
+    for reason, count in rejected.items():
+        report.rejected[reason] += count
 
 
 def _attributions(
@@ -2246,9 +2266,14 @@ def _admitted_event(
     load: _Load,
     nearest: Optional[_Prompt],
     origin: str,
-    report: BackfillReport,
+    rejected: Dict[str, int],
 ) -> Optional[AssociationEvent]:
-    """Gate one load and return the event to store, or ``None`` when the gate refused it."""
+    """Gate one load and return the event to store, or ``None`` when the gate refused it.
+
+    Rejections land in *rejected* rather than the run report, so the caller merges them only when
+    the session's event write succeeded: a failed session leaves no gate counts for evidence the run
+    did not store.
+    """
     resolved = None if load.name is None else resolve_skill_name(store, load.name)
     skill_id = None if resolved is None else resolved.id
     prompt = None
@@ -2269,11 +2294,11 @@ def _admitted_event(
     )
     reason = gate_rejection(event)
     if reason is not None:
-        report.rejected[reason] += 1
+        rejected[reason] = rejected.get(reason, 0) + 1
         return None
     if skill_id is None or nearest is None or load.name is None:
         # Unreachable while the gate is the only decider, but never invent an identity.
-        report.rejected["explicit-load"] += 1
+        rejected["explicit-load"] = rejected.get("explicit-load", 0) + 1
         return None
     return AssociationEvent(
         session_id=session.id,

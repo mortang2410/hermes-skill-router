@@ -1076,6 +1076,8 @@ def test_backfill_reads_the_live_hermes_store_whole_and_records_its_wall_time(tm
     assert report.sessions_found > 300, f"the live store holds {report.sessions_found} sessions"
     assert report.sessions_scanned + report.sessions_skipped == report.sessions_found
     assert report.sessions_scanned > 250
+    assert report.skip_reasons["write-failed"] == 0, "a write failure would be a bug in this module"
+    assert report.skip_reasons["unreadable"] == 0, "the live store's sessions are readable"
     assert report.loads > 0, "the live store carries skill_view evidence"
     assert report.ms < 60_000, f"the whole-store pass cost {report.ms} ms"
     catalog_names = {skill.name for skill in catalog}
@@ -1126,6 +1128,16 @@ def test_a_read_only_store_can_rank_but_refuses_maintenance_and_reset(tmp_path: 
         maintenance(reader, now_ms=T0 + 2 * DAY)
     with pytest.raises(AssociationStoreError, match="reset needs a writable store"):
         reset_associations(reader)
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        upsert_events(reader, [load_of(0)])
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        upsert_prompts(reader, [prompt_of(0)])
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        reconcile_catalog(reader, CATALOG, T0)
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        write_meta(reader, META_LAST_SCAN_MS, "1")
+    with pytest.raises(AssociationStoreError, match="open read-only"):
+        backfill(reader, str(tmp_path / "state.db"))
     reader.close()
 
 
@@ -1174,6 +1186,7 @@ def test_backfill_counts_a_session_whose_write_fails_instead_of_aborting(
     hermes.session("s-bad", started_ms=T0 + 1000)
     hermes.user("s-bad", "Review the writing skill reference material now", T0 + 2000)
     hermes.skill_view("s-bad", "writing", T0 + 3000)
+    hermes.skill_view("s-bad", "unknown-skill", T0 + 4000)
     hermes.commit()
 
     real = associations_module.upsert_events
@@ -1190,6 +1203,9 @@ def test_backfill_counts_a_session_whose_write_fails_instead_of_aborting(
     assert report.sessions_skipped == 1
     assert report.sessions_scanned == 1
     assert report.loads == 1, "the healthy session was still stored"
+    assert report.prompts == 2, "the failed session's committed prompt rows are reported, not hidden"
+    assert report.rejected == zero_rejections(), "a failed session leaves no gate counts behind"
+    assert rows(store, "SELECT count(*) FROM prompt_event")[0][0] == 2
     assert [row["skill_name"] for row in load_rows(store)] == ["code-review"]
 
 
