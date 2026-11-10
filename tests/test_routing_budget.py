@@ -1,11 +1,14 @@
 """D12 and ticket T5: one routing budget bounds one pass, and it starts after the index build.
 
-Two properties are pinned here, both through the real rewrite with the real HTTP clients:
+Three properties are pinned here, all through the real rewrite with the real HTTP clients:
 
 * a stub endpoint that answers past the budget ends the pass at the budget: the request keeps its
-  catalog and gets no block, exactly one warning names the budget, and no rerank request is sent;
+  catalog and gets no block, exactly one warning names the budget, no rerank request is sent, and
+  the display record says inert;
 * a catalog build slower than the budget does not trip it, because the budget starts once the index
-  is in hand, and the same request still routes.
+  is in hand, and the same request still routes;
+* the cap covers the rerank leg too: an embed that answers inside the budget followed by a rerank
+  that answers past it also ends at the budget.
 
 The budget is loaded from the plugin config, and the endpoints are loopback fakes from
 ``tests/fake_endpoint.py``, so the pass needs no model and no network.
@@ -14,6 +17,7 @@ The budget is loaded from the plugin config, and the endpoints are loopback fake
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import sys
 import time
@@ -29,12 +33,13 @@ for entry in (ROOT, ROOT / "tests"):
 from fake_endpoint import FakeEndpoint, Response  # noqa: E402
 from hermes_skill_router import embed as embed_module  # noqa: E402
 from hermes_skill_router import rerank as rerank_module  # noqa: E402
+from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
-#: The budget both tests run at. The schema's lower bound is 1000, and a value no other test uses
-#: keeps the router's log-once key distinct, so "exactly one line" is decided by this pass alone.
+#: The budget every test runs at. The schema's lower bound is 1000, and the fixture below clears
+#: the router's log-once set, so each test's "exactly one line" is decided by that test's own pass.
 BUDGET_MS = 1100
 
 QUERY = "draft a git commit message for a bug fix"
@@ -91,12 +96,14 @@ def rerank_answer(documents):
 
 @pytest.fixture()
 def budget_reset():
-    """Give each test a clean endpoint health state, as a fresh process would have."""
+    """Give each test a clean endpoint health state and log-once set, as a fresh process would."""
     embed_module.HEALTH.reset()
     rerank_module.HEALTH.reset()
+    router_module._LOGGED.clear()
     yield
     embed_module.HEALTH.reset()
     rerank_module.HEALTH.reset()
+    router_module._LOGGED.clear()
 
 
 def settings(endpoints, suggestions_path):
@@ -170,6 +177,10 @@ def test_a_stub_endpoint_that_answers_past_the_budget_falls_back_with_one_budget
         assert reranking.count == 0, 'a pass that ends at its budget must never reach the rerank stage'
         # The stub holds the answer for 5 s, so finishing well before that is the budget at work.
         assert elapsed < 4.0, f'the budget must end the pass long before the 5 s stub answer; took {elapsed:.2f} s'
+
+        record = json.loads((tmp_path / "suggestions.json").read_text(encoding="utf-8"))
+        assert record["status"] == "inert", 'the expiry must write the inert display record'
+        assert record["names"] == [], 'an inert record carries no names'
     finally:
         embeddings.close()
         reranking.close()
@@ -209,6 +220,46 @@ def test_a_catalog_build_slower_than_the_budget_does_not_trip_it(tmp_path, caplo
         assert "Beta skill" in block["content"], 'the pass must still route its suggestion'
         assert [record.getMessage() for record in caplog.records if "routing budget" in record.getMessage()] == []
         assert reranking.count == 1, 'the pass reached the rerank stage after the slow build'
+    finally:
+        embeddings.close()
+        reranking.close()
+
+
+def test_a_rerank_that_answers_past_the_budget_ends_the_pass(tmp_path, caplog, budget_reset):
+    """The cap covers the rerank leg too: an instant embed and a slow rerank still end at the budget."""
+    caplog.set_level(logging.WARNING, logger="hermes_skill_router.router")
+
+    def embed_responder(request):
+        return Response(body=embeddings_answer([QUERY_VECTOR for _text in request.json()["input"]]))
+
+    def rerank_responder(request):
+        # The shortlist is answered, but only long after the budget has run out.
+        return Response(body=rerank_answer(request.json()["documents"]), delay=5.0)
+
+    embeddings = FakeEndpoint(embed_responder)
+    reranking = FakeEndpoint(rerank_responder)
+    try:
+        cfg = settings((embeddings, reranking), tmp_path / "suggestions.json")
+        payload = chat_payload()
+
+        started = time.monotonic()
+        result = rewrite(payload, cfg=cfg, index=built_index())
+        elapsed = time.monotonic() - started
+
+        assert result is None, 'a pass whose rerank cannot finish must leave the request unchanged'
+        assert payload["messages"][0]["content"] == SYSTEM, 'the catalog must still be on the request'
+
+        lines = budget_warnings(caplog)
+        assert len(lines) == 1, f'exactly one line must name the budget; saw {lines}'
+        assert str(BUDGET_MS) in lines[0], f'the line must name the budget of {BUDGET_MS} ms: {lines[0]}'
+
+        assert embeddings.count == 1, 'the query embed answered inside the budget'
+        assert reranking.count == 1, 'the pass was cut at the rerank request, not before it'
+        # The embed is instant and the rerank holds its answer for 5 s, so ending well before
+        # that is the rerank timeout cap at work.
+        assert elapsed < 4.0, (
+            f'the budget must end the pass long before the 5 s rerank answer; took {elapsed:.2f} s'
+        )
     finally:
         embeddings.close()
         reranking.close()

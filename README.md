@@ -417,17 +417,22 @@ it applies no second softmax.
 loaded or built, so it never covers that build: the build issues 27 chunked embeddings requests and
 takes about 38 seconds here, and it already fails through its own path by returning no index
 instead of being cut off. Each per-request timeout is capped at the milliseconds the budget has
-left, so the pass cannot outlive the budget even when both endpoints answer slowly. When the budget
-runs out the plugin abandons the pass: the request keeps the bare catalog and gets no suggestion
-block, the same inert fallback every other failure uses.
+left, so a slow embed or rerank is cut when the budget ends. The cap bounds the wait for an answer,
+not the transfer of one: a server that trickles bytes within every socket timeout can still run
+past the budget. When the budget runs out the plugin abandons the pass: the request keeps the bare
+catalog and gets no suggestion block, the same inert fallback every other failure uses, and one
+warning names the budget.
 
-The 30000 ms default is the measured cost with headroom. A steady-state single-text embed took 236
-to 306 ms and a 50-document rerank took 2158 to 2255 ms, while the first embed after an endpoint
-restart took 2700 ms, so a cold but healthy pass costs about 5 seconds: 2700 plus 2255. The two
-per-request timeouts allow a 26 second pass at worst, 6000 plus 20000, so the 30000 ms budget sits
-above that ceiling and a working but slow path is never cut. On a host whose endpoints are slower
-than those figures, raise the budget above your own measured cold pass before lowering anything
-else.
+The 30000 ms default rests on two facts. The two per-request timeouts allow a 26 second pass at
+worst, 6000 plus 20000, so 30000 sits above that ceiling and a working but slow path is never cut,
+and it matches the DSH router's 30 second catalog read deadline. It also has headroom over the
+measurements recorded on this machine against its live endpoints: a steady-state single-text
+embed took 236 to 306 ms, a 50-document rerank took 2158 to 2255 ms, and the first embed after an
+endpoint restart took 2700 ms, so a cold but healthy pass cost about 5 seconds, 2700 plus 2255.
+Those are the slow case rather than a constant: an earlier live run on the same host measured a
+full warm rewrite at 0.75 to 0.79 seconds, and a probe on 2026-11-10 measured a one-text embed at
+84 ms and a 50-document rerank at 287 ms. On a host whose endpoints are slower than the recorded
+figures, raise the budget above your own measured cold pass before lowering anything else.
 
 ## Point it at your own models
 

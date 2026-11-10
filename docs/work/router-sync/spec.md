@@ -176,6 +176,9 @@ enough that a third party can point the plugin at their own models.
 | `documentPrefix` | the DSH skill prefix | string | Exact text before `<name> - <description>` in a rerank document. |
 | `deferredSkills` | empty | list of catalog names | Routable skills. Empty means every non-eager skill is routable. |
 | `rerankTimeoutMs` | `20000` | 100..60000 | Per-request rerank timeout. |
+| `routingTimeoutMs` | `30000` | 1000..60000 | One whole routing pass, from the query embed through
+  the rerank reply. The budget starts after the index is loaded or built, so the cold build is never
+  cut, and each per-request timeout is capped at the time left. |
 | `shortlistSize` | `50` | 1..383 | Candidates carried from embeddings into rerank. |
 | `cutoff` | `0.01` | 0..1 | Rerank `relevance_score` a candidate needs, compared inclusively. |
 | `maxSuggestions` | `8` | 0..50 | Hard cap on suggested rows; 0 selects none, while kept rows are still listed. |
