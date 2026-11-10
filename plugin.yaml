@@ -72,6 +72,12 @@ config_schema:
     minimum: 100
     maximum: 60000
     description: "Per-request rerank timeout in milliseconds (100..60000)."
+  routingTimeoutMs:
+    type: int
+    default: 30000
+    minimum: 1000
+    maximum: 60000
+    description: "Whole routing pass budget in milliseconds (1000..60000), from the query embed through the rerank reply. It starts after the skill index is loaded or built, so the cold build is never cut, and caps each per-request timeout at the time left. On expiry the request keeps the bare skill catalog and gets no suggestions."
   shortlistSize:
     type: int
     default: 50

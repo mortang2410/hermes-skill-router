@@ -20,6 +20,12 @@ block replaces it. Any failure — an unreachable or timed-out endpoint, an unbu
 user text, an empty block — returns ``None``, and ``_apply_request_chain`` then keeps the payload
 that arrived, catalog included (R5, D8). The rewrite never raises and never mutates its input.
 
+Steps 3 and 4 run inside one routing budget, ``cfg.routing_timeout_ms``. The budget starts after
+the index is in hand, so it never covers the cold build, which embeds the whole catalog in batches
+and already fails through its own path. Each per-request timeout is capped by the milliseconds left,
+so the pass cannot outlive the budget, and a pass that reaches the end of it is abandoned with one
+log line naming the budget.
+
 On every request that carried the catalog on Chat Completions the same decision is written to the
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
 names, or ``inert`` with no names. The record is written after the payload is built and never
@@ -36,6 +42,8 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import replace
+from time import monotonic
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 
 from .catalog import strip_catalog
@@ -176,7 +184,12 @@ def _compose(
     if not index.names:
         inert()
         return None
-    query_vector = _embed_query(cfg, query, embed, inert)
+    # The budget starts here, after the index is in hand. A cold build embeds the whole
+    # catalog in 27 requests and the library records it as about 38 s, so a budget that
+    # covered the build would cut a healthy first pass; a build that fails already returns
+    # no index above and leaves the request untouched.
+    deadline = monotonic() + cfg.routing_timeout_ms / 1000.0
+    query_vector = _embed_query(cfg, query, embed, inert, deadline)
     if query_vector is None:
         return None
     shortlist = _shortlist(index, query_vector, cfg.shortlist_size)
@@ -186,14 +199,8 @@ def _compose(
     documents = [
         cfg.document_prefix + name + " - " + description for name, description in shortlist
     ]
-    try:
-        scores = rerank(cfg, query, documents)
-    except Exception:
-        logger.debug("skill router: rerank raised", exc_info=True)
-        scores = None
+    scores = _rerank_scores(cfg, query, documents, rerank, inert, deadline)
     if scores is None:
-        _log_once("rerank unreachable")
-        inert()
         return None
     chosen = select(scores, [name for name, _description in shortlist], cfg)
     # The partition's variant chooses the header, so the block matches the prose this request lost.
@@ -214,27 +221,58 @@ def _compose(
     return {"request": rewritten}
 
 
+def _budget_left(deadline: float) -> Optional[int]:
+    """Return the whole milliseconds left before *deadline*, or ``None`` once it has passed.
+
+    The value is rounded UP, so a per-request timeout set from it can never fire before the
+    deadline: the socket then times out with the budget already spent, which is what lets a
+    failed call tell a budget expiry from an endpoint that failed on its own.
+    """
+    left = int(math.ceil((deadline - monotonic()) * 1000.0))
+    return left if left > 0 else None
+
+
+def _capped(cfg: Config, field: str, left: int) -> Config:
+    """Return *cfg* with *field*, a per-request timeout, capped by the milliseconds left."""
+    return replace(cfg, **{field: min(getattr(cfg, field), left)})
+
+
+def _expire_budget(cfg: Config, inert: Callable[[], None]) -> None:
+    """Abandon the pass at its budget: one line naming it, and the inert decision."""
+    _log_once(f"routing budget {cfg.routing_timeout_ms} ms exhausted")
+    inert()
+
+
 def _embed_query(
     cfg: Config,
     query: str,
     embed: Embedder,
     inert: Callable[[], None],
+    deadline: float,
 ) -> Optional[List[float]]:
-    """Embed the user's text, or return ``None`` after logging and recording the inert decision."""
-    try:
-        vectors = embed(cfg, [query])
-    except TimeoutError:
-        _log_once("embed timeout")
-        inert()
+    """Embed the user's text inside the budget, or return ``None`` after logging and recording."""
+    left = _budget_left(deadline)
+    if left is None:
+        _expire_budget(cfg, inert)
         return None
+    timed_out = False
+    try:
+        vectors = embed(_capped(cfg, "embed_timeout_ms", left), [query])
+    except TimeoutError:
+        timed_out = True
+        vectors = None
     except Exception:
         logger.debug("skill router: embeddings call raised", exc_info=True)
-        _log_once("embed unreachable")
-        inert()
-        return None
+        vectors = None
     if not vectors:
-        _log_once("embed unreachable")
-        inert()
+        if _budget_left(deadline) is None:
+            _expire_budget(cfg, inert)
+        elif timed_out:
+            _log_once("embed timeout")
+            inert()
+        else:
+            _log_once("embed unreachable")
+            inert()
         return None
     try:
         return [float(value) for value in vectors[0]]
@@ -242,6 +280,34 @@ def _embed_query(
         _log_once("embed unreachable")
         inert()
         return None
+
+
+def _rerank_scores(
+    cfg: Config,
+    query: str,
+    documents: Sequence[str],
+    rerank: Reranker,
+    inert: Callable[[], None],
+    deadline: float,
+) -> Optional[List[float]]:
+    """Score the shortlist inside the budget, or return ``None`` after logging and recording."""
+    left = _budget_left(deadline)
+    if left is None:
+        _expire_budget(cfg, inert)
+        return None
+    try:
+        scores = rerank(_capped(cfg, "rerank_timeout_ms", left), query, documents)
+    except Exception:
+        logger.debug("skill router: rerank raised", exc_info=True)
+        scores = None
+    if scores is None:
+        if _budget_left(deadline) is None:
+            _expire_budget(cfg, inert)
+        else:
+            _log_once("rerank unreachable")
+            inert()
+        return None
+    return scores
 
 
 def _shortlist(index: Index, query_vector: Sequence[float], limit: int) -> List[ShortlistRow]:

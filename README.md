@@ -279,6 +279,7 @@ partition is computed per request from the catalog rows.
 | `documentPrefix` | `This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: ` | non-empty string | Exact text before `<name> - <description>` in a rerank document. The default matches DSH. |
 | `deferredSkills` | empty | list of skill names | Routable skills. Empty means every non-eager skill is routable; a non-empty list restricts routing to the named skills and lists the rest. |
 | `rerankTimeoutMs` | `20000` | 100..60000 | Per-request rerank timeout. One rerank call carries the whole shortlist. |
+| `routingTimeoutMs` | `30000` | 1000..60000 | Whole routing pass budget, from the query embed through the rerank reply. It starts after the index is loaded or built, so the cold build is never cut, and each per-request timeout is capped at the time left. On expiry the request keeps the bare catalog and gets no suggestions. |
 | `shortlistSize` | `50` | 1..383 | Candidates carried from embeddings into rerank. |
 | `cutoff` | `0.01` | 0..1 | Rerank `relevance_score` a candidate needs, compared inclusively. |
 | `maxSuggestions` | `8` | 0..50 | Hard cap on suggested rows. Zero selects none while kept rows are still listed. |
@@ -407,9 +408,26 @@ it applies no second softmax.
 
 | Setting | Applies to | Default | Bound |
 | --- | --- | --- | --- |
+| `routingTimeoutMs` | One whole routing pass: the query embed, the shortlist, and the rerank reply | 30000 ms | 1000..60000 |
 | `embedTimeoutMs` | One embeddings request, including each index-build chunk | 6000 ms | 100..60000 |
 | `rerankTimeoutMs` | One rerank request carrying the whole shortlist | 20000 ms | 100..60000 |
 | `healthCheckMs` | How long a failed endpoint is not probed again | 60000 ms | 0..3600000 |
+
+`routingTimeoutMs` bounds one whole routing pass. The budget starts after the skill index is
+loaded or built, so it never covers that build: the build issues 27 chunked embeddings requests and
+takes about 38 seconds here, and it already fails through its own path by returning no index
+instead of being cut off. Each per-request timeout is capped at the milliseconds the budget has
+left, so the pass cannot outlive the budget even when both endpoints answer slowly. When the budget
+runs out the plugin abandons the pass: the request keeps the bare catalog and gets no suggestion
+block, the same inert fallback every other failure uses.
+
+The 30000 ms default is the measured cost with headroom. A steady-state single-text embed took 236
+to 306 ms and a 50-document rerank took 2158 to 2255 ms, while the first embed after an endpoint
+restart took 2700 ms, so a cold but healthy pass costs about 5 seconds: 2700 plus 2255. The two
+per-request timeouts allow a 26 second pass at worst, 6000 plus 20000, so the 30000 ms budget sits
+above that ceiling and a working but slow path is never cut. On a host whose endpoints are slower
+than those figures, raise the budget above your own measured cold pass before lowering anything
+else.
 
 ## Point it at your own models
 
@@ -452,6 +470,7 @@ so the catalog comes back and the model keeps working:
 
 - An endpoint is unreachable, refuses the connection, or fails TLS.
 - An endpoint times out.
+- The routing budget runs out before the pass finishes, which leaves the bare catalog in place.
 - An endpoint answers a redirect. The plugin does not follow it, and no second request is sent.
 - A response is malformed, short, long or ragged, or carries a score that is not a finite number.
 - The index cannot be built, is empty, or has no routed rows.
@@ -463,10 +482,11 @@ so the catalog comes back and the model keeps working:
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build
-failed`, `rerank unreachable`, `no user text`, and `unsupported api mode`. After a failure the
-endpoint is not probed again until `healthCheckMs` has passed, so a stopped service costs one
-attempt per window instead of one timeout per request. A cache write failure is logged once and the
-in-memory index is still used.
+failed`, `rerank unreachable`, `no user text`, and `unsupported api mode`. A routing pass that runs
+out of its budget logs one line naming that budget, `routing budget <n> ms exhausted`, and then
+abandons the pass. After a failure the endpoint is not probed again until `healthCheckMs` has
+passed, so a stopped service costs one attempt per window instead of one timeout per request. A
+cache write failure is logged once and the in-memory index is still used.
 
 Only OpenAI-compatible Chat Completions requests, with `api_mode: "chat_completions"`, are
 rewritten. Codex Responses (`api_mode: "codex_responses"`) carries the prompt in `instructions` and

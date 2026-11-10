@@ -53,6 +53,7 @@ LIST_KEYS = {"eagerSkills", "deferredSkills"}
 INT_KEYS = {
     "embedTimeoutMs",
     "rerankTimeoutMs",
+    "routingTimeoutMs",
     "shortlistSize",
     "maxSuggestions",
     "maxDisplayNames",

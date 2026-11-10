@@ -40,6 +40,7 @@ SPEC_DEFAULTS = {
     ),
     "deferredSkills": (),
     "rerankTimeoutMs": 20000,
+    "routingTimeoutMs": 30000,
     "shortlistSize": 50,
     "cutoff": 0.01,
     "maxSuggestions": 8,
@@ -54,6 +55,7 @@ SPEC_DEFAULTS = {
 SPEC_BOUNDS = {
     "embedTimeoutMs": (100, 60000),
     "rerankTimeoutMs": (100, 60000),
+    "routingTimeoutMs": (1000, 60000),
     "shortlistSize": (1, 383),
     "cutoff": (0.0, 1.0),
     "maxSuggestions": (0, 50),
@@ -65,6 +67,7 @@ SPEC_BOUNDS = {
 FIELD_BY_KEY = {
     "embedTimeoutMs": "embed_timeout_ms",
     "rerankTimeoutMs": "rerank_timeout_ms",
+    "routingTimeoutMs": "routing_timeout_ms",
     "shortlistSize": "shortlist_size",
     "cutoff": "cutoff",
     "maxSuggestions": "max_suggestions",
@@ -87,6 +90,7 @@ CONFIG_FIELDS = {
     "rerank_model",
     "rerank_provider",
     "rerank_timeout_ms",
+    "routing_timeout_ms",
     "shortlist_size",
     "cutoff",
     "max_suggestions",
@@ -107,6 +111,8 @@ OUT_OF_BOUNDS = [
     ("embedTimeoutMs", 60001),
     ("rerankTimeoutMs", 0),
     ("rerankTimeoutMs", 60001),
+    ("routingTimeoutMs", 999),
+    ("routingTimeoutMs", 60001),
     ("shortlistSize", 0),
     ("shortlistSize", 384),
     ("cutoff", -0.01),
@@ -161,6 +167,7 @@ def test_load_none_returns_every_default():
     assert cfg.rerank_base_url == "http://127.0.0.1:8010"
     assert cfg.embed_timeout_ms == 6000
     assert cfg.rerank_timeout_ms == 20000
+    assert cfg.routing_timeout_ms == 30000
     assert cfg.shortlist_size == 50
     assert cfg.cutoff == 0.01
     assert cfg.max_suggestions == 8

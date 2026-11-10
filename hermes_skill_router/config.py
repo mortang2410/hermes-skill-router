@@ -70,6 +70,11 @@ _SPECS: Tuple[_Spec, ...] = (
     _Spec("documentPrefix", "document_prefix", "text", DOCUMENT_PREFIX),
     _Spec("deferredSkills", "deferred_skills", "name_list", ()),
     _Spec("rerankTimeoutMs", "rerank_timeout_ms", "int", 20000, 100, 60000),
+    # One routing pass, from the query embed through the rerank reply. It starts after the
+    # index is loaded or built, so it never covers the ~38 s cold build, and it is larger
+    # than 6000 + 20000, the sum of the two per-request timeouts, so a working but slow
+    # pass is never cut. Bounds are the same shape as the per-request ones.
+    _Spec("routingTimeoutMs", "routing_timeout_ms", "int", 30000, 1000, 60000),
     _Spec("shortlistSize", "shortlist_size", "int", 50, 1, 383),
     _Spec("cutoff", "cutoff", "float", 0.01, 0.0, 1.0),
     _Spec("maxSuggestions", "max_suggestions", "int", 8, 0, 50),
@@ -109,6 +114,7 @@ class Config:
     rerank_model: str
     rerank_provider: str
     rerank_timeout_ms: int
+    routing_timeout_ms: int
     shortlist_size: int
     cutoff: float
     max_suggestions: int
