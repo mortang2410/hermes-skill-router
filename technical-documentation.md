@@ -542,7 +542,8 @@ the only requirement is that every response for one index uses one consistent wi
 ## Failure behaviour
 
 The plugin fails open and inert. Any of these conditions leaves the request exactly as it arrived, so
-the catalog comes back and the model keeps working:
+the catalog comes back and the model keeps working when it is the first failure in the compaction
+window:
 
 - An endpoint is unreachable, refuses the connection, or fails TLS.
 - An endpoint times out.
@@ -555,6 +556,21 @@ the catalog comes back and the model keeps working:
 - The last message already starts with the shared first line of either header, so a replayed request
   is not injected twice.
 - The plugin is disabled, or the request carries no skills section.
+
+The catalog is shown once per compaction window. The first failed pass in a window leaves the
+request unchanged and sends the whole catalog, a dump, and the rewrite records that fact in the
+payload it returns by appending one marker message, `Skill catalog dropped after a routing
+failure`. Hermes rebuilds the system message each turn from its cached prompt and drops the prior
+turn's appended system messages, so the marker reaches the payload the rewrite sees through the
+history the host carries forward. The rewrite recognises the marker in a later request and, on any
+further failed pass in that window, strips the catalog and appends the marker again instead of
+dumping the catalog a second time. It also suggests nothing after a dump, because the dump showed
+every skill and nothing is suggestible for the rest of that window. The marker names no skill and
+does not read as a routed block. A compaction that removes the marker starts a new window and the
+catalog may be dumped once again. When the first failure arrives in a window the request is left
+unchanged, and when the marker is already present the rewrite is a clean catalog strip plus one
+marker message, never a partial strip. `None` is still returned whenever there is no marker and no
+prior block, so a strip without a replacement never loses the catalog for nothing.
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build failed`,

@@ -22,8 +22,11 @@ the spec's order of work and nothing else:
 
 The strip is atomic with the injection: a request only loses its skills section when a non-empty
 block replaces it. Any failure, such as an unreachable or timed-out endpoint, an unbuildable index,
-no user text or an empty block, returns ``None``, and ``_apply_request_chain`` then keeps the payload
-that arrived, catalog included (R5, D8). The rewrite never raises and never mutates its input.
+no user text or an empty block, returns ``None`` on the first failure in a compaction window, and
+``_apply_request_chain`` then keeps the payload that arrived, catalog included (R5, D8). On a later
+failure in the same window the rewrite strips the catalog and appends one marker message instead,
+so the whole catalog never reaches the model twice in one window. The rewrite never raises and
+never mutates its input.
 
 Steps 3 and 4 are :func:`hermes_skill_router.search.rank`, the same pass the model's search tool
 runs, so a turn and a search for the same query and catalog can never disagree. The pass hands back
@@ -37,7 +40,9 @@ pass that reaches the end of it is abandoned with one log line naming the budget
 Suppression and the opening flag both come from the payload's own messages, never from module state.
 A message whose content opens with the block's shared first line is a block this plugin injected
 earlier in the compaction window: its suggested names are suppressed, and its presence means this is
-not the window's opening block. A compaction that removes the block leaves neither, so the names are
+not the window's opening block. A message whose content opens with the dropped marker's first line
+is the proof that the whole catalog already went out in this window, so a later turn strips the
+catalog again and suggests nothing. A compaction that removes both leaves neither, so the names are
 suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
 the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
 
@@ -73,7 +78,7 @@ from .catalog import strip_catalog
 from .config import Config
 from .display import INERT, ROUTED, record
 from .embed import embed_texts as default_embed
-from .inject import HEADER, render, suggested_names
+from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
 from .search import Ranked, forget_session, rank, remember_partition
@@ -88,6 +93,10 @@ CHAT_COMPLETIONS = "chat_completions"
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
 INJECTED_HEADER = HEADER.split("\n", 1)[0]
+
+#: The dropped-catalog marker's first line. It is distinct from the block header on purpose: the
+#: strip guard below recognises the marker as its own proof that the catalog already went out.
+DROPPED_HEADER_LINE = DROPPED_HEADER.split("\n", 1)[0]
 
 #: The most preceding-context characters that join the newest typed message, counted over whole
 #: messages from the newest backwards. The newest message itself is never part of this cap.
@@ -185,6 +194,8 @@ def _compose(
     if _already_injected(messages):
         # The previous turn's block is the last message; injecting again would compound it.
         return None
+    previous = _prior_blocks(messages)
+    dropped_before = _dropped_before(messages)
     stripped, partition = strip_catalog(
         payload, eager=cfg.eager_skills, deferred=cfg.deferred_skills
     )
@@ -196,13 +207,36 @@ def _compose(
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition)
     inert = _recorder(cfg, INERT, (), session_id, turn_id, notify)
+
+    def _fail(reason: str):
+        """Return the failure result for this pass.
+
+        The first failure in a window returns ``None`` and the request keeps its catalog, which
+        is one clean dump. A later failure in the same window strips the catalog and appends the
+        dropped marker, so the model never reads the whole catalog twice. Both paths record
+        inert and log once, and both leave the input payload untouched.
+        """
+        _log_once(reason)
+        inert()
+        if not previous and not dropped_before:
+            return None
+        return {
+            "request": {
+                **dict(payload),
+                "messages": [
+                    *list(stripped.get("messages") or ()),
+                    {"role": "system", "content": DROPPED_MESSAGE},
+                ],
+            }
+        }
+
     query = _query_text(messages)
     if not query:
-        _log_once("no user text")
-        inert()
-        return None
+        return _fail("no user text")
     if not partition.routed.names:
         # Every row was kept: there is nothing to suggest and nothing a block would replace.
+        # This is the empty-selection case: the strip without a replacement would lose the
+        # catalog for nothing, so the whole request is returned untouched on every pass.
         inert()
         return None
     if index is None:
@@ -212,20 +246,19 @@ def _compose(
             logger.debug("skill router: index build raised", exc_info=True)
             index = None
         if index is None:
-            _log_once("index build failed")
-            inert()
-            return None
+            return _fail("index build failed")
     if not index.names:
         inert()
         return None
+    if dropped_before:
+        # A dump earlier in this window already showed every skill, so nothing is suggestible
+        # for the rest of the window even when ranking would succeed now.
+        return _fail("catalog already dumped in this window")
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank)
     if ranked.reason:
-        _log_once(ranked.detail)
-        inert()
-        return None
+        return _fail(ranked.detail)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
-    previous = _prior_blocks(messages)
     suppressed = {name for block in previous for name in suggested_names(block)}
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
@@ -342,6 +375,22 @@ def _prior_blocks(messages: Any) -> List[str]:
         if isinstance(content, str) and content.startswith(INJECTED_HEADER):
             blocks.append(content)
     return blocks
+
+
+def _dropped_before(messages: Any) -> bool:
+    """Return whether any message opens with the dropped-catalog marker's first line.
+
+    The marker is this plugin's own proof that the whole catalog already went out in this window
+    on a failed pass. A compaction that removes it starts a new window and the catalog may go
+    out again, exactly as with a routed block.
+    """
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.startswith(DROPPED_HEADER_LINE):
+            return True
+    return False
 
 
 def _resolve_paths(names: Sequence[str]) -> Dict[str, str]:

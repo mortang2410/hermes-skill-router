@@ -28,7 +28,7 @@ from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.config import DEFAULTS, Config, load  # noqa: E402
-from hermes_skill_router.inject import HEADER, ONE_SHOT_HEADER, PINNED  # noqa: E402
+from hermes_skill_router.inject import (DROPPED_MESSAGE, HEADER, ONE_SHOT_HEADER, PINNED)  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
@@ -1362,3 +1362,135 @@ def test_the_display_record_is_byte_identical_to_the_pre_change_build(tmp_path):
     record = record_for(cfg)
     record.pop("at")
     assert record == GOLDEN_RECORD
+
+
+# ---------------------------------------------------------------------------
+# The catalog reaches the model once per compaction window. A failed pass that leaves
+# the catalog in place is a dump: the next turn in the same window must not dump it
+# again, and no later turn suggests a name the dump already showed.
+# ---------------------------------------------------------------------------
+
+
+def test_two_failing_passes_dump_the_catalog_once_and_no_name_twice(tmp_path):
+    """Invariant 1 and 2, decisive probe: two consecutive requests whose routing fails."""
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+
+    first = rewrite(
+        payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+    assert first is None, "the first failure leaves the request unchanged"
+
+    # The first request went out with the catalog on the wire. The second request carries
+    # the marker the first strip appended, below the rebuilt system message.  The marker
+    # itself names no skill; the names it stands for came from the catalog the first
+    # request exposed.
+    payload_marker = {
+        **payload,
+        "messages": [
+            payload["messages"][0],
+            {"role": "user", "content": payload["messages"][1]["content"]},
+            {"role": "system", "content": DROPPED_MESSAGE},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next request"},
+        ],
+    }
+
+    second = rewrite(
+        payload_marker, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+
+    assert second is not None, "the second request re-dumped the catalog"
+    rewritten = second["request"]
+    system = rewritten["messages"][0]["content"]
+    assert "## Skills" not in system, "the catalog survived into the second request"
+    assert "<available_skills>" not in system
+    # The first request exposed every skill. The second request exposes no name again
+    # through the catalog, and the marker it appends names no skill.
+    for name, _description in ROWS:
+        assert name not in str(rewritten["messages"]), (
+            f"{name} reached the model in the second request"
+        )
+    assert len(rewritten["messages"]) == len(payload_marker["messages"]) + 1
+    assert rewritten["messages"][-1]["role"] == "system"
+
+
+def test_a_fresh_window_allows_the_catalog_again(tmp_path):
+    """Invariant 3: a payload with no prior router block opens a new window."""
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+
+    rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker())
+    fresh = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker())
+
+    assert fresh is None, "a fresh window must not strip the catalog on a failed pass"
+    good = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker())
+    assert good is not None
+    assert "- beta: Beta skill" in block_of(good)
+
+
+def test_a_dump_never_corrupts_the_request(tmp_path):
+    """Invariant 4: a dump keeps every top-level key and appends one clean system message."""
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+    second_input = {**payload, "messages": [
+        payload["messages"][0],
+        payload["messages"][1],
+        {"role": "system", "content": DROPPED_MESSAGE},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "next request"},
+    ]}
+
+    result = rewrite(
+        second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+
+    assert result is not None
+    assert set(result) == {"request"}
+    rewritten = result["request"]
+    assert rewritten["model"] == "test-model"
+    assert rewritten["tools"] == payload["tools"]
+    assert rewritten["unrelated_key"] == {"kept": True}
+    assert len(rewritten["messages"]) == len(second_input["messages"]) + 1
+    last = rewritten["messages"][-1]
+    assert last["role"] == "system"
+    assert "Skills routed for this request" not in last["content"], (
+        "the strip marker must not pose as a routed block"
+    )
+    assert record_for(cfg)["status"] == "inert"
+
+
+def test_a_first_failure_without_a_marker_returns_none(tmp_path):
+    """Invariant 4: the first failure in a window leaves the request as it arrived."""
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    before = copy.deepcopy(payload)
+
+    result = rewrite(
+        payload, cfg=cfg, index=make_index(), embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+
+    assert result is None
+    assert payload == before
+
+
+def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):
+    """Invariant 1, routed branch: the catalog is stripped every turn, never re-dumped."""
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+
+    first = rewrite(
+        payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert first is not None
+    second_input = _second_turn(payload, block_of(first))
+
+    second = rewrite(
+        second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+
+    assert second is None or "## Skills" not in second["request"]["messages"][0]["content"]

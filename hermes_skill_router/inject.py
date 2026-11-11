@@ -100,6 +100,20 @@ ALSO_LISTED = "Also listed:"
 #: Prefix of the read-path line under a suggestion or pinned row.
 PATH_PREFIX = "  path: "
 
+#: The one-line marker a stripped request carries when routing failed and the catalog went out
+#: instead. The first line is neither block header, so the recogniser never reads it as a
+#: suggestion, and carries no skill name, so it cannot pose as exposure of any one skill.
+#: The rewrite recognises it in a later request and strips the catalog again, which keeps the
+#: whole catalog out of the window after the first dump.
+DROPPED_HEADER = "Skill catalog dropped after a routing failure"
+
+DROPPED_MESSAGE = (
+    "Skill catalog dropped after a routing failure\n"
+    "The full skill catalog was already shown earlier in this compaction window, so it is not "
+    "shown again. Call skills_list to see every skill available, or load one with "
+    "skill_view(name). Do not guess a skill name: use the list or the loader."
+)
+
 #: Names whose pinned row was omitted for a missing path, so one warning is logged per process.
 _PINNED_WARNED: set[str] = set()
 

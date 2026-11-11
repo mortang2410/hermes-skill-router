@@ -34,8 +34,9 @@ typed messages before it (up to 10,000 characters), with the skill rows and keep
 The rerank endpoint scores that shortlist against the same query, and the plugin suggests what
 scores at or above `cutoff`.
 
-If a service is down or too slow, the plugin falls back to the ordinary skill catalog, so a bad
-endpoint costs latency, not a broken turn.
+If a service is down or too slow, the plugin falls back to the ordinary skill catalog once per
+compaction window, so a bad endpoint costs latency, not a broken turn, and the catalog never
+reaches the model twice in the same window.
 
 ## Install
 
