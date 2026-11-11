@@ -105,7 +105,7 @@ def test_both_headers_share_their_first_line_and_differ_only_after_it():
     assert "## Skills" not in HEADER
     assert "## Skills" not in ONE_SHOT_HEADER
 
-    # Both fixed texts are pinned here: the normal one is quoted by the README.
+    # Both fixed texts are pinned here: the normal one is quoted by technical-documentation.md.
     assert "even partially relevant" in HEADER
     assert "Do not load general process skills" in ONE_SHOT_HEADER
     assert "Do not load general process skills" not in HEADER
