@@ -48,7 +48,13 @@ DISPATCH_KWARGS = {
     "api_call_count": 1,
 }
 
-BOOL_KEYS = {"enabled", "showSuggestions"}
+BOOL_KEYS = {
+    "enabled",
+    "showSuggestions",
+    "channelsSemantic",
+    "channelsBm25",
+    "channelsAssociations",
+}
 LIST_KEYS = {"eagerSkills", "deferredSkills"}
 INT_KEYS = {
     "embedTimeoutMs",
@@ -56,6 +62,8 @@ INT_KEYS = {
     "routingTimeoutMs",
     "shortlistSize",
     "maxSuggestions",
+    "frecencyHalfLifeDays",
+    "frecencyCapPositions",
     "maxDisplayNames",
     "maxDescriptionChars",
     "healthCheckMs",
@@ -183,10 +191,7 @@ def _install(hermes, dispatcher, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _host_paths(monkeypatch):
-    """The host lookup resolves every name, and no dump record leaks between tests."""
-    from hermes_skill_router import search as search_module
-
-    search_module.clear_dumps()
+    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
     resolver = lambda name: f"/skills/{name}/SKILL.md"
     for module_name, module in list(sys.modules.items()):
         if module_name.endswith("router") and hasattr(module, "skill_path"):

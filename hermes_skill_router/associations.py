@@ -53,12 +53,14 @@ bit-identical: both apply the same recurrence to the same events in ``load_event
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
 import os
 import pathlib
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -81,8 +83,14 @@ HERMES_STATE_DB = os.path.join(".hermes", "state.db")
 #: One writer at a time, and a writer waits this long for the other one.
 BUSY_TIMEOUT_MS = 5000
 
+#: One day in milliseconds, the unit every decay window is written in.
+DAY_MS = 24 * 60 * 60 * 1000
+
 #: Association decay half-life. The design's 30 days, not frecency's 14.
-ASSOCIATION_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000
+ASSOCIATION_HALF_LIFE_MS = 30 * DAY_MS
+
+#: Frecency half-life used when the caller passes no usable value. The setting's default matches.
+DEFAULT_USAGE_HALF_LIFE_DAYS = 14
 
 #: A skill missing from the catalog keeps its rows this long before the purge.
 DELETED_SKILL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
@@ -650,6 +658,7 @@ class AssociationWeight:
     skill_id: int
     weight: float
     support: int
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -1327,39 +1336,60 @@ def decayed_weights(
     store: AssociationStore,
     terms: Sequence[str],
     now_ms: Optional[int] = None,
+    support_floor: int = 0,
 ) -> List[AssociationWeight]:
     """Return association weights for a query's terms, decayed to *now_ms* and summed per skill.
 
-    Only live skills are returned. An ambient skill is filtered out here rather than deleted from
-    the table, because the ubiquity ratio has to stay measurable from the same rows; the association
-    channel simply contributes no rank for it.
+    Only live, non-ambient skills are returned. *support_floor* is applied to each ``(term, skill)``
+    row before its weight is summed, so a skill whose matching rows each carry support 1 contributes
+    no rank at the channel's floor of 3 even when its total support reaches 3 through other terms.
+    An ambient skill is filtered out here rather than deleted from the table, because the ubiquity
+    ratio has to stay measurable from the same rows; the association channel simply contributes no
+    rank for it.
     """
     stamp = _now() if now_ms is None else int(now_ms)
     unique = [term for term in dict.fromkeys(terms) if term]
     if not unique:
         return []
     placeholders = ", ".join("?" for _ in unique)
+    floor = max(0, int(support_floor))
+    conditions = [
+        "s.deleted_at_ms IS NULL",
+        f"a.term IN ({placeholders})",
+    ]
+    arguments: List[Any] = list(unique)
+    if floor > 1:
+        conditions.append("a.support >= ?")
+        arguments.append(floor)
     rows = store.conn.execute(
-        f"""SELECT a.skill_id AS skill_id, a.weight AS weight, a.last_ms AS last_ms
+        f"""SELECT a.skill_id AS skill_id, a.weight AS weight, a.last_ms AS last_ms,
+                   s.name AS name
             FROM association a JOIN skill s ON s.id = a.skill_id
-            WHERE s.deleted_at_ms IS NULL AND a.term IN ({placeholders})""",
-        tuple(unique),
+            WHERE {' AND '.join(conditions)}""",
+        tuple(arguments),
     ).fetchall()
     if not rows:
         return []
     ambient = ambient_skill_ids(store, stamp)
     by_skill: Dict[int, float] = {}
+    names: Dict[int, str] = {}
     for row in rows:
         skill_id = int(row["skill_id"])
         if skill_id in ambient:
             continue
         decayed = float(row["weight"]) * decay_factor(stamp - int(row["last_ms"]))
         by_skill[skill_id] = by_skill.get(skill_id, 0.0) + decayed
+        names[skill_id] = str(row["name"])
     if not by_skill:
         return []
     support = _skill_support(store)
     weights = [
-        AssociationWeight(skill_id=skill_id, weight=weight, support=support.get(skill_id, 0))
+        AssociationWeight(
+            skill_id=skill_id,
+            weight=weight,
+            support=support.get(skill_id, 0),
+            name=names.get(skill_id, ""),
+        )
         for skill_id, weight in by_skill.items()
     ]
     weights.sort(key=lambda item: (-item.weight, item.skill_id))
@@ -1411,6 +1441,55 @@ def ambient_skill_ids(store: AssociationStore, now_ms: Optional[int] = None) -> 
         if is_ambient(count, prompts):
             ambient.add(skill_id)
     return ambient
+
+
+def usage_scores(
+    store: AssociationStore,
+    half_life_days: float = DEFAULT_USAGE_HALF_LIFE_DAYS,
+    now_ms: Optional[int] = None,
+) -> Dict[str, float]:
+    """Return the decayed usage score per skill name, for the recency bump.
+
+    The score is ``sum over distinct tasks of 0.5 ** (age_days / half_life_days)``. A task is one
+    session turn: a skill loaded three times in one turn counts once, which one grouped scan with
+    ``GROUP BY skill, session, turn`` produces directly. Ambient and soft-deleted skills are
+    excluded here rather than filtered later, so the caller can treat the map as the complete gated
+    usage signal. A skill with no load history is simply absent.
+
+    The read is one grouped scan. This function writes nothing, migrates nothing and vacuums
+    nothing; the caller opens the store read-only on the turn path.
+    """
+    stamp = _now() if now_ms is None else int(now_ms)
+    days = float(half_life_days) if _positive_number(half_life_days) else float(DEFAULT_USAGE_HALF_LIFE_DAYS)
+    half_life_ms = days * DAY_MS
+    rows = store.conn.execute(
+        """SELECT s.id AS skill_id, s.name AS name, min(le.observed_ms) AS observed_ms
+           FROM load_event le
+           JOIN prompt_event pe ON pe.id = le.prompt_event_id
+           JOIN skill s ON s.id = le.skill_id
+           WHERE s.deleted_at_ms IS NULL
+           GROUP BY s.id, pe.session_id, pe.turn"""
+    ).fetchall()
+    if not rows:
+        return {}
+    ambient = ambient_skill_ids(store, stamp)
+    scores: Dict[str, float] = {}
+    for row in rows:
+        skill_id = int(row["skill_id"])
+        if skill_id in ambient:
+            continue
+        age_ms = max(0, stamp - int(row["observed_ms"]))
+        decayed = 0.5 ** (age_ms / half_life_ms if half_life_ms else 0.0)
+        name = str(row["name"])
+        scores[name] = scores.get(name, 0.0) + decayed
+    return scores
+
+
+def _positive_number(value: Any) -> bool:
+    """Return whether *value* is a positive finite number, not a boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and float(value) > 0
 
 
 def maintenance(
@@ -2357,3 +2436,102 @@ def _stamp_of(value: Any) -> int:
 def _now() -> int:
     """Return the current epoch milliseconds."""
     return int(time.time() * 1000)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the association backfill as a command and print what it did.
+
+    The command reads the Hermes session store read-only, writes only the association store, accepts
+    a bounded session count and is idempotent by the store's own uniqueness. Exit status is 0 for a
+    completed run, 1 when the store or the session store cannot be read.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python3 -m hermes_skill_router.associations",
+        description=(
+            "Fill the association store from the Hermes session store. The session store is opened "
+            "read-only; only the association store is written."
+        ),
+    )
+    parser.add_argument(
+        "--db",
+        default=default_association_db_path(),
+        help="association database to write (default: the router cache directory)",
+    )
+    parser.add_argument(
+        "--state-db",
+        default=default_state_db_path(),
+        help="Hermes session store to read (default: ~/.hermes/state.db)",
+    )
+    parser.add_argument(
+        "--max-sessions",
+        type=int,
+        default=None,
+        help="scan at most this many of the newest sessions; omit to scan the whole store",
+    )
+    parser.add_argument(
+        "--catalog",
+        default=None,
+        help="optional JSON file of catalog names, or an index file with a names list",
+    )
+    parser.add_argument(
+        "--now-ms",
+        type=int,
+        default=None,
+        help="read clock in epoch milliseconds; defaults to the current clock",
+    )
+    args = parser.parse_args(argv)
+    if args.max_sessions is not None and args.max_sessions < 0:
+        parser.error("--max-sessions must be zero or more")
+    catalog: List[CatalogSkill] = []
+    if args.catalog:
+        try:
+            with open(args.catalog, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError) as error:
+            print(f"associations: cannot read catalog {args.catalog}: {error}", file=sys.stderr)
+            return 1
+        names = data.get("names") if isinstance(data, dict) else data
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            print(f"associations: {args.catalog} carries no list of skill names", file=sys.stderr)
+            return 1
+        catalog = [CatalogSkill(name) for name in names]
+    try:
+        store = open_store(args.db)
+    except AssociationStoreError as error:
+        print(f"associations: {error}", file=sys.stderr)
+        return 1
+    try:
+        report = backfill(
+            store,
+            args.state_db,
+            catalog=catalog,
+            now_ms=args.now_ms,
+            max_sessions=args.max_sessions,
+        )
+    except (AssociationStoreError, sqlite3.Error, OSError) as error:
+        print(f"associations: the backfill failed: {error}", file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    print(
+        json.dumps(
+            {
+                "sessions_found": report.sessions_found,
+                "sessions_scanned": report.sessions_scanned,
+                "sessions_skipped": report.sessions_skipped,
+                "prompts": report.prompts,
+                "loads": report.loads,
+                "duplicates": report.duplicates,
+                "rejected": report.rejected,
+                "ambient_loads": report.ambient_loads,
+                "last_scan_ms": report.last_scan_ms,
+                "ms": report.ms,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

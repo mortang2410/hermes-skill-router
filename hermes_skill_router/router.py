@@ -37,17 +37,14 @@ build, which embeds the whole catalog in batches and already fails through its o
 per-request timeout is capped by the milliseconds left, so the pass cannot outlive the budget, and a
 pass that reaches the end of it is abandoned with one log line naming the budget.
 
-Suppression and the opening flag come from the payload's own messages. A message whose content
-opens with the block's shared first line is a block this plugin injected earlier in the compaction
-window: its suggested names are suppressed, and its presence means this is not the window's
-opening block. The dropped-catalog marker alone cannot prove a dump, because Hermes rebuilds
-every request from message history and never copies ``api_kwargs`` messages back into it; a
-payload check for the marker must be system-role only and must read list-shaped content too.
-The dump fact lives in a per-session durable record next to the partitions in
-:mod:`hermes_skill_router.search`, set by the first failed pass in a window and cleared when a
-request shows no prior block, so the record expires with the window and a compaction that
-removes the blocks starts a new one. Routing the same payload twice therefore returns the same
-result, and the second pass of an unchanged payload is left untouched by the replay guard.
+Suppression and the opening flag both come from the payload's own messages, never from module state.
+A message whose content opens with the block's shared first line is a block this plugin injected
+earlier in the compaction window: its suggested names are suppressed, and its presence means this is
+not the window's opening block. A message whose content opens with the dropped marker's first line
+is the proof that the whole catalog already went out in this window, so a later turn strips the
+catalog again and suggests nothing. A compaction that removes both leaves neither, so the names are
+suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
+the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
 
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
 request clears the previous one first, so a search never ranks rows from an earlier prompt (D10).
@@ -84,7 +81,7 @@ from .embed import embed_texts as default_embed
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
-from .search import Ranked, clear_dump, dumped, forget_session, rank, remember_dump, remember_partition
+from .search import Ranked, forget_session, rank, remember_partition
 from .select import Suggestion, select
 from .tools import skill_path
 
@@ -199,16 +196,6 @@ def _compose(
         return None
     previous = _prior_blocks(messages)
     dropped_before = _dropped_before(messages)
-    dumped_before = dumped(session_id)
-    if dumped_before:
-        # A durable dump fact: a second pass in this window strips even when this payload shows
-        # no prior block, because the host never copies the marker back into history. It may
-        # not clear the fact here, or the fresh-window signal (no prior block) would lose it.
-        dropped_before = True
-    elif not previous and not dropped_before:
-        # No prior block or marker in this payload: the compaction removed them, so this
-        # request opens a new window and any stale dump fact expires with the old one.
-        clear_dump(session_id)
     stripped, partition = strip_catalog(
         payload, eager=cfg.eager_skills, deferred=cfg.deferred_skills
     )
@@ -231,8 +218,7 @@ def _compose(
         """
         _log_once(reason)
         inert()
-        if not previous and not dropped_before and not dumped_before:
-            remember_dump(session_id)
+        if not previous and not dropped_before:
             return None
         return {
             "request": {
@@ -249,7 +235,10 @@ def _compose(
         return _fail("no user text")
     if not partition.routed.names:
         # Every row was kept: there is nothing to suggest and nothing a block would replace.
-        return _fail("no routed skill to suggest")
+        # This is the empty-selection case: the strip without a replacement would lose the
+        # catalog for nothing, so the whole request is returned untouched on every pass.
+        inert()
+        return None
     if index is None:
         try:
             index = load_or_build(cfg, partition.routed, embed)
@@ -259,12 +248,13 @@ def _compose(
         if index is None:
             return _fail("index build failed")
     if not index.names:
-        return _fail("the skill index carries no row")
-    if dropped_before or dumped_before:
+        inert()
+        return None
+    if dropped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
         # for the rest of the window even when ranking would succeed now.
         return _fail("catalog already dumped in this window")
-    ranked = rank(cfg, index, query, embed=embed, rerank=rerank)
+    ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=skill_path)
     if ranked.reason:
         return _fail(ranked.detail)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
@@ -293,10 +283,8 @@ def _compose(
         paths=paths,
     )
     if not block:
-        # A completed pass whose selection emptied because every candidate was already
-        # suggested or fell below the cutoff is healthy, not a routing failure: the window
-        # was already routed, so nothing is appended and no dump record is set. Only a
-        # failed embed, rerank or index arm consumes the window's one dump.
+        # No selected suggestion and no kept row: stripping without a replacement would lose the
+        # catalog for nothing, so the whole request is returned untouched.
         inert()
         return None
     rewritten = {
@@ -367,21 +355,9 @@ def _already_injected(messages: Any) -> bool:
     """Return whether the last message already starts with the injected block header."""
     if not isinstance(messages, list) or not messages:
         return False
-    return _message_text(messages[-1]).startswith(INJECTED_HEADER)
-
-
-def _message_text(message: Any) -> str:
-    """Return one message's text from a string or a list of text parts, else ``""``."""
-    content = message.get("content") if isinstance(message, Mapping) else None
-    if isinstance(content, str):
-        return content
-    if isinstance(content, (list, tuple)):
-        return "\n".join(
-            part["text"]
-            for part in content
-            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
-        )
-    return ""
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, Mapping) else None
+    return isinstance(content, str) and content.startswith(INJECTED_HEADER)
 
 
 def _prior_blocks(messages: Any) -> List[str]:
@@ -389,32 +365,30 @@ def _prior_blocks(messages: Any) -> List[str]:
 
     Only a message that opens with that line counts, so user text that merely mentions a skill name,
     or quotes the marker later in a line, never seeds the suppressed set. The returned blocks are the
-    payload's own record of what earlier turns in this compaction window showed. A list-shaped
-    content whose text opens with the line counts the same way, so no payload check misses it.
+    payload's own record of what earlier turns in this compaction window showed.
     """
     blocks: List[str] = []
     if not isinstance(messages, list):
         return blocks
     for message in messages:
-        text = _message_text(message)
-        if text.startswith(INJECTED_HEADER):
-            blocks.append(text)
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.startswith(INJECTED_HEADER):
+            blocks.append(content)
     return blocks
 
 
 def _dropped_before(messages: Any) -> bool:
-    """Return whether a system message opens with the dropped-catalog marker's first line.
+    """Return whether any message opens with the dropped-catalog marker's first line.
 
-    Only a system message counts: any role could start a message with this text and silence
-    routing, so a user or assistant message that happens to quote it must never act as proof
-    that the catalog already went out. List-shaped content counts the same way as a string.
+    The marker is this plugin's own proof that the whole catalog already went out in this window
+    on a failed pass. A compaction that removes it starts a new window and the catalog may go
+    out again, exactly as with a routed block.
     """
     if not isinstance(messages, list):
         return False
     for message in messages:
-        if not isinstance(message, Mapping) or message.get("role") != "system":
-            continue
-        if _message_text(message).startswith(DROPPED_HEADER_LINE):
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.startswith(DROPPED_HEADER_LINE):
             return True
     return False
 

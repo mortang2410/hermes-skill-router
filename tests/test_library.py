@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hermes_skill_router import bm25 as bm25_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router.catalog import CatalogRows, strip_catalog  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
@@ -30,6 +31,7 @@ from hermes_skill_router.library import (  # noqa: E402
     document_text,
     fingerprint,
     load_or_build,
+    shortlist,
 )
 
 STABLE = "You are Hermes Agent."
@@ -98,8 +100,9 @@ def make_config(tmp_path, **overrides):
 
 @pytest.fixture(autouse=True)
 def empty_memo(monkeypatch):
-    """Start every test as a fresh process, so the memo never leaks between tests."""
+    """Start every test as a fresh process, so neither memo leaks between tests."""
     monkeypatch.setattr(library_module, "_MEMO", {})
+    monkeypatch.setattr(library_module, "_TERM_MEMO", {})
 
 
 def render_content(rows=ROUTED_ROWS, demoted=()):
@@ -580,11 +583,15 @@ def test_the_cache_is_written_through_a_temporary_file(monkeypatch, tmp_path):
     index = load_or_build(make_config(tmp_path), BASE_ROWS, CountingEmbedder())
 
     assert index is not None
-    assert len(replaced) == 1
-    assert replaced[0][1] == str(cache_file)
-    assert replaced[0][0] != str(cache_file)
+    assert len(replaced) == 2, "the vector index and the term index are each replaced atomically"
+    destinations = {destination for _source, destination in replaced}
+    assert destinations == {str(cache_file), str(tmp_path / "bm25.json")}
+    for source, destination in replaced:
+        assert source != destination
     assert cache_file.is_file()
+    assert (tmp_path / "bm25.json").is_file()
     assert not list(tmp_path.glob(".index-*"))
+    assert not list(tmp_path.glob(".bm25-*"))
 
 
 @pytest.mark.parametrize(
@@ -707,6 +714,109 @@ def test_the_cache_survives_a_second_process(tmp_path):
         "dim": built.dim,
         "fingerprint": built.fingerprint,
     }
+
+
+# ---------------------------------------------------------------------------
+# The term channel: built beside the vector index, digest-gated, never a precondition.
+# ---------------------------------------------------------------------------
+
+
+def test_the_term_index_is_written_beside_the_vector_index(tmp_path):
+    cfg = make_config(tmp_path)
+    index = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+
+    term_file = tmp_path / "bm25.json"
+    assert term_file.is_file()
+    data = json.loads(term_file.read_text(encoding="utf-8"))
+    assert data["version"] == bm25_module.TERM_INDEX_VERSION
+    assert (data["k1"], data["b"]) == (bm25_module.BM25_K1, bm25_module.BM25_B)
+    assert [document["name"] for document in data["documents"]] == index.names
+    assert index.term_index is not None
+
+
+def test_the_term_index_and_the_embedder_read_one_document_text(tmp_path):
+    cfg = make_config(tmp_path)
+    embedder = CountingEmbedder()
+    index = load_or_build(cfg, BASE_ROWS, embedder)
+
+    texts = [
+        document_text(cfg, name, description)
+        for name, description in zip(index.names, index.descriptions)
+    ]
+    assert embedder.texts == texts
+    pairs = list(zip(index.names, texts))
+    assert index.term_index.catalog_digest == bm25_module.catalog_digest(pairs)
+    assert [document.length for document in index.term_index.documents] == [
+        len(bm25_module.tokenise(text)) for text in texts
+    ]
+
+
+def test_a_foreign_term_index_is_refused_and_the_semantic_channel_still_routes(
+    monkeypatch, tmp_path, caplog
+):
+    cfg = make_config(tmp_path)
+    built = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+    foreign = bm25_module.build_term_index([("other", "other text entirely")])
+    bm25_module.write_term_index(str(tmp_path / "bm25.json"), foreign)
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    monkeypatch.setattr(library_module, "_TERM_MEMO", {})
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        index = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+
+    assert index.term_index is None
+    assert index.names == built.names
+    warnings = [record for record in caplog.records if "term index" in record.getMessage()]
+    assert len(warnings) == 1, [record.getMessage() for record in warnings]
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        rows = shortlist(index, index.vectors[0], "alpha beta", 5, cfg=cfg)
+    assert rows, "the semantic channel still routes without a term index"
+    assert len([record for record in caplog.records if "term index" in record.getMessage()]) == 1
+
+
+def test_a_term_index_that_cannot_be_built_keeps_the_vector_pass_and_warns_once(
+    monkeypatch, tmp_path, caplog
+):
+    cfg = make_config(tmp_path)
+
+    def boom(rows, cache_path=None):
+        raise RuntimeError("tokeniser exploded")
+
+    monkeypatch.setattr(bm25_module, "build_term_index", boom)
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        index = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+
+    assert index is not None
+    assert index.names == list(BASE_ROWS.names)
+    assert index.term_index is None
+    assert (tmp_path / "index.json").is_file()
+    assert not (tmp_path / "bm25.json").exists()
+    warnings = [record for record in caplog.records if "could not be built" in record.getMessage()]
+    assert len(warnings) == 1
+    rows = shortlist(index, index.vectors[0], "alpha", 5, cfg=cfg)
+    assert rows, "the vector channel still routes after a term build failure"
+
+
+def test_the_term_index_is_loaded_once_per_process(monkeypatch, tmp_path):
+    cfg = make_config(tmp_path)
+    load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    monkeypatch.setattr(library_module, "_TERM_MEMO", {})
+    calls = []
+    real_load = bm25_module.load_term_index
+
+    def counting(path, rows):
+        calls.append(path)
+        return real_load(path, rows)
+
+    monkeypatch.setattr(bm25_module, "load_term_index", counting)
+    first = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})  # a new fingerprint memo, same process
+    second = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+
+    assert first.term_index is not None and second.term_index is not None
+    assert len(calls) == 1, "a warm process re-read the term index"
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1102,7 @@ def test_a_failed_cache_replace_keeps_the_previous_cache_and_removes_its_sibling
 
     assert index is not None, "the in-memory index survives a cache write failure"
     assert (tmp_path / "index.json").read_text() == before
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["index.json"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["bm25.json", "index.json"]
 
 
 def test_a_refused_sibling_removal_keeps_one_file_and_names_it(tmp_path, monkeypatch, caplog):

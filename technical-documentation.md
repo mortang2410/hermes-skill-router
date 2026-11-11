@@ -12,14 +12,16 @@ The rewrite runs six steps for one Chat Completions request:
 2. Build or load the index over the routed rows only. The index is the routed rows' names and
    descriptions, embedded through the embeddings endpoint.
 3. Build the query from the newest typed user message and the typed user messages before it, then
-   embed it and keep the `shortlistSize` routed rows nearest to it by cosine similarity. The query is
-   `<newest message> Context: <older message> <older message>`, with the older messages joined oldest
-   first; only typed user messages count, so a system message, an assistant message and an earlier
-   injected block never join it. The preceding context is capped at `RECENT_CONTEXT_CHARS = 10000`
-   characters, counted over whole messages from the newest backwards and stopping at the first
-   message that would cross the cap, so a message is never cut. The newest message is not part of the
-   cap and is embedded in full, and with no typed message before it the query is exactly the newest
-   message.
+   embed it and fuse three channel orders: the `shortlistSize`-independent cosine order over the
+   index, the BM25 order over the same documents, and the association order over the learned store.
+   Fuse them with reciprocal rank fusion, apply the bounded recency bump, and only then cut to
+   `shortlistSize`. The query is `<newest message> Context: <older message> <older message>`, with
+   the older messages joined oldest first; only typed user messages count, so a system message, an
+   assistant message and an earlier injected block never join it. The preceding context is capped at
+   `RECENT_CONTEXT_CHARS = 10000` characters, counted over whole messages from the newest backwards
+   and stopping at the first message that would cross the cap, so a message is never cut. The newest
+   message is not part of the cap and is embedded in full, and with no typed message before it the
+   query is exactly the newest message.
 4. Send those candidates to the rerank endpoint with the same query string, one document per
    candidate, in the rerank document format `documentPrefix + name + " - " + description`.
 5. Resolve every reranked candidate's read path through the host lookup the `skill_view` resolver
@@ -52,6 +54,82 @@ anything, the saved index and its vectors stay in place, and the turn routes fro
 per refused catalog names the arrived count, the saved count and the cache path, and it names the
 recovery: remove the cache file to force a rebuild. The trade is deliberate: a real catalog shrink of
 more than half keeps routing against the saved list until that file is removed.
+
+### The three channels
+
+The semantic channel is the cosine order over the index vectors, and it is the rollback order: with
+`fusionMode: cosine` the plugin returns it untouched.
+
+The BM25 channel indexes the exact document text the embedder sees, so both channels read one
+document format. Tokens are lowercased, split on every character that is not a letter or a digit,
+dropped below two characters, dropped when they are in one short English stopword list, and never
+stemmed. Scoring is Okapi BM25 with `k1` 1.2 and `b` 0.75, with document frequency and average
+document length computed over the same catalog. The constants are module constants, not settings.
+
+The term index is built during an index build and written atomically to `bm25.json` beside
+`cachePath`, so a restart does not re-tokenise the catalog. It carries a digest over the document
+texts and the scoring constants, and a loader refuses a file whose digest does not match the rows in
+hand. It is loaded once per process. A missing, corrupt or foreign term index contributes no BM25
+ranks, logs one warning, and leaves the other channels routing. A term index that cannot be built
+does not fail the index build: the vector index stays usable, the BM25 channel is disabled for that
+pass with one warning, and the remaining channels are fused.
+
+The association channel reads the learned load store at `associationDbPath` open read-only. It
+normalises the composed query with the module's own term rule, reads the decayed weights for those
+terms, keeps only `(term, skill)` rows whose support clears the floor of three distinct prompts,
+excludes ambient and soft-deleted skills, maps skill ids to catalog names and contributes ranks only
+for names the catalog carries. A missing or unreadable store contributes no association ranks,
+logs one warning, and leaves the other channels routing. No channel is a precondition.
+
+The three orders are fused with reciprocal rank fusion: `sum(weight / (20 + rank))` over the channel
+ranks, with weights 1.0 for semantic, 0.5 for BM25 and 1.0 for associations, and ties broken by
+name. Only ranks are fused, never the three scores, so a channel whose scores live on another scale
+cannot dominate the list. A disabled channel and a zero weight produce the same order.
+
+The recency bump is a boost, not a fourth channel. It moves a candidate up by
+`round(frecencyCapPositions * min(usage, 1))` places, once, and it only reorders candidates a
+channel already returned. The usage score is `sum over distinct session turns of
+0.5 ** (age_days / frecencyHalfLifeDays)`, so three loads in one turn count once, and ambient and
+soft-deleted skills are absent. The bump is gated on a resolvable catalog path: a candidate whose
+path the host lookup does not resolve keeps its fused position, which is the same gate the reference
+router applies to its usage scores. The shortlist is cut to `shortlistSize` only after the bump, so
+a candidate just below the cut can still enter it. The defaults are 14 days and 5 positions.
+
+### Fusion modes
+
+`fusionMode: live` is the default: the shortlist is the fused, bumped, cut order.
+
+`fusionMode: shadow` computes the same fused, bumped, cut order and logs one line per turn carrying
+each candidate's three channel ranks, its movement and its final position, then returns the cosine
+order cut to `shortlistSize`. It is the side-by-side comparison mode. The line carries skill names
+and ranks only, never request text.
+
+`fusionMode: cosine` returns the cosine order cut to `shortlistSize` with no BM25 score, no
+association store open and no bump. It is the single rollback switch: no rebuild and no config
+change beyond this key.
+
+### The association backfill
+
+The association store is filled from the Hermes session store by the module's own backfill, run as a
+command from the repository root:
+
+```sh
+python3 -m hermes_skill_router.associations --max-sessions 200
+```
+
+The command reads `~/.hermes/state.db` read-only, writes only the association store, and accepts a
+bounded session count as above; omit `--max-sessions` to scan the whole store. `--db` names a
+different store file, `--state-db` a different session store, and `--catalog` an optional JSON list
+of catalog names (or an index file carrying a `names` list). It prints a JSON report with the
+session, prompt and load counts.
+
+Run it after the catalog has been indexed and after a batch of work that loaded skills you want the
+channel to learn from; it is safe to rerun because uniqueness in the store, not a check, is what
+makes a second run insert nothing. Until it has run, the store is missing or empty and the
+association channel contributes no ranks, so the fused order is the semantic and BM25 channels only.
+That costs no correctness: the channel is a ranking signal, not a precondition, and the turn logs
+one warning naming the store path.
+
 
 ## The request rewrite and the prompt block
 
@@ -314,9 +392,16 @@ partition is computed per request from the catalog rows.
 | `shortlistSize` | `50` | 1..383 | Candidates carried from embeddings into rerank. |
 | `cutoff` | `0.01` | 0..1 | Rerank `relevance_score` a candidate needs, compared inclusively. |
 | `maxSuggestions` | `10` | 0..50 | Cap on suggested rows, applied once in the selector. Zero means unlimited. |
+| `fusionMode` | `live` | `live`, `shadow` or `cosine` | Fusion mode. `live` returns the fused order, `shadow` logs the diagnostics and returns the cosine order, `cosine` is the rollback switch with no channel read and no bump. |
+| `channelsSemantic` | `true` | boolean | Read the semantic (cosine) channel. False is the same input as a zero weight for that channel. |
+| `channelsBm25` | `true` | boolean | Read the BM25 channel. A term index that is missing or cannot be built contributes no ranks either way, with one warning. |
+| `channelsAssociations` | `true` | boolean | Read the association channel. The store stays read-only on the turn path. |
+| `frecencyHalfLifeDays` | `14` | 1..3650 | Half-life in days of the usage decay behind the recency bump. |
+| `frecencyCapPositions` | `5` | 0..50 | Most shortlist positions the recency bump can move one candidate. Zero disables the bump and keeps the channels fused. |
 | `maxDisplayNames` | `12` | 1..50 | Names the desktop pane and the TUI widget list. The count stays visible when collapsed. |
 | `maxDescriptionChars` | `400` | 3..4000 | Description characters kept per row, in the block and the embedding text. Part of the index fingerprint. |
 | `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. |
+| `associationDbPath` | empty | path, empty means beside the index | Association store file. Empty puts `associations.db` beside `cachePath`; with `cachePath` also empty, the store is not opened. A missing or unreadable store contributes no association ranks with one warning. |
 | `showSuggestions` | `true` | boolean | Let the display read the last suggestion names. False stops the record and removes an existing one. |
 | `suggestionsPath` | `~/.cache/hermes-skill-router/suggestions.json` | path, empty disables the record | Display record both surfaces read. Names only, never request text. |
 | `healthCheckMs` | `60000` | 0..3600000 | Minimum gap between probes of an endpoint that failed. Zero probes every request. |
@@ -558,22 +643,19 @@ window:
 - The plugin is disabled, or the request carries no skills section.
 
 The catalog is shown once per compaction window. The first failed pass in a window leaves the
-request unchanged and sends the whole catalog, a dump, and records that fact in a per-session
-durable record next to the search partitions, because Hermes rebuilds every request from message
-history and never copies the middleware's `api_kwargs` messages back into it, so a marker
-appended to that payload never reaches the next turn. On any further failed pass in that window
-the rewrite strips the catalog and appends one marker message, `Skill catalog dropped after a
-routing failure`, instead of dumping the catalog a second time. It also suggests nothing after a
-dump, because the dump showed every skill and nothing is suggestible for the rest of that
-window. A payload check for the marker is system-role only and reads list-shaped content, so a
-user message that quotes the marker text cannot silence routing. The marker names no skill and
-does not read as a routed block. A compaction that removes the prior blocks starts a new window,
-the durable record expires with it, and the catalog may be dumped once again. When the first
-failure arrives in a window the request is left unchanged, and on a later failure in the same
-window the rewrite is a clean catalog strip plus one marker message, never a partial strip. A
-completed pass whose selection is empty because everything was already suggested or fell below
-the cutoff is healthy, not a failure: it returns nothing and sets no dump record, so only a
-failed embed, rerank or index arm consumes the window's one dump.
+request unchanged and sends the whole catalog, a dump, and the rewrite records that fact in the
+payload it returns by appending one marker message, `Skill catalog dropped after a routing
+failure`. Hermes rebuilds the system message each turn from its cached prompt and drops the prior
+turn's appended system messages, so the marker reaches the payload the rewrite sees through the
+history the host carries forward. The rewrite recognises the marker in a later request and, on any
+further failed pass in that window, strips the catalog and appends the marker again instead of
+dumping the catalog a second time. It also suggests nothing after a dump, because the dump showed
+every skill and nothing is suggestible for the rest of that window. The marker names no skill and
+does not read as a routed block. A compaction that removes the marker starts a new window and the
+catalog may be dumped once again. When the first failure arrives in a window the request is left
+unchanged, and when the marker is already present the rewrite is a clean catalog strip plus one
+marker message, never a partial strip. `None` is still returned whenever there is no marker and no
+prior block, so a strip without a replacement never loses the catalog for nothing.
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build failed`,
@@ -596,6 +678,12 @@ lost rows and an unchanged catalog. A missing, corrupt, wrong-version or wrong-s
 saved list, so the build proceeds and no refusal warning is logged. A turn whose routed catalog is
 empty returns the request unchanged before the index is touched, so the guard's zero case is reached
 only by a direct library call.
+
+The term index and the association store are not preconditions. A term index that is missing,
+foreign or unbuildable disables only the BM25 channel for that pass, with one warning, and a store
+that is missing or unreadable disables only the association channel and the bump, with one warning.
+Both leave the semantic channel and the rerank pass working, so the turn still suggests what the
+remaining channels found. The warnings name the file and never the query.
 
 `skill_view` and `skills_list` are never touched. The model can open any name the block lists, and
 the background review can still list and open every skill.

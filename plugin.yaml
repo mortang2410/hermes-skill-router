@@ -96,6 +96,35 @@ config_schema:
     minimum: 0
     maximum: 50
     description: "Cap on suggested rows, applied once in the selector; 0 means unlimited (0..50)."
+  fusionMode:
+    type: str
+    default: live
+    values: [live, shadow, cosine]
+    description: "Fusion mode. live returns the fused order, shadow logs the diagnostics and returns the cosine order, cosine is the rollback switch."
+  channelsSemantic:
+    type: bool
+    default: true
+    description: "Read the semantic channel."
+  channelsBm25:
+    type: bool
+    default: true
+    description: "Read the BM25 channel."
+  channelsAssociations:
+    type: bool
+    default: true
+    description: "Read the association channel."
+  frecencyHalfLifeDays:
+    type: int
+    default: 14
+    minimum: 1
+    maximum: 3650
+    description: "Recency half-life in days (1..3650)."
+  frecencyCapPositions:
+    type: int
+    default: 5
+    minimum: 0
+    maximum: 50
+    description: "Most shortlist positions the recency bump can move a candidate (0..50)."
   maxDisplayNames:
     type: int
     default: 12
@@ -112,6 +141,10 @@ config_schema:
     type: str
     default: "~/.cache/hermes-skill-router/index.json"
     description: "Persisted index; empty disables persistence."
+  associationDbPath:
+    type: str
+    default: ""
+    description: "Association store file; empty puts associations.db beside cachePath, and nowhere when cachePath is empty."
   showSuggestions:
     type: bool
     default: true

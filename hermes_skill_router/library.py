@@ -38,11 +38,21 @@ import math
 import os
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import associations, bm25
 from .catalog import CatalogRows
 from .config import Config
+from .fusion import (
+    ASSOCIATION_SUPPORT_FLOOR,
+    CandidateDiagnostic,
+    FusionConfig,
+    apply_frecency,
+    cut_shortlist,
+    fuse_rankings,
+    resolve_fusion_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,16 +71,25 @@ BATCH_TEXTS = 16
 #: ``M5.embed_texts``: one vector per text, in order, or ``None`` when the endpoint failed.
 Embedder = Callable[[Config, Sequence[str]], Optional[Sequence[Sequence[float]]]]
 
+#: The host's own skill lookup: a ``SKILL.md`` path, or ``None`` when it refuses the name.
+PathResolver = Callable[[str], Optional[str]]
+
 
 @dataclass(frozen=True)
 class Index:
-    """The embedded routed catalog: parallel names, descriptions and vectors plus their identity."""
+    """The embedded routed catalog: parallel names, descriptions and vectors plus their identity.
+
+    ``term_index`` is the BM25 inverted index built from the same document text, or ``None`` when
+    the term index could not be built or did not match. It is optional at the end so a test or a
+    caller can hand over an index of vectors alone.
+    """
 
     names: List[str]
     descriptions: List[str]
     vectors: List[List[float]]
     dim: int
     fingerprint: str
+    term_index: Optional[bm25.TermIndex] = None
 
 
 def document_text(cfg: Config, name: str, description: str) -> str:
@@ -103,6 +122,11 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
     is still returned. A catalog holding fewer than half the rows of the saved index is refused
     before anything is embedded or written: the saved index is returned unchanged and one warning
     names both counts and the cache path (R6).
+
+    The BM25 term index is built in the same pass and written beside the vector index. A term index
+    that cannot be built does not fail the build: the returned index carries ``None``, one warning
+    is logged, and the vector pass stays usable. A warm vector cache loads the term index once per
+    process; a missing or foreign one leaves the channel with no ranks and warns once.
     """
     unique = _unique(rows)
     key = _fingerprint(unique, cfg)
@@ -110,19 +134,26 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
         saved = _read_saved(cfg)
         if saved is not None and len(unique) * 2 < len(saved.names):
             _warn_refusal(cfg, len(unique), len(saved.names))
-            return saved
+            return _with_term_index(cfg, saved, _saved_texts(cfg, saved))
         if not unique:
             return None
         memo = _MEMO.get(key)
         if memo is not None:
             return memo
         if saved is not None and saved.fingerprint == key and len(saved.names) == len(unique):
-            _MEMO[key] = saved
-            return saved
-        index = _build(unique, _embed_rows(cfg, unique, embedder), key)
+            index = _with_term_index(cfg, saved, _text_rows(cfg, unique))
+            _MEMO[key] = index
+            return index
+        index = _build(
+            unique,
+            _embed_rows(cfg, unique, embedder),
+            key,
+            _build_term_index(cfg, unique),
+        )
         if index is None:
             return None
-        _write_cache(cfg, index)
+        if _write_cache(cfg, index):
+            _write_term_index(cfg, index.term_index)
         _MEMO[key] = index
         return index
 
@@ -134,23 +165,341 @@ def cached_row_count(cfg: Config) -> int:
     return len(saved.names) if saved is not None else 0
 
 
-def shortlist(index: Index, query_vector: Sequence[float], limit: int) -> List[Tuple[str, str]]:
-    """Return the *limit* indexed rows closest to *query_vector* by cosine, ties in index order.
+def shortlist(
+    index: Index,
+    query_vector: Sequence[float],
+    query_text: str,
+    limit: int,
+    *,
+    cfg: Config,
+    resolver: Optional[PathResolver] = None,
+    now_ms: Optional[int] = None,
+    on_diagnostic: Optional[Callable[[CandidateDiagnostic], None]] = None,
+) -> List[Tuple[str, str]]:
+    """Return the fused, bumped and cut shortlist for *query_vector* and *query_text*.
 
-    One stage of the routing pass, shared by the request middleware and the search tool so the same
-    query and index always shortlist the same rows in the same order. An empty index, a zero limit
-    or a query vector with no length returns ``[]``.
+    The semantic channel is the cosine order over the index, the BM25 channel reads the term index
+    the build carried, and the association channel reads the learned store open read-only. The
+    channels are fused with reciprocal rank fusion, the recency bump moves a candidate whose
+    catalog path *resolver* resolves, and only then is the order cut to *limit*. A disabled channel
+    and an absent one are the same input, so a missing term index or store leaves the remaining
+    channels routing.
+
+    ``mode: cosine`` returns the cosine order cut to *limit* without reading the term index, opening
+    the store or applying the bump. ``mode: shadow`` computes and logs the diagnostics but returns
+    the cosine order, so the two published orders can be compared from the log. A zero limit or an
+    empty index returns ``[]``.
     """
-    scored: List[Tuple[float, int, str, str]] = []
-    for position, (name, description, vector) in enumerate(
-        zip(index.names, index.descriptions, index.vectors)
-    ):
-        scored.append((-_cosine(query_vector, vector), position, name, description))
-    scored.sort()
-    return [
-        (name, description)
-        for _score, _position, name, description in scored[: max(0, limit)]
+    if limit <= 0 or not index.names:
+        return []
+    cosine_order = _cosine_order(index, query_vector)
+    settings = _fusion_settings(cfg)
+    if settings.mode == "cosine" or not settings.enabled:
+        return _described(index, cosine_order[:limit])
+
+    bm25_order: Optional[List[str]] = None
+    if settings.bm25:
+        if index.term_index is None:
+            _warn_term_index_missing(cfg)
+        else:
+            bm25_order = bm25.score_ranks(index.term_index, query_text, len(index.names))
+
+    store = _open_store(cfg)
+    association_order: Optional[List[str]] = None
+    if settings.associations and store is not None:
+        association_order = _association_ranks(store, index, query_text, now_ms)
+    try:
+        fused = fuse_rankings(
+            {
+                "cosine": cosine_order,
+                "semantic": cosine_order if settings.semantic else None,
+                "bm25": bm25_order,
+                "associations": association_order,
+            },
+            settings,
+        )
+        if settings.mode == "shadow":
+            _log_fusion_diagnostics(cut_shortlist(fused, limit))
+            return _described(index, cosine_order[:limit])
+        usage = _usage_scores(store, settings, now_ms)
+        moved = apply_frecency(fused, _gated_usage(usage, fused, resolver), settings)
+    finally:
+        _close_store(store)
+    cut = cut_shortlist(moved, limit)
+    if on_diagnostic is not None:
+        for record in cut:
+            on_diagnostic(record)
+    return _described(index, [record.name for record in cut])
+
+
+def _cosine_order(index: Index, query_vector: Sequence[float]) -> List[str]:
+    """Return every indexed name by descending cosine, ties in index order."""
+    scored = [
+        (-_cosine(query_vector, vector), position, name)
+        for position, (name, vector) in enumerate(zip(index.names, index.vectors))
     ]
+    scored.sort()
+    return [name for _score, _position, name in scored]
+
+
+def _described(index: Index, names: Sequence[str]) -> List[Tuple[str, str]]:
+    """Map names back to the catalog descriptions, in the order given."""
+    descriptions = dict(zip(index.names, index.descriptions))
+    return [(name, descriptions.get(name, "")) for name in names]
+
+
+def _fusion_settings(cfg: Config) -> FusionConfig:
+    """Resolve the fusion settings from the one place that validated them."""
+    return resolve_fusion_config(
+        {
+            "mode": cfg.fusion_mode,
+            "channels": {
+                "semantic": cfg.channels_semantic,
+                "bm25": cfg.channels_bm25,
+                "associations": cfg.channels_associations,
+            },
+            "frecency": {
+                "halfLifeDays": cfg.frecency_half_life_days,
+                "capPositions": cfg.frecency_cap_positions,
+            },
+        }
+    )
+
+
+def _text_rows(cfg: Config, unique: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Return the ``(name, text)`` pairs the term index indexes: the embedder's own document text."""
+    return [(name, document_text(cfg, name, description)) for name, description in unique]
+
+
+def _saved_texts(cfg: Config, saved: Index) -> List[Tuple[str, str]]:
+    """Return the saved index's rows in the same document text the term index was built with."""
+    return [
+        (name, document_text(cfg, name, description))
+        for name, description in zip(saved.names, saved.descriptions)
+    ]
+
+
+def _with_term_index(
+    cfg: Config,
+    index: Index,
+    texts: Sequence[Tuple[str, str]],
+) -> Index:
+    """Return *index* carrying the loaded term index, or ``None`` when none is usable."""
+    return replace(index, term_index=_load_term_index(cfg, texts))
+
+
+def _load_term_index(cfg: Config, texts: Sequence[Tuple[str, str]]) -> Optional[bm25.TermIndex]:
+    """Load the term index beside the cache once per process, or report that there is none."""
+    path = _term_path(cfg)
+    if path is None:
+        return None
+    digest = bm25.catalog_digest(texts)
+    cached = _TERM_MEMO.get(path)
+    if cached is not None and cached[0] == digest:
+        return cached[1]
+    try:
+        loaded = bm25.load_term_index(path, texts)
+    except Exception:  # the channel must never fail the pass
+        logger.debug("skill index: the term index load raised", exc_info=True)
+        loaded = None
+    if loaded is None:
+        _warn_term_index_missing(cfg)
+    _TERM_MEMO[path] = (digest, loaded)
+    return loaded
+
+
+def _build_term_index(
+    cfg: Config,
+    unique: Sequence[Tuple[str, str]],
+) -> Optional[bm25.TermIndex]:
+    """Build the term index over the embedder's document text, or warn once and disable BM25."""
+    try:
+        return bm25.build_term_index(_text_rows(cfg, unique))
+    except Exception as exc:  # a broken term index must not fail the vector pass
+        logger.debug("skill index: the term index build raised", exc_info=True)
+        _log_once(
+            f"term-index:{_term_location(cfg)}",
+            f"skill index: the term index at {_term_location(cfg)} could not be built ({exc}), so "
+            "the BM25 channel contributes no ranks",
+        )
+        return None
+
+
+def _write_term_index(cfg: Config, term_index: Optional[bm25.TermIndex]) -> None:
+    """Write the term index beside the vector index, or log the write failure once."""
+    path = _term_path(cfg)
+    if path is None or term_index is None:
+        return
+    try:
+        bm25.write_term_index(path, term_index)
+    except OSError as exc:
+        _log_once(
+            f"term-index-write:{path}",
+            f"skill index: could not write the term index {path}: {exc}",
+        )
+        return
+    _TERM_MEMO[path] = (term_index.catalog_digest, term_index)
+
+
+def _term_path(cfg: Config) -> Optional[str]:
+    """Return the term index path beside the vector cache, or ``None`` when persistence is off."""
+    raw = (cfg.cache_path or "").strip()
+    if not raw:
+        return None
+    return os.path.join(
+        os.path.dirname(os.path.expanduser(raw)),
+        bm25.TERM_INDEX_FILENAME,
+    )
+
+
+def _term_location(cfg: Config) -> str:
+    """Return the term index location for a warning, naming the in-memory case."""
+    return _term_path(cfg) or "the in-memory index"
+
+
+def _warn_term_index_missing(cfg: Config) -> None:
+    """Log one warning per process when the BM25 channel has no usable term index."""
+    location = _term_location(cfg)
+    _log_once(
+        f"term-index:{location}",
+        f"skill index: no term index matches the catalog at {location}, so the BM25 channel "
+        "contributes no ranks",
+    )
+
+
+def _association_path(cfg: Config) -> Optional[str]:
+    """Return the association store path, or ``None`` when persistence is off."""
+    raw = (cfg.association_db_path or "").strip()
+    if raw:
+        return os.path.expanduser(raw)
+    cache = (cfg.cache_path or "").strip()
+    if not cache:
+        return None
+    return associations.association_db_path_for(cache)
+
+
+def _open_store(cfg: Config) -> Optional[associations.AssociationStore]:
+    """Open the association store read-only, or report a missing or unreadable file once."""
+    path = _association_path(cfg)
+    if path is None:
+        return None
+    if not os.path.exists(path):
+        _log_once(
+            f"associations-missing:{path}",
+            f"skill index: the association database at {path} is missing, so the association "
+            "channel contributes no ranks",
+        )
+        return None
+    try:
+        return associations.open_store(path, read_only=True)
+    except Exception as exc:  # a foreign or corrupt store is one channel losing its ranks
+        logger.debug("skill index: the association store open raised", exc_info=True)
+        _log_once(
+            f"associations-unreadable:{path}",
+            f"skill index: the association database at {path} is unreadable ({exc}), so the "
+            "association channel contributes no ranks",
+        )
+        return None
+
+
+def _close_store(store: Optional[associations.AssociationStore]) -> None:
+    """Close a read-only store, ignoring a failure that no caller can act on."""
+    if store is not None:
+        store.close()
+
+
+def _association_ranks(
+    store: associations.AssociationStore,
+    index: Index,
+    query_text: str,
+    now_ms: Optional[int],
+) -> List[str]:
+    """Return the association channel's ranked catalog names, or no rank on a read failure."""
+    try:
+        terms = associations.normalise_terms(query_text)
+        weights = associations.decayed_weights(
+            store,
+            terms,
+            now_ms,
+            support_floor=ASSOCIATION_SUPPORT_FLOOR,
+        )
+    except Exception as exc:  # one channel losing its ranks must not fail the pass
+        logger.debug("skill index: the association read raised", exc_info=True)
+        _log_once(
+            f"associations-read:{store.path}",
+            f"skill index: the association database at {store.path} could not be read ({exc}), so "
+            "the association channel contributes no ranks",
+        )
+        return []
+    catalog = set(index.names)
+    return [row.name for row in weights if row.name in catalog]
+
+
+def _usage_scores(
+    store: Optional[associations.AssociationStore],
+    settings: FusionConfig,
+    now_ms: Optional[int],
+) -> Dict[str, float]:
+    """Return the decayed usage map, or an empty map when the store contributes nothing."""
+    if store is None:
+        return {}
+    try:
+        return associations.usage_scores(store, settings.half_life_days, now_ms)
+    except Exception as exc:  # frecency losing its input must not fail the pass
+        logger.debug("skill index: the usage read raised", exc_info=True)
+        _log_once(
+            f"associations-read:{store.path}",
+            f"skill index: the association database at {store.path} could not be read ({exc}), so "
+            "frecency contributes no boost",
+        )
+        return {}
+
+
+def _gated_usage(
+    usage: Dict[str, float],
+    records: Sequence[CandidateDiagnostic],
+    resolver: Optional[PathResolver],
+) -> Dict[str, float]:
+    """Keep usage rows for candidates the host lookup resolves, the gate on the bump.
+
+    A candidate no channel returned cannot reach the bump anyway, and is dropped here as well. With
+    no resolver every candidate is unresolved, which is the same rule as a path the lookup refuses:
+    no path, no bump.
+    """
+    if not usage or resolver is None:
+        return {}
+    candidates = {record.name for record in records}
+    gated: Dict[str, float] = {}
+    for name, score in usage.items():
+        if name not in candidates:
+            continue
+        try:
+            path = resolver(name)
+        except Exception:  # the host lookup never raises, but the pass must not depend on it
+            logger.debug("skill index: the path lookup for %r raised", name, exc_info=True)
+            path = None
+        if path:
+            gated[name] = float(score)
+    return gated
+
+
+def _log_fusion_diagnostics(records: Sequence[CandidateDiagnostic]) -> None:
+    """Log one shadow-mode line carrying the channel ranks, the movement and the position."""
+    payload = [
+        {
+            "name": record.name,
+            "semantic": record.semantic_rank,
+            "bm25": record.bm25_rank,
+            "associations": record.association_rank,
+            "movement": record.frecency_movement,
+            "position": record.final_shortlist_position,
+        }
+        for record in records
+    ]
+    logger.info(
+        "skill router fusion: mode=shadow candidates=%s",
+        json.dumps(payload, separators=(",", ":")),
+    )
 
 
 def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
@@ -240,6 +589,7 @@ def _build(
     unique: Sequence[Tuple[str, str]],
     vectors: Optional[Sequence[Sequence[float]]],
     key: str,
+    term_index: Optional[bm25.TermIndex],
 ) -> Optional[Index]:
     """Turn the embedded rows into an ``Index``, or ``None`` when the embedding failed."""
     if not vectors:
@@ -250,6 +600,7 @@ def _build(
         vectors=[[float(value) for value in vector] for vector in vectors],
         dim=len(vectors[0]),
         fingerprint=key,
+        term_index=term_index,
     )
 
 
@@ -341,11 +692,15 @@ def _warn_refusal(cfg: Config, arrived: int, saved: int) -> None:
     )
 
 
-def _write_cache(cfg: Config, index: Index) -> None:
-    """Write the cache atomically, or log once and keep the in-memory index."""
+def _write_cache(cfg: Config, index: Index) -> bool:
+    """Write the cache atomically, or log once and keep the in-memory index.
+
+    Returns whether the file was replaced. The term index is written after a successful vector
+    write, so a failed build never leaves a term index without the vector cache it belongs to.
+    """
     path = _cache_path(cfg)
     if path is None:
-        return
+        return False
     directory = os.path.dirname(path) or "."
     temporary: Optional[str] = None
     try:
@@ -365,8 +720,10 @@ def _write_cache(cfg: Config, index: Index) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         temporary = None
+        return True
     except OSError as exc:
         _log_once(f"cache-write:{path}", f"skill index: could not write {path}: {exc}")
+        return False
     finally:
         if temporary is not None:
             try:
@@ -393,6 +750,10 @@ def _cache_payload(index: Index) -> Dict[str, object]:
 
 #: The in-process memo, keyed by fingerprint: one build per fingerprint per process.
 _MEMO: Dict[str, Index] = {}
+
+#: The loaded term index per path and the digest it matched, so a warm process reads it once.
+_TERM_MEMO: Dict[str, Tuple[str, Optional[bm25.TermIndex]]] = {}
+
 _MEMO_LOCK = threading.Lock()
 
 #: Reasons already logged, so one broken path logs once instead of once per request (D8).

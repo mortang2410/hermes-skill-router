@@ -62,6 +62,8 @@ def _rendered(value: object) -> str:
     """Return the default as the documentation spells it."""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, str) and value == "":
+        return "empty"
     if isinstance(value, (tuple, list)):
         return "empty" if not value else ", ".join(str(item) for item in value)
     if isinstance(value, float):
@@ -229,6 +231,36 @@ def test_the_documentation_documents_the_decision_line_and_its_privacy_boundary(
     )
     assert "no warning contains the user's text" in prose, (
         "the Failure behaviour promise that no warning contains user text is gone"
+    )
+
+
+def test_the_documentation_documents_the_channels_modes_and_backfill() -> None:
+    prose = _prose()
+    assert "`bm25.json`" in prose, "the documentation does not name the term index file"
+    assert "the exact document text the embedder sees" in prose, (
+        "the documentation does not say both channels read one document text"
+    )
+    assert "reciprocal rank fusion" in prose, "the documentation does not name the fusion rule"
+    assert "the floor of three distinct prompts" in prose, (
+        "the documentation does not state the association support floor"
+    )
+    assert "`fusionMode: shadow` computes" in prose, (
+        "the documentation does not describe the shadow mode"
+    )
+    assert "`fusionMode: cosine` returns the cosine order" in prose, (
+        "the documentation does not describe the cosine rollback"
+    )
+    assert "python3 -m hermes_skill_router.associations --max-sessions 200" in prose, (
+        "the documentation does not carry the backfill command"
+    )
+    assert "reads `~/.hermes/state.db` read-only, writes only the association store" in prose, (
+        "the documentation does not state the backfill's read and write boundary"
+    )
+    assert "uniqueness in the store, not a check, is what" in prose, (
+        "the documentation does not state why the backfill is idempotent"
+    )
+    assert "association channel contributes no ranks" in prose, (
+        "the documentation does not say what an empty store costs"
     )
 
 

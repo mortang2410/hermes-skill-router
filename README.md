@@ -29,10 +29,14 @@ Hermes dumps the whole skill catalog into the model context. This plugin hides t
 surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that gets
 listed at the start of each compaction window.
 
-Two endpoints rank them. The embeddings endpoint compares your newest message, together with the
-typed messages before it (up to 10,000 characters), with the skill rows and keeps the nearest ones.
-The rerank endpoint scores that shortlist against the same query, and the plugin suggests what
-scores at or above `cutoff`.
+The embeddings endpoint compares your newest message, together with the typed
+messages before it (up to 10,000 characters), with the skill rows and keeps a cosine order. A BM25
+term index built beside the vector index scores the same text by the prompt's exact words, and a
+read-only association store adds skills that were loaded for similar prompts before. The plugin
+fuses those three orders with reciprocal rank fusion, gives candidates a small capped recency bump
+when their skill path resolves, and cuts the result to the shortlist. The rerank endpoint then
+scores that shortlist against the same query, and the plugin suggests what scores at or above
+`cutoff`.
 
 If a service is down or too slow, the plugin falls back to the ordinary skill catalog once per
 compaction window, so a bad endpoint costs latency, not a broken turn, and the catalog never
@@ -99,8 +103,9 @@ The defaults are what we run, so you only have to set the two base URLs:
   `embedModelId: bge-m3`.
 - Rerank: `tasksource-decider-nano` through a Cohere-compatible rerank service on 8010, with
   `rerankProvider: cohere`.
-- Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 10`, and the 6000, 20000 and
-  30000 ms timeouts. Keep them unless your endpoints need different budgets.
+- Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 10`, `fusionMode: live` with all
+  three channels on, and the 6000, 20000 and 30000 ms timeouts. Keep them unless your endpoints need
+  different budgets.
 
 ## Use
 

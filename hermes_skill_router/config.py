@@ -30,6 +30,9 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 #: Rerank request/response shapes this plugin implements.
 RERANK_PROVIDERS = ("cohere",)
 
+#: The fusion modes. ``cosine`` is the single rollback switch.
+FUSION_MODES = ("live", "shadow", "cosine")
+
 _KIND_LABELS = {
     "bool": "boolean",
     "int": "integer",
@@ -39,6 +42,7 @@ _KIND_LABELS = {
     "file_path": "path",
     "name_list": "list of skill names",
     "provider": "provider name",
+    "fusion_mode": "fusion mode (live, shadow or cosine)",
     "url": "endpoint URL",
 }
 
@@ -79,9 +83,20 @@ _SPECS: Tuple[_Spec, ...] = (
     _Spec("cutoff", "cutoff", "float", 0.01, 0.0, 1.0),
     # Zero means unlimited at every reader, never "select nothing".
     _Spec("maxSuggestions", "max_suggestions", "int", 10, 0, 50),
+    # The fused shortlist: mode, one switch per channel and the bounded recency bump. The two
+    # numeric keys are the only ones with a numeric bound; the mode and the switches are bounded
+    # by their kind, and the store path by the path rule.
+    _Spec("fusionMode", "fusion_mode", "fusion_mode", "live"),
+    _Spec("channelsSemantic", "channels_semantic", "bool", True),
+    _Spec("channelsBm25", "channels_bm25", "bool", True),
+    _Spec("channelsAssociations", "channels_associations", "bool", True),
+    _Spec("frecencyHalfLifeDays", "frecency_half_life_days", "int", 14, 1, 3650),
+    _Spec("frecencyCapPositions", "frecency_cap_positions", "int", 5, 0, 50),
     _Spec("maxDisplayNames", "max_display_names", "int", 12, 1, 50),
     _Spec("maxDescriptionChars", "max_description_chars", "int", 400, 3, 4000),
     _Spec("cachePath", "cache_path", "file_path", "~/.cache/hermes-skill-router/index.json"),
+    # Empty puts associations.db beside cachePath, and nowhere when cachePath is empty.
+    _Spec("associationDbPath", "association_db_path", "file_path", ""),
     _Spec("showSuggestions", "show_suggestions", "bool", True),
     _Spec(
         "suggestionsPath",
@@ -119,8 +134,15 @@ class Config:
     shortlist_size: int
     cutoff: float
     max_suggestions: int
+    fusion_mode: str
+    channels_semantic: bool
+    channels_bm25: bool
+    channels_associations: bool
+    frecency_half_life_days: int
+    frecency_cap_positions: int
     max_description_chars: int
     cache_path: str
+    association_db_path: str
     health_check_ms: int
     show_suggestions: bool
     suggestions_path: str
@@ -295,6 +317,10 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
         return tuple(names)
     if kind == "provider":
         if isinstance(value, str) and value.strip().lower() in RERANK_PROVIDERS:
+            return value.strip().lower()
+        return _invalid(spec, value, notes)
+    if kind == "fusion_mode":
+        if isinstance(value, str) and value.strip().lower() in FUSION_MODES:
             return value.strip().lower()
         return _invalid(spec, value, notes)
     if kind == "url":

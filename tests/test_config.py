@@ -44,9 +44,16 @@ SPEC_DEFAULTS = {
     "shortlistSize": 50,
     "cutoff": 0.01,
     "maxSuggestions": 10,
+    "fusionMode": "live",
+    "channelsSemantic": True,
+    "channelsBm25": True,
+    "channelsAssociations": True,
+    "frecencyHalfLifeDays": 14,
+    "frecencyCapPositions": 5,
     "maxDisplayNames": 12,
     "maxDescriptionChars": 400,
     "cachePath": "~/.cache/hermes-skill-router/index.json",
+    "associationDbPath": "",
     "showSuggestions": True,
     "suggestionsPath": "~/.cache/hermes-skill-router/suggestions.json",
     "healthCheckMs": 60000,
@@ -59,6 +66,8 @@ SPEC_BOUNDS = {
     "shortlistSize": (1, 383),
     "cutoff": (0.0, 1.0),
     "maxSuggestions": (0, 50),
+    "frecencyHalfLifeDays": (1, 3650),
+    "frecencyCapPositions": (0, 50),
     "maxDisplayNames": (1, 50),
     "maxDescriptionChars": (3, 4000),
     "healthCheckMs": (0, 3600000),
@@ -71,6 +80,12 @@ FIELD_BY_KEY = {
     "shortlistSize": "shortlist_size",
     "cutoff": "cutoff",
     "maxSuggestions": "max_suggestions",
+    "fusionMode": "fusion_mode",
+    "channelsSemantic": "channels_semantic",
+    "channelsBm25": "channels_bm25",
+    "channelsAssociations": "channels_associations",
+    "frecencyHalfLifeDays": "frecency_half_life_days",
+    "frecencyCapPositions": "frecency_cap_positions",
     "maxDisplayNames": "max_display_names",
     "maxDescriptionChars": "max_description_chars",
     "healthCheckMs": "health_check_ms",
@@ -94,8 +109,15 @@ CONFIG_FIELDS = {
     "shortlist_size",
     "cutoff",
     "max_suggestions",
+    "fusion_mode",
+    "channels_semantic",
+    "channels_bm25",
+    "channels_associations",
+    "frecency_half_life_days",
+    "frecency_cap_positions",
     "max_description_chars",
     "cache_path",
+    "association_db_path",
     "health_check_ms",
     "show_suggestions",
     "suggestions_path",
@@ -119,6 +141,10 @@ OUT_OF_BOUNDS = [
     ("cutoff", 1.01),
     ("maxSuggestions", -1),
     ("maxSuggestions", 51),
+    ("frecencyHalfLifeDays", 0),
+    ("frecencyHalfLifeDays", 3651),
+    ("frecencyCapPositions", -1),
+    ("frecencyCapPositions", 51),
     ("maxDisplayNames", 0),
     ("maxDisplayNames", 51),
     ("maxDescriptionChars", 2),
@@ -133,6 +159,11 @@ MALFORMED = [
     {"cutoff": {"value": 0.5}},
     {"cutoff": True},
     {"maxSuggestions": 1.5},
+    {"fusionMode": "ranked"},
+    {"channelsSemantic": 5},
+    {"channelsBm25": "sometimes"},
+    {"frecencyHalfLifeDays": "14"},
+    {"frecencyCapPositions": 2.5},
     {"enabled": 5},
     {"eagerSkills": "alpha"},
     {"eagerSkills": ["alpha", 3]},
@@ -171,6 +202,12 @@ def test_load_none_returns_every_default():
     assert cfg.shortlist_size == 50
     assert cfg.cutoff == 0.01
     assert cfg.max_suggestions == 10
+    assert cfg.fusion_mode == "live"
+    assert cfg.channels_semantic is True
+    assert cfg.channels_bm25 is True
+    assert cfg.channels_associations is True
+    assert cfg.frecency_half_life_days == 14
+    assert cfg.frecency_cap_positions == 5
     assert cfg.max_description_chars == 400
     assert cfg.max_display_names == 12
     assert cfg.health_check_ms == 60000
@@ -178,6 +215,7 @@ def test_load_none_returns_every_default():
     assert cfg.eager_skills == ()
     assert cfg.deferred_skills == ()
     assert cfg.cache_path == "~/.cache/hermes-skill-router/index.json"
+    assert cfg.association_db_path == ""
     assert cfg.suggestions_path == "~/.cache/hermes-skill-router/suggestions.json"
     assert cfg.rerank_provider == "cohere"
 
@@ -198,6 +236,13 @@ def test_in_bounds_values_are_kept():
             "shortlistSize": 383,
             "cutoff": 1.0,
             "maxSuggestions": 0,
+            "fusionMode": "shadow",
+            "channelsSemantic": False,
+            "channelsBm25": False,
+            "channelsAssociations": False,
+            "frecencyHalfLifeDays": 30,
+            "frecencyCapPositions": 0,
+            "associationDbPath": "/tmp/associations.db",
             "maxDisplayNames": 50,
             "maxDescriptionChars": 3,
             "healthCheckMs": 0,
@@ -208,6 +253,14 @@ def test_in_bounds_values_are_kept():
     assert cfg.shortlist_size == 383
     assert cfg.cutoff == 1.0
     assert cfg.max_suggestions == 0
+    assert cfg.fusion_mode == "shadow"
+    assert (cfg.channels_semantic, cfg.channels_bm25, cfg.channels_associations) == (
+        False,
+        False,
+        False,
+    )
+    assert (cfg.frecency_half_life_days, cfg.frecency_cap_positions) == (30, 0)
+    assert cfg.association_db_path == "/tmp/associations.db"
     assert cfg.max_display_names == 50
     assert cfg.max_description_chars == 3
     assert cfg.health_check_ms == 0
@@ -282,6 +335,20 @@ def test_rerank_provider_only_accepts_cohere():
     cfg = load({"rerankProvider": "jina"})
     assert cfg.rerank_provider == "cohere"
     assert any("rerankProvider" in note for note in cfg.notes)
+
+
+@pytest.mark.parametrize("mode", ["live", "shadow", "cosine"])
+def test_fusion_mode_accepts_each_published_mode(mode):
+    cfg = load({"fusionMode": mode, "cachePath": ""})
+    assert cfg.fusion_mode == mode
+    assert cfg.notes == ()
+
+
+def test_fusion_mode_is_case_insensitive_and_rejects_another_word():
+    assert load({"fusionMode": " COSINE ", "cachePath": ""}).fusion_mode == "cosine"
+    cfg = load({"fusionMode": "ranked", "cachePath": ""})
+    assert cfg.fusion_mode == "live"
+    assert any("fusionMode" in note for note in cfg.notes)
 
 
 def test_name_lists_are_stripped_deduplicated_and_empty_by_default():

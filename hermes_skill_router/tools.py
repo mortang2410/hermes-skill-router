@@ -120,8 +120,7 @@ def handle(
                 "no-catalog", "no skill catalog has been parsed for this session yet"
             )
         outcome = select_rows(
-            cfg, rows, query, embed=EMBED, rerank=RERANK, resolve=skill_path,
-            session_id=str(session_id or ""),
+            cfg, rows, query, embed=EMBED, rerank=RERANK, resolve=skill_path
         )
         if outcome.reason:
             return _degraded(outcome.reason, outcome.detail)
