@@ -400,6 +400,29 @@ def test_a_search_leaves_the_next_turn_unchanged(tmp_path, fake_clients, session
     assert sorted(path.name for path in tmp_path.iterdir()) == ["suggestions.json"]
 
 
+def test_the_tool_repeats_the_turn_selection_on_the_same_catalog(tmp_path, fake_clients):
+    from hermes_skill_router.router import rewrite
+
+    embedder, reranker = fake_clients
+    cfg = load(settings(tmp_path))
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": TURN_SYSTEM},
+            {"role": "user", "content": QUERY},
+        ],
+    }
+    rewritten = rewrite(payload, cfg=cfg, embed=embedder, rerank=reranker, session_id="session-1")
+    assert rewritten is not None
+    turn_names = read(cfg.suggestions_path)["names"]
+
+    answer = json.loads(
+        handle({"query": QUERY}, settings=settings(tmp_path), session_id="session-1")
+    )
+
+    assert [row["name"] for row in answer["skills"]] == turn_names
+
+
 LOADER_SCRIPT = """
 import json
 from hermes_cli import plugins as plugins_mod
