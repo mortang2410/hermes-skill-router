@@ -20,7 +20,8 @@ first, plus the skills you pinned under `Also listed:`.
 
 Two endpoints rank them. The embeddings endpoint compares your message with the routed skill rows
 and keeps the nearest ones. The rerank endpoint scores that shortlist against the same message, and
-the plugin suggests what scores at or above `cutoff`.
+the plugin suggests what scores at or above `cutoff`. Both can be the endpoints DSH's skill router
+uses, so the two harnesses rank with the same vectors.
 
 The plugin strips and injects in one step, so when it cannot build a block the request arrives
 unchanged with its catalog. A stopped endpoint then costs latency, not a broken turn.

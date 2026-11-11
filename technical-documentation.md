@@ -425,6 +425,34 @@ at 0.75 to 0.79 seconds, and a probe on 2026-11-10 measured a one-text embed at 
 50-document rerank at 287 ms. On a host whose endpoints are slower than the recorded figures, raise
 the budget above your own measured cold pass before lowering anything else.
 
+## The bundled embeddings service
+
+The repository ships one embeddings server for BGE-M3 ONNX on CPU. Its model directory must contain
+`onnx/model.onnx` and `tokenizer.json`, and the Python environment needs `onnxruntime`, `tokenizers`,
+`fastapi`, `uvicorn` and `numpy`. From the checkout root:
+
+```bash
+HSR_MODEL_DIR=/path/to/bge-m3 HSR_PORT=8012 python3 -m service.embed_server
+```
+
+The service listens on `127.0.0.1:8012` by default. It reads its settings from `HSR_*` environment
+variables: `HSR_MODEL_DIR`, `HSR_PORT` (default 8012), `HSR_MODEL_ID` (default `bge-m3`) and
+`HSR_MAX_LENGTH` (default 512). While it loads its model it answers `{"status": "loading"}` and
+returns 503 for embeddings requests.
+
+The tracked systemd user unit runs the same command, but it carries the author's model path in
+`HSR_MODEL_DIR`, so override that value for your host, for example with
+`systemctl --user edit hermes-skill-router-embed.service`. Then link and start the unit:
+
+```bash
+ln -sfn /path/to/hermes-skill-router/service/hermes-skill-router-embed.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-skill-router-embed.service
+```
+
+The rerank endpoint is a separate service, and this repository does not ship one. The author's host
+runs one on `127.0.0.1:8010` with the `tasksource-decider-nano` model.
+
 ## Point it at your own models
 
 The plugin needs no OpenAI key and ships no model. To use your own models:
@@ -601,9 +629,11 @@ The plugin is stdlib-only Python; `urllib` is its only HTTP client. The embeddin
 
 ### No block appears in the dump
 
-Read the plugin log for the one warning that names the failure reason, and compare it with the reason
-list under [Failure behaviour](#failure-behaviour). Enable the plugin in the profile first: with it
-disabled, every request keeps its catalog.
+A correct dump carries no `<available_skills>` block and no `## Skills` heading, its last message
+starts with `Skills routed for this request`, and `request.body` still carries `model` and `tools`.
+When the block is missing, read the plugin log for the one warning that names the failure reason, and
+compare it with the reason list under [Failure behaviour](#failure-behaviour). Enable the plugin in
+the profile first: with it disabled, every request keeps its catalog.
 
 ### The first turn is slow
 
