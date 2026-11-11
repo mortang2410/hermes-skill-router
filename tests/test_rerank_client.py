@@ -2,8 +2,8 @@
 
 Every test drives the loopback fake from ``tests/fake_endpoint.py``, so no model, GPU or network is
 needed and the exact bytes that would leave the process are observable. The request body is asserted
-against the DSH document text from ``config.DOCUMENT_PREFIX``, because the same 8010 endpoint serves
-DSH and this plugin and parses that prefix to recover the skill name.
+against the shared document text from ``config.DOCUMENT_PREFIX``, because the same 8010 endpoint
+serves another client and this plugin and parses that prefix to recover the skill name.
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ from hermes_skill_router import rerank as rerank_module  # noqa: E402
 from hermes_skill_router.config import DOCUMENT_PREFIX, load  # noqa: E402
 from hermes_skill_router.rerank import rerank  # noqa: E402
 
-#: The DSH skill prefix, copied here from ``judgment/jev-client.ts`` and
+#: The shared skill prefix, copied here from ``judgment/jev-client.ts`` and
 #: ``/home/wilder/.scripts/decider-rerank-server.py`` (``SKILL_PREFIX``) as a fixed expected string.
-DSH_SKILL_PREFIX = (
+REFERENCE_SKILL_PREFIX = (
     "This skill supplies a procedure, tool, or domain-specific instructions that the agent would "
     "actually need to carry out the current task correctly. Skill: "
 )
@@ -90,7 +90,7 @@ def test_sends_one_cohere_shaped_request_and_returns_scores_in_input_order(fake)
     }
 
 
-def test_the_outgoing_documents_carry_the_dsh_prefix_and_name_dash_description(fake):
+def test_the_outgoing_documents_carry_the_reference_prefix_and_name_dash_description(fake):
     fake.answer(body=rerank_body([0.4, 0.6]))
     cfg = make_config(fake)
     documents = [
@@ -100,15 +100,15 @@ def test_the_outgoing_documents_carry_the_dsh_prefix_and_name_dash_description(f
 
     assert rerank(cfg, "fix the failing test", documents) == [0.4, 0.6]
 
-    # The default prefix is the DSH sentence, so the endpoint recovers the skill names from both
+    # The default prefix is the reference sentence, so the endpoint recovers the skill names from both
     # clients the same way; the body is compared to one fixed expected string.
-    assert DOCUMENT_PREFIX == DSH_SKILL_PREFIX
+    assert DOCUMENT_PREFIX == REFERENCE_SKILL_PREFIX
     assert fake.requests[0].json() == {
         "model": "tasksource-decider-nano",
         "query": "fix the failing test",
         "documents": [
-            DSH_SKILL_PREFIX + "alpha - Alpha skill",
-            DSH_SKILL_PREFIX + "beta - Beta skill",
+            REFERENCE_SKILL_PREFIX + "alpha - Alpha skill",
+            REFERENCE_SKILL_PREFIX + "beta - Beta skill",
         ],
         "top_n": 2,
     }

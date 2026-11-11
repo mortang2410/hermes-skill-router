@@ -70,9 +70,10 @@ class Index:
 def document_text(cfg: Config, name: str, description: str) -> str:
     """Return the exact text embedded for one row: ``name``, a newline, then the description.
 
-    The description is clipped to ``cfg.max_description_chars``, which is what DSH's ``documentText``
-    does, so Hermes and DSH embed byte-identical text for the same row and configuration. It is one
-    function so the index, the fingerprint and the DSH side can never drift apart.
+    The description is clipped to ``cfg.max_description_chars``, which is what the reference router's
+    ``documentText`` does, so both clients embed byte-identical text for the same row and
+    configuration. It is one function so the index, the fingerprint and the other client can never
+    drift apart.
     """
     return name + "\n" + description[: cfg.max_description_chars]
 

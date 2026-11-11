@@ -291,7 +291,7 @@ def test_name_lists_are_stripped_deduplicated_and_empty_by_default():
     assert cfg.notes == ()
 
 
-def test_document_prefix_defaults_to_the_dsh_skill_prefix():
+def test_document_prefix_defaults_to_the_reference_skill_prefix():
     cfg = load()
     assert cfg.document_prefix.startswith("This skill supplies a procedure")
     assert cfg.document_prefix.endswith("Skill: ")

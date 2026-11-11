@@ -4,6 +4,13 @@ A Hermes Agent plugin that takes the always-on skill catalog out of every Chat C
 and appends a short list of the skills that fit the turn. The model keeps `skills_list` and
 `skill_view`, so it can still list or open any skill.
 
+This fits people who keep one super-agent profile that does everything but do not want the context
+polluted by so many skills that the model cannot tell which one to pick. It also pairs well with a
+memory provider like [Hindsight](https://github.com/vectorize-io/hindsight), which takes care of
+memory routing.
+
+The skill list is embedded once and cached, so a warm turn routes in about a second.
+
 Every setting, both endpoint protocols, the display record and the measurements are in
 [technical-documentation.md](technical-documentation.md).
 
@@ -11,18 +18,16 @@ Every setting, both endpoint protocols, the display record and the measurements 
 
 ## How it works
 
-Hermes builds a `## Skills` section into the system prompt on every turn. The plugin removes that
-section and appends one extra system message with the skills that match your last user message, best
-first. It lists the skills you pinned under `Also listed:` once, in the opening block of each
-compaction window, and every later turn in that window carries the suggestions only.
+Hermes dumps the whole skill catalog into the model context. This plugin hides the catalog and only
+surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that gets
+listed at the start of each compaction window.
 
-Two endpoints rank them. The embeddings endpoint compares your message with the routed skill rows
-and keeps the nearest ones. The rerank endpoint scores that shortlist against the same message, and
-the plugin suggests what scores at or above `cutoff`. Both can be the endpoints DSH's skill router
-uses, so the two harnesses rank with the same vectors.
+Two endpoints rank them. The embeddings endpoint compares your message with the skill rows and keeps
+the nearest ones. The rerank endpoint scores that shortlist against the same message, and the plugin
+suggests what scores at or above `cutoff`.
 
-The plugin strips and injects in one step, so when it cannot build a block the request arrives
-unchanged with its catalog. A stopped endpoint then costs latency, not a broken turn.
+If a service is down or too slow, the plugin falls back to the ordinary skill catalog, so a bad
+endpoint costs latency, not a broken turn.
 
 ## Install
 
@@ -77,6 +82,17 @@ unchanged with its catalog. A stopped endpoint then costs latency, not a broken 
    starts with `Skills routed for this request`. When no block appears, the plugin log carries one
    warning naming the reason.
 
+## Recommended setup
+
+The defaults are what we run, so you only have to set the two base URLs:
+
+- Embeddings: BGE-M3 on CPU, served by the bundled `service.embed_server` on 8012, with
+  `embedModelId: bge-m3`.
+- Rerank: `tasksource-decider-nano` through a Cohere-compatible rerank service on 8010, with
+  `rerankProvider: cohere`.
+- Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 8`, and the 6000, 20000 and
+  30000 ms timeouts. Keep them unless your endpoints need different budgets.
+
 ## Use
 
 A routed turn ends with one extra system message. The sample below is the opening block of a
@@ -94,7 +110,8 @@ Rows above `Also listed:` are that turn's suggestions, best first, capped at `ma
 opening block, rows below the marker stay visible and are never suggested. A later turn in the same
 window carries only the suggestion rows, and the next window opens with the pinned rows again. The
 model can open any of them with `skill_view`, and `skills_list` still lists the whole catalog. When
-the shortlist misses, the model can call `skill_router_search` with wording of its own.
+the shortlist misses, it can search by hand: `skill_router_search` takes any `query` in the model's
+own words and returns ranked names, descriptions and skill paths.
 
 The last decision also appears on screen, and neither place costs a token. The desktop app gets a
 `Skills routed` pane on the right rail, collapsed by default, with the names and one caption line. In

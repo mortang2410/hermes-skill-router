@@ -1,7 +1,7 @@
 """The Hermes association store, the eligibility gate and the backfill (modules M9, C9).
 
 This is the Hermes half of the learned-association channel: the same SQLite schema, the same six
-gate conditions and the same incremental-versus-recompute contract as the DSH router's
+gate conditions and the same incremental-versus-recompute contract as the reference router's
 ``src/associations/{store,gate,backfill}.ts``, restated against the Hermes session store. The
 schema, privacy and identity rules are ``RESEARCH.md`` section 5, the gate is section 4.1 and the
 attribution rule is section 2.4 and 6.2 of the pre-reranker routing research.
@@ -25,7 +25,7 @@ Two Hermes facts shape the port:
   share. ``skill.path`` still exists because the schema requires it: it holds the resolved absolute
   ``SKILL.md`` path once a load reveals one, and the synthetic ``hermes:<name>`` until then. A load
   that reveals a path updates the row in place instead of creating a second row, so one skill never
-  splits into two identities. The DSH store keys on the path because DSH reads files through the
+  splits into two identities. That store keys on the path because it reads files through the
   ``read`` tool; the two rules differ because the two catalogs do.
 * A Hermes load has no turn to stop at. Attribution walks back from the load to the nearest
   preceding typed user row, skipping harness-injected rows and compacted summaries, and never pairs
@@ -128,7 +128,7 @@ PROMPT_SOURCE_USER = "user"
 #: Markers a harness writes into a user row. An injected row is never the user's typing, even when
 #: the harness stored it with ``role=user``: Hermes injects a loaded skill's body, a system nudge, an
 #: image caption and an out-of-band steer as user rows, and a prompt-term corpus must not learn from
-#: them. ``<system-reminder>`` is the DSH marker, kept so one marker list covers both harnesses.
+#: them. ``<system-reminder>`` is the reference marker, kept so one marker list covers both clients.
 INJECTED_PROMPT_MARKERS: Tuple[str, ...] = (
     "<system-reminder>",
     "[IMPORTANT:",
@@ -2076,7 +2076,7 @@ def _resolve_tool_result(
     """Turn one matched tool result into a load, and return 1 when its content was unreadable.
 
     A ``skill_view`` by name is the harness's tool call, so it carries the ``tool`` evidence kind,
-    exactly as a DSH ``skill`` call would; a ``read_file`` of a ``SKILL.md`` path carries
+    exactly as a reference ``skill`` call would; a ``read_file`` of a ``SKILL.md`` path carries
     ``skill_md_read``. The two are the design's "both count equally" case: one strength, two
     provenance kinds, so a ranking can say which one produced it. A read of a file under
     ``references/`` carries ``tool`` at the follow-on strength and needs the same skill's

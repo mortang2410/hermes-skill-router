@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
-#: Exact text the DSH skill router puts before ``<name> - <description>`` in a rerank document.
+#: Exact text the reference skill router puts before ``<name> - <description>`` in a rerank document.
 DOCUMENT_PREFIX = (
     "This skill supplies a procedure, tool, or domain-specific instructions that the agent would "
     "actually need to carry out the current task correctly. Skill: "

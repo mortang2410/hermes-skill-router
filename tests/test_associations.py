@@ -1,7 +1,7 @@
 """T4: the Hermes association store, the gate and the backfill.
 
-The DSH implementation (``src/associations/{store,gate,backfill}.ts``) defines the behaviour; this
-suite restates its cases against Hermes and adds the two Hermes-only rules the ticket names: the
+The reference implementation (``src/associations/{store,gate,backfill}.ts``) defines the behaviour;
+this suite restates its cases against Hermes and adds the two Hermes-only rules the ticket names: the
 ``skill_view`` load path with its ``file=`` follow-on prerequisite, and the automation provenance
 flag that keeps 84% of the store while a subagent session contributes nothing.
 

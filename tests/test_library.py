@@ -134,7 +134,7 @@ def split(rows=ROUTED_ROWS, demoted=(), **options):
 
 
 # ---------------------------------------------------------------------------
-# The index is the routed half of the catalog, under the DSH document text.
+# The index is the routed half of the catalog, under the shared document text.
 # ---------------------------------------------------------------------------
 
 

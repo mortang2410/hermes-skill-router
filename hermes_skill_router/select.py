@@ -1,15 +1,15 @@
 """The cutoff and cap that turn rerank probabilities into suggestions (module M7, contract C7).
 
 The scores arrive from :func:`hermes_skill_router.rerank.rerank` already as probabilities: the shared
-decider answers with its softmax share over the shortlist, and DSH's selector compares that value
-directly. This module does the same and nothing more. A candidate is selected when its score is at
-or above ``cfg.cutoff`` (inclusive), the survivors are sorted by descending score, and the list is
+decider answers with its softmax share over the shortlist, and the reference selector compares that
+value directly. This module does the same and nothing more. A candidate is selected when its score is
+at or above ``cfg.cutoff`` (inclusive), the survivors are sorted by descending score, and the list is
 truncated to ``cfg.max_suggestions``. Ties keep the order they arrived in, which is shortlist order,
 so a stable descending sort is the whole ordering policy.
 
 There is deliberately no normalisation here. A softmax over the incoming scores would turn a single
 confident candidate into 0.99 and lift forty-nine near-zero candidates over a 0.01 cutoff, which is
-the failure the DSH study records as "two softmaxes": a page of suggestions where one skill was
+the failure the routing study records as "two softmaxes": a page of suggestions where one skill was
 meant. ``cutoff`` is a probability threshold, not a share of a recalculated distribution.
 
 Nothing here reads a clock, a file or the network, so selection replays against recorded scores.
@@ -44,6 +44,7 @@ def select(scores: Sequence[float], names: Sequence[str], cfg: Config) -> List[S
         probability = float(score)
         if probability >= cutoff:
             eligible.append((name, probability))
-    # ``list.sort`` is stable, so equal probabilities keep shortlist order, as DSH's selector does.
+    # ``list.sort`` is stable, so equal probabilities keep shortlist order, as the reference
+    # selector does.
     eligible.sort(key=lambda suggestion: suggestion[1], reverse=True)
     return eligible[:limit]

@@ -5,8 +5,7 @@ Contract C1 (``docs/work/router-sync/skeleton.md``): ``GET /health`` and
 export under ``$HSR_MODEL_DIR``; the tokenizer is read from ``tokenizer.json``
 through ``tokenizers``. ``transformers`` is never imported.
 
-Two measured facts from the DSH embedder
-(``packages/dsh-skill-router/src/index/bge-embedder.ts``) shape the embedding
+Two measured facts from the reference embedder shape the embedding
 path, and both fail silently when ignored:
 
 * the published export ignores the attention mask, so every row after the

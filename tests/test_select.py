@@ -1,7 +1,7 @@
 """Contract C7: the cutoff, the descending sort and the cap, with no second normalisation.
 
-The scores come from the reranker as probabilities, so these tests pin the DSH selector's parity on
-fixed vectors: a single confident candidate plus near-zero siblings must select one row, an
+The scores come from the reranker as probabilities, so these tests pin the reference selector's parity
+on fixed vectors: a single confident candidate plus near-zero siblings must select one row, an
 inclusive cutoff keeps the exact boundary value, and the cap truncates after the sort.
 """
 

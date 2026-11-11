@@ -13,8 +13,8 @@ The rewrite runs six steps for one Chat Completions request:
    descriptions, embedded through the embeddings endpoint.
 3. Embed the text of the request's last user message, then keep the `shortlistSize` routed rows
    nearest to it by cosine similarity.
-4. Send those candidates to the rerank endpoint, one document per candidate, in the DSH format
-   `documentPrefix + name + " - " + description`.
+4. Send those candidates to the rerank endpoint, one document per candidate, in the rerank document
+   format `documentPrefix + name + " - " + description`.
 5. Keep the candidates whose rerank score is at or above `cutoff`, sort them by score, and cap them
    at `maxSuggestions`.
 6. Render the block with those suggestions and the kept rows, and append it as one system message.
@@ -237,7 +237,7 @@ request.
 
 ### Eager and deferred lists
 
-`eagerSkills` and `deferredSkills` mirror DSH's eager and deferred split, applied to skills. The
+`eagerSkills` and `deferredSkills` split the catalog into a pinned list and a routable pool. The
 partition is computed per request from the catalog rows.
 
 - `eagerSkills` names skills that are listed once, in the opening block of a compaction window,
@@ -268,7 +268,7 @@ partition is computed per request from the catalog rows.
 | `rerankPath` | `/v1/rerank` | path starting with `/` | Path appended to `rerankBaseUrl`. |
 | `rerankModel` | `tasksource-decider-nano` | non-empty string | `model` field sent to the rerank endpoint. |
 | `rerankProvider` | `cohere` | `cohere` | Request and response shape. Cohere is the only implemented provider. |
-| `documentPrefix` | `This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: ` | non-empty string | Exact text before `<name> - <description>` in a rerank document. The default matches DSH. |
+| `documentPrefix` | `This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: ` | non-empty string | Exact text before `<name> - <description>` in a rerank document. The default matches the format the shared rerank service parses. |
 | `deferredSkills` | empty | list of skill names | Routable skills. Empty means every non-eager skill is routable; a non-empty list restricts routing to the named skills and lists the rest. |
 | `rerankTimeoutMs` | `20000` | 100..60000 | Per-request rerank timeout. One rerank call carries the whole shortlist. |
 | `routingTimeoutMs` | `30000` | 1000..60000 | Whole routing pass budget, from the query embed through the rerank reply. It starts after the index is loaded or built, so the cold build is never cut, and each per-request timeout is capped at the time left. On expiry the request keeps the bare catalog and gets no suggestions. |
@@ -418,9 +418,8 @@ the budget runs out the plugin abandons the pass: the request keeps the bare cat
 suggestion block, the same inert fallback every other failure uses, and one warning names the budget.
 
 The 30000 ms default rests on two facts. The two per-request timeouts allow a 26 second pass at
-worst, 6000 plus 20000, so 30000 sits above that ceiling and a working but slow path is never cut,
-and it matches the DSH router's 30 second catalog read deadline. It also has headroom over the
-measurements recorded on this machine against its live endpoints: a steady-state single-text embed
+worst, 6000 plus 20000, so 30000 sits above that ceiling and a working but slow path is never cut. It
+also has headroom over the measurements recorded on this machine against its live endpoints: a steady-state single-text embed
 took 236 to 306 ms, a 50-document rerank took 2158 to 2255 ms, and the first embed after an endpoint
 restart took 2700 ms, so a cold but healthy pass cost about 5 seconds, 2700 plus 2255. Those are the
 slow case rather than a constant: an earlier live run on the same host measured a full warm rewrite
@@ -487,8 +486,7 @@ plugins:
 ```
 
 The model ids are free-form strings passed through to your servers. The vector width is your choice;
-the only requirement is that every response for one index uses one consistent width. Both endpoints
-can be shared with DSH.
+the only requirement is that every response for one index uses one consistent width.
 
 ## Failure behaviour
 
@@ -527,41 +525,13 @@ its own recorded request text, and that text is what ships, so the fork routes o
 than on its parent's wording. `skills_list` and `skill_view` stay available on every spawn, which is
 what the background review uses.
 
-## Sharing the endpoints with DSH
+## Sharing the endpoints
 
-DSH's skill router reaches the embeddings endpoint through its HTTP embedder, and the rerank endpoint
-through its gateway URL. The `skill-router` row in the active DSH profile's `cordis.patch.yml`
-carries these keys:
-
-| Key | Default | Bound | Effect |
-| --- | --- | --- | --- |
-| `embedBaseUrl` | empty | string | Non-empty selects the HTTP embedder. Empty keeps the in-process ONNX embedder. |
-| `embedPath` | `/v1/embeddings` | string | Path appended to `embedBaseUrl`. |
-| `embedModelId` | `bge-m3` | string | `model` field sent to the endpoint. |
-| `embedTimeoutMs` | `2000` | 100..60000 | Per-request timeout. |
-
-For example:
-
-```yaml
-- id: skill-router
-  name: '@local/dsh-skill-router'        # the installed package name
-  config:
-    modelPath: '/path/to/bge-m3'          # still required: suppression is gated on it
-    embedBaseUrl: 'http://127.0.0.1:8012'
-    embedPath: '/v1/embeddings'
-    embedModelId: 'bge-m3'
-    embedTimeoutMs: 2000
-    gatewayUrl: 'http://127.0.0.1:8010'
-    judgmentModelId: 'tasksource-decider-nano'
-    judgmentProvider: 'cohere-compatible'
-```
-
-DSH still requires a non-empty `modelPath` even when `embedBaseUrl` is set, because its catalog
-suppression is gated on it; the ONNX path stays as the fallback. The DSH index fingerprint includes
-the embedder identity, meaning the endpoint kind, base URL, path and model id, so repointing the
-endpoint rebuilds its cache instead of reusing vectors from another model. The rerank side is
-unchanged: DSH calls the same `gatewayUrl` on 8010 with the Cohere shape, which is why the two
-harnesses suggest from the same scores.
+Both endpoints are plain HTTP, so another agent or tool can use them. The embeddings side takes
+`POST /v1/embeddings` with a `model` and an `input` list. The rerank side takes the Cohere shape at
+`/v1/rerank` with a `model`, a `query` and a `documents` list, each document in the `documentPrefix`
+format above. A client that sends the same model ids and the same `documentPrefix` ranks against the
+same vectors and scores, so it suggests the same skills for the same query.
 
 ## Measured effect
 

@@ -20,7 +20,7 @@ at:
 Scores are used as the endpoint returned them. It already answers with a probability over the
 candidates, and the selector compares that value against the cutoff directly (D10); normalising it
 again would turn one confident skill into a page of suggestions. The document text is the caller's:
-``cfg.document_prefix + name + " - " + description``, the DSH format the shared service parses.
+``cfg.document_prefix + name + " - " + description``, the format the shared service parses.
 
 The client never raises: connection errors, timeouts, HTTP errors including every 3xx and unusable
 bodies all return ``None``, which the rewrite turns into an unchanged request (R5).
