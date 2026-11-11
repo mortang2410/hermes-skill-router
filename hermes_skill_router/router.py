@@ -20,11 +20,15 @@ block replaces it. Any failure — an unreachable or timed-out endpoint, an unbu
 user text, an empty block — returns ``None``, and ``_apply_request_chain`` then keeps the payload
 that arrived, catalog included (R5, D8). The rewrite never raises and never mutates its input.
 
-Steps 3 and 4 run inside one routing budget, ``cfg.routing_timeout_ms``. The budget starts after
-the index is in hand, so it never covers the cold build, which embeds the whole catalog in batches
-and already fails through its own path. Each per-request timeout is capped by the milliseconds left,
-so the pass cannot outlive the budget, and a pass that reaches the end of it is abandoned with one
-log line naming the budget.
+Steps 3 to 5 are :func:`hermes_skill_router.search.rank`, the same pass the model's search tool
+runs, so a turn and a search for the same query and catalog can never disagree. The pass runs inside
+one routing budget, ``cfg.routing_timeout_ms``, which starts after the index is in hand and never
+covers the cold build, which embeds the whole catalog in batches and already fails through its own
+path. Each per-request timeout is capped by the milliseconds left, so the pass cannot outlive the
+budget, and a pass that reaches the end of it is abandoned with one log line naming the budget.
+
+The parsed partition is kept for the session's search tool, which ranks its routed half; every
+request clears the previous one first, so a search never ranks rows from an earlier prompt (D10).
 
 On every request that carried the catalog on Chat Completions the same decision is written to the
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
@@ -41,10 +45,7 @@ because Hermes replays recorded request bytes on later turns.
 from __future__ import annotations
 
 import logging
-import math
-from dataclasses import replace
-from time import monotonic
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .catalog import strip_catalog
 from .config import Config
@@ -53,7 +54,7 @@ from .embed import embed_texts as default_embed
 from .inject import HEADER, render
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
-from .select import select
+from .search import forget_session, rank, remember_partition
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +77,6 @@ Reranker = Callable[[Config, str, Sequence[str]], Optional[Sequence[float]]]
 
 #: Receives the turn id after a record was written; the default broadcasts the plugin event.
 Notify = Callable[[str], None]
-
-#: One shortlist row: the catalog name and the description the index carries for it.
-ShortlistRow = Tuple[str, str]
 
 #: Failure reasons already logged, so one broken path logs once per process instead of per request.
 _LOGGED: set[str] = set()
@@ -109,8 +107,13 @@ def rewrite(
     Returns ``None`` for a non-Chat-Completions mode, a disabled plugin, a payload without the
     catalog, no user text, an empty index or block, a last message that already carries the block,
     and for any failure inside the pipeline. An exception never escapes this function.
+
+    The call starts by dropping the session's searchable record: every request the middleware sees
+    begins with no searchable catalog, and only a request that parses one sets it again, so a tool
+    call can never rank rows from an earlier prompt (D10).
     """
     try:
+        forget_session(session_id)
         return _compose(
             payload,
             cfg=cfg,
@@ -161,6 +164,9 @@ def _compose(
         # No catalog on this request: there is no section to replace, so stay inert and record
         # nothing. The record describes routing decisions, not requests in general.
         return None
+    # The tool ranks the routed half of this partition, so it remembers the rows this prompt
+    # showed before any later stage can fail and leave the request as it arrived.
+    remember_partition(session_id, partition)
     inert = _recorder(cfg, INERT, (), session_id, turn_id, notify)
     query = _last_user_text(messages)
     if not query:
@@ -184,27 +190,13 @@ def _compose(
     if not index.names:
         inert()
         return None
-    # The budget starts here, after the index is in hand. A cold build embeds the whole
-    # catalog in 27 requests and the library records it as about 38 s, so a budget that
-    # covered the build would cut a healthy first pass; a build that fails already returns
-    # no index above and leaves the request untouched.
-    deadline = monotonic() + cfg.routing_timeout_ms / 1000.0
-    query_vector = _embed_query(cfg, query, embed, inert, deadline)
-    if query_vector is None:
-        return None
-    shortlist = _shortlist(index, query_vector, cfg.shortlist_size)
-    if not shortlist:
+    ranked = rank(cfg, index, query, embed=embed, rerank=rerank)
+    if ranked.reason:
+        _log_once(ranked.detail)
         inert()
         return None
-    documents = [
-        cfg.document_prefix + name + " - " + description for name, description in shortlist
-    ]
-    scores = _rerank_scores(cfg, query, documents, rerank, inert, deadline)
-    if scores is None:
-        return None
-    chosen = select(scores, [name for name, _description in shortlist], cfg)
     # The partition's variant chooses the header, so the block matches the prose this request lost.
-    block = render(chosen, partition.kept, index, cfg, partition.one_shot)
+    block = render(ranked.rows, partition.kept, index, cfg, partition.one_shot)
     if not block:
         # No selected suggestion and no kept row: stripping without a replacement would lose the
         # catalog for nothing, so the whole request is returned untouched.
@@ -217,129 +209,8 @@ def _compose(
             {"role": "system", "content": block},
         ],
     }
-    _recorder(cfg, ROUTED, [name for name, _score in chosen], session_id, turn_id, notify)()
+    _recorder(cfg, ROUTED, [name for name, _score in ranked.rows], session_id, turn_id, notify)()
     return {"request": rewritten}
-
-
-def _budget_left(deadline: float) -> Optional[int]:
-    """Return the whole milliseconds left before *deadline*, or ``None`` once it has passed.
-
-    The value is rounded UP, so a per-request timeout set from it can never fire before the
-    deadline: the socket then times out with the budget already spent, which is what lets a
-    failed call tell a budget expiry from an endpoint that failed on its own.
-    """
-    left = int(math.ceil((deadline - monotonic()) * 1000.0))
-    return left if left > 0 else None
-
-
-def _capped(cfg: Config, field: str, left: int) -> Config:
-    """Return *cfg* with *field*, a per-request timeout, capped by the milliseconds left."""
-    return replace(cfg, **{field: min(getattr(cfg, field), left)})
-
-
-def _expire_budget(cfg: Config, inert: Callable[[], None]) -> None:
-    """Abandon the pass at its budget: one line naming it, and the inert decision."""
-    _log_once(f"routing budget {cfg.routing_timeout_ms} ms exhausted")
-    inert()
-
-
-def _embed_query(
-    cfg: Config,
-    query: str,
-    embed: Embedder,
-    inert: Callable[[], None],
-    deadline: float,
-) -> Optional[List[float]]:
-    """Embed the user's text inside the budget, or return ``None`` after logging and recording."""
-    left = _budget_left(deadline)
-    if left is None:
-        _expire_budget(cfg, inert)
-        return None
-    timed_out = False
-    try:
-        vectors = embed(_capped(cfg, "embed_timeout_ms", left), [query])
-    except TimeoutError:
-        timed_out = True
-        vectors = None
-    except Exception:
-        logger.debug("skill router: embeddings call raised", exc_info=True)
-        vectors = None
-    if not vectors:
-        if _budget_left(deadline) is None:
-            _expire_budget(cfg, inert)
-        elif timed_out:
-            _log_once("embed timeout")
-            inert()
-        else:
-            _log_once("embed unreachable")
-            inert()
-        return None
-    try:
-        return [float(value) for value in vectors[0]]
-    except (TypeError, ValueError):
-        _log_once("embed unreachable")
-        inert()
-        return None
-
-
-def _rerank_scores(
-    cfg: Config,
-    query: str,
-    documents: Sequence[str],
-    rerank: Reranker,
-    inert: Callable[[], None],
-    deadline: float,
-) -> Optional[List[float]]:
-    """Score the shortlist inside the budget, or return ``None`` after logging and recording."""
-    left = _budget_left(deadline)
-    if left is None:
-        _expire_budget(cfg, inert)
-        return None
-    try:
-        scores = rerank(_capped(cfg, "rerank_timeout_ms", left), query, documents)
-    except Exception:
-        logger.debug("skill router: rerank raised", exc_info=True)
-        scores = None
-    if scores is None:
-        if _budget_left(deadline) is None:
-            _expire_budget(cfg, inert)
-        else:
-            _log_once("rerank unreachable")
-            inert()
-        return None
-    return scores
-
-
-def _shortlist(index: Index, query_vector: Sequence[float], limit: int) -> List[ShortlistRow]:
-    """Return the *limit* routed rows closest to *query_vector* by cosine, ties in index order."""
-    scored: List[Tuple[float, int, str, str]] = []
-    for position, (name, description, vector) in enumerate(
-        zip(index.names, index.descriptions, index.vectors)
-    ):
-        scored.append((-_cosine(query_vector, vector), position, name, description))
-    scored.sort()
-    return [
-        (name, description)
-        for _score, _position, name, description in scored[: max(0, limit)]
-    ]
-
-
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    """Return the cosine similarity of two vectors, or ``0.0`` when either has no length."""
-    length = min(len(left), len(right))
-    dot = 0.0
-    left_norm = 0.0
-    right_norm = 0.0
-    for position in range(length):
-        first = float(left[position])
-        second = float(right[position])
-        dot += first * second
-        left_norm += first * first
-        right_norm += second * second
-    if left_norm <= 0.0 or right_norm <= 0.0:
-        return 0.0
-    score = dot / math.sqrt(left_norm * right_norm)
-    return score if math.isfinite(score) else 0.0
 
 
 def _last_user_text(messages: Any) -> str:

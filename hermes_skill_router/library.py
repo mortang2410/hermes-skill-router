@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -112,6 +113,43 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
         _write_cache(cfg, index)
         _MEMO[key] = index
         return index
+
+
+def shortlist(index: Index, query_vector: Sequence[float], limit: int) -> List[Tuple[str, str]]:
+    """Return the *limit* indexed rows closest to *query_vector* by cosine, ties in index order.
+
+    One stage of the routing pass, shared by the request middleware and the search tool so the same
+    query and index always shortlist the same rows in the same order. An empty index, a zero limit
+    or a query vector with no length returns ``[]``.
+    """
+    scored: List[Tuple[float, int, str, str]] = []
+    for position, (name, description, vector) in enumerate(
+        zip(index.names, index.descriptions, index.vectors)
+    ):
+        scored.append((-_cosine(query_vector, vector), position, name, description))
+    scored.sort()
+    return [
+        (name, description)
+        for _score, _position, name, description in scored[: max(0, limit)]
+    ]
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    """Return the cosine similarity of two vectors, or ``0.0`` when either has no length."""
+    length = min(len(left), len(right))
+    dot = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+    for position in range(length):
+        first = float(left[position])
+        second = float(right[position])
+        dot += first * second
+        left_norm += first * first
+        right_norm += second * second
+    if left_norm <= 0.0 or right_norm <= 0.0:
+        return 0.0
+    score = dot / math.sqrt(left_norm * right_norm)
+    return score if math.isfinite(score) else 0.0
 
 
 def _unique(rows: CatalogRows) -> List[Tuple[str, str]]:
@@ -288,8 +326,13 @@ def _write_cache(cfg: Config, index: Index) -> None:
         if temporary is not None:
             try:
                 os.unlink(temporary)
-            except OSError:
-                pass
+            except OSError as exc:
+                # The destination failure is already reported; name the leftover too, so the one
+                # file a refusing filesystem keeps is never silent.
+                _log_once(
+                    f"leftover:{temporary}",
+                    f"skill index: cannot remove the temporary file {temporary}: {exc}",
+                )
 
 
 def _cache_payload(index: Index) -> Dict[str, object]:

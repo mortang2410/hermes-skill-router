@@ -735,3 +735,50 @@ def test_two_threads_on_a_cold_cache_embed_once(tmp_path):
     assert len(results) == 2
     assert all(result is not None for result in results)
     assert results[0].fingerprint == results[1].fingerprint
+
+
+def test_a_failed_cache_replace_keeps_the_previous_cache_and_removes_its_sibling(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    assert load_or_build(cfg, BASE_ROWS, CountingEmbedder()) is not None
+    before = (tmp_path / "index.json").read_text()
+    newer = CatalogRows(
+        ("alpha", "beta", "gamma"), ("Alpha skill", "Beta skill", "Gamma skill")
+    )
+    monkeypatch.setattr(
+        library_module.os,
+        "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    index = load_or_build(cfg, newer, CountingEmbedder())
+
+    assert index is not None, "the in-memory index survives a cache write failure"
+    assert (tmp_path / "index.json").read_text() == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["index.json"]
+
+
+def test_a_refused_sibling_removal_keeps_one_file_and_names_it(tmp_path, monkeypatch, caplog):
+    cfg = make_config(tmp_path)
+    assert load_or_build(cfg, BASE_ROWS, CountingEmbedder()) is not None
+    before = (tmp_path / "index.json").read_text()
+    newer = CatalogRows(
+        ("alpha", "beta", "gamma"), ("Alpha skill", "Beta skill", "Gamma skill")
+    )
+    monkeypatch.setattr(
+        library_module.os,
+        "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        library_module.os, "unlink", lambda *a, **k: (_ for _ in ()).throw(OSError("busy"))
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        index = load_or_build(cfg, newer, CountingEmbedder())
+
+    assert index is not None
+    assert (tmp_path / "index.json").read_text() == before
+    siblings = [path for path in tmp_path.iterdir() if path.suffix == ".tmp"]
+    assert len(siblings) == 1, "exactly the one file the removal refused to discard"
+    messages = " ".join(caplog.messages)
+    assert str(siblings[0]) in messages, "the kept sibling's path is logged"

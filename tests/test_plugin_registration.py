@@ -181,11 +181,11 @@ def _install(hermes, dispatcher, monkeypatch):
     return dispatcher
 
 
-def test_register_records_one_llm_request_middleware_and_nothing_else(plugin_module):
+def test_register_records_one_middleware_and_one_search_tool(plugin_module):
     ctx = RecordingContext()
     plugin_module.register(ctx)
 
-    assert ctx.tools == []
+    assert ctx.tools == ["skill_router_search"]
     assert ctx.hooks == []
     assert ctx.commands == []
     assert len(ctx.middleware) == 1
@@ -217,7 +217,7 @@ def test_plugin_yaml_parses_strictly_and_declares_the_capabilities():
     assert 'version: "0.1.0"' in MANIFEST_TEXT, "the version literal must stay quoted"
     assert manifest["requires_hermes"] == ">=0.22.2"
     assert manifest["description"].strip()
-    assert manifest["provides_tools"] == []
+    assert manifest["provides_tools"] == ["skill_router_search"]
     assert manifest["provides_hooks"] == []
     # The catalog capability must be declared or `hermes plugins validate` rejects the plugin.
     # This build's manifest parser logs one unknown-field warning per load; that is expected.

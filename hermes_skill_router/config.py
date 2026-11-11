@@ -342,3 +342,18 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
             notes.append(f"{name}: unknown config key ignored")
     report_notes(notes)
     return Config(notes=tuple(notes), **values)
+
+
+def read_settings(ctx: Any) -> dict[str, Any]:
+    """Read every settings key through ``ctx.get_config``, defaulting when the surface lacks one.
+
+    One reader for the request middleware and the search tool, so both see the same values from the
+    same place; a context that raises for one key still yields that key's default.
+    """
+    raw: dict[str, Any] = {}
+    for key, default in DEFAULTS.items():
+        try:
+            raw[key] = ctx.get_config(key, default)
+        except Exception:
+            raw[key] = default
+    return raw

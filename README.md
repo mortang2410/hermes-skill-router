@@ -229,6 +229,15 @@ See [Display](#display) for the desktop pane and the Ink TUI widget.
    at `maxSuggestions`.
 6. Render the block with those suggestions and the kept rows, and append it as one system message.
 
+The model can also search the catalog the prompt showed. The plugin registers one tool,
+`skill_router_search`, which ranks the routed half of the same partition through the same embed,
+shortlist, rerank, cutoff and cap, and returns `{"skills": [{"name", "description", "path"?}]}`. The
+prompt's shortlist is already in front of the model, so the tool description tells it not to call
+the tool for those rows. A search runs inside `routingTimeoutMs` and finds the index the turn
+already built; it writes the same display record with origin `search`, so both surfaces show it.
+The tool never scans the skill library: a session with no parsed catalog answers `no-catalog`, and
+with `showSuggestions` off the record stays hidden exactly as for a turn.
+
 The persisted index at `cachePath` is keyed by a fingerprint of every routed row's text and full
 description, `embedModelId`, the document format version, and `embedBaseUrl + embedPath`. A change
 to a routed skill, the model, the endpoint, or the description clip rebuilds it. A change to a kept

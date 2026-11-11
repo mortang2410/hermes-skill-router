@@ -79,14 +79,18 @@ def chat_payload():
 
 
 class RecordingContext:
-    """Fake plugin context: records the registrar call and answers ``get_config`` from a dict."""
+    """Fake plugin context: records each registrar call and answers ``get_config`` from a dict."""
 
     def __init__(self, settings):
         self.settings = dict(settings)
         self.middleware = []
+        self.tools = []
 
     def register_middleware(self, kind, callback):
         self.middleware.append((kind, callback))
+
+    def register_tool(self, name, **kwargs):
+        self.tools.append((name, kwargs))
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)

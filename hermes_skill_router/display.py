@@ -278,8 +278,13 @@ def _write(path: str, entry: Dict[str, Any]) -> bool:
         if temporary is not None:
             try:
                 os.unlink(temporary)
-            except OSError:
-                pass
+            except OSError as exc:
+                # The destination failure is already reported; name the leftover too, so the one
+                # file a refusing filesystem keeps is never silent.
+                _log_once(
+                    f"leftover:{temporary}",
+                    f"skill display: cannot remove the temporary file {temporary}: {exc}",
+                )
     return True
 
 
