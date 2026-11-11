@@ -137,7 +137,10 @@ class RecordingContext:
 
 @pytest.fixture(autouse=True)
 def _host_paths(monkeypatch):
-    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
+    """The host lookup resolves every name, and no dump record leaks between tests."""
+    from hermes_skill_router import search as search_module
+
+    search_module.clear_dumps()
     resolver = lambda name: f"/skills/{name}/SKILL.md"
     for module_name, module in list(sys.modules.items()):
         if module_name.endswith("router") and hasattr(module, "skill_path"):

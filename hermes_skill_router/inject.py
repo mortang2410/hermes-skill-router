@@ -103,8 +103,9 @@ PATH_PREFIX = "  path: "
 #: The one-line marker a stripped request carries when routing failed and the catalog went out
 #: instead. The first line is neither block header, so the recogniser never reads it as a
 #: suggestion, and carries no skill name, so it cannot pose as exposure of any one skill.
-#: The rewrite recognises it in a later request and strips the catalog again, which keeps the
-#: whole catalog out of the window after the first dump.
+#: The marker is the per-request strip notice only; the durable dump fact lives beside the
+#: partitions in :mod:`hermes_skill_router.search`, because this payload never re-enters
+#: history on the host path.
 DROPPED_HEADER = "Skill catalog dropped after a routing failure"
 
 DROPPED_MESSAGE = (

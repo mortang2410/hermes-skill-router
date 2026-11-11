@@ -107,7 +107,40 @@ class Ranked:
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
 _PARTITIONS: Dict[str, Partition] = {}
+#: Sessions in which the whole catalog already went out in the current compaction window.
+#: Hermes rebuilds every request from message history and never copies the middleware's
+#: ``api_kwargs`` messages back into history, so a marker appended to that payload never
+#: reaches the next turn. This record is that durable fact instead. The rewrite clears a
+#: session's entry when a request shows no prior router block, so a compaction that removes
+#: the window's blocks starts a new window and the record expires with it, never forever.
+#: The search tool reads it to answer healthy-empty after a dump, so a name the dump already
+#: showed is never suggested again.
+_DUMPED: set[str] = set()
 _PARTITIONS_LOCK = threading.Lock()
+
+
+def remember_dump(session_id: str) -> None:
+    """Record that the whole catalog went out in *session_id*'s current compaction window."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.add(session_id)
+
+
+def clear_dumps() -> None:
+    """Expire every session's dump record. Tests call this; production never needs it."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.clear()
+
+
+def clear_dump(session_id: str) -> None:
+    """Expire the dump record for *session_id*; a payload with no prior block is a new window."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.discard(session_id)
+
+
+def dumped(session_id: str) -> bool:
+    """Return whether the whole catalog already went out in this session's current window."""
+    with _PARTITIONS_LOCK:
+        return session_id in _DUMPED
 
 
 def remember_partition(session_id: str, partition: Partition) -> None:
@@ -117,7 +150,13 @@ def remember_partition(session_id: str, partition: Partition) -> None:
 
 
 def forget_session(session_id: str) -> None:
-    """Drop the session's record, so a later search answers ``no-catalog`` until a catalog parses."""
+    """Drop the session's record, so a later search answers ``no-catalog`` until a catalog parses.
+
+    The dump record is deliberately not dropped here: ``forget_session`` runs at the start of
+    every request, and the dump fact has to survive from the failed turn to the next one in
+    the same window. ``_compose`` clears it only when a payload shows no prior block, which
+    is the window boundary.
+    """
     with _PARTITIONS_LOCK:
         _PARTITIONS.pop(session_id, None)
 
@@ -154,6 +193,7 @@ def select_rows(
     rerank: Optional[Reranker] = None,
     deadline: Optional[float] = None,
     resolve: Optional[PathResolver] = None,
+    session_id: Optional[str] = None,
 ) -> SearchOutcome:
     """Rank *rows* for *query* and return the selected rows, or the failure arm.
 
@@ -171,7 +211,14 @@ def select_rows(
     The ranking is :func:`rank`, the middleware's own pass, so the same query and catalog give the
     same names and order a turn would inject. Never raises: an index, embed or rerank failure
     returns that arm, and an empty selection is a healthy outcome with no rows.
+
+    A session whose whole catalog already went out in this compaction window answers
+    healthy-empty: the same no-name-twice rule the turn path applies after a dump, so the search
+    never re-suggests a name the model already saw. *rows* alone cannot carry that fact, so callers
+    that know the session pass ``session_id``; without it this check does not run.
     """
+    if session_id is not None and dumped(session_id):
+        return SearchOutcome()
     material = [(row.name, row.description) for row in rows]
     if not material:
         return SearchOutcome()

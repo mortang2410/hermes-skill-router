@@ -558,19 +558,22 @@ window:
 - The plugin is disabled, or the request carries no skills section.
 
 The catalog is shown once per compaction window. The first failed pass in a window leaves the
-request unchanged and sends the whole catalog, a dump, and the rewrite records that fact in the
-payload it returns by appending one marker message, `Skill catalog dropped after a routing
-failure`. Hermes rebuilds the system message each turn from its cached prompt and drops the prior
-turn's appended system messages, so the marker reaches the payload the rewrite sees through the
-history the host carries forward. The rewrite recognises the marker in a later request and, on any
-further failed pass in that window, strips the catalog and appends the marker again instead of
-dumping the catalog a second time. It also suggests nothing after a dump, because the dump showed
-every skill and nothing is suggestible for the rest of that window. The marker names no skill and
-does not read as a routed block. A compaction that removes the marker starts a new window and the
-catalog may be dumped once again. When the first failure arrives in a window the request is left
-unchanged, and when the marker is already present the rewrite is a clean catalog strip plus one
-marker message, never a partial strip. `None` is still returned whenever there is no marker and no
-prior block, so a strip without a replacement never loses the catalog for nothing.
+request unchanged and sends the whole catalog, a dump, and records that fact in a per-session
+durable record next to the search partitions, because Hermes rebuilds every request from message
+history and never copies the middleware's `api_kwargs` messages back into it, so a marker
+appended to that payload never reaches the next turn. On any further failed pass in that window
+the rewrite strips the catalog and appends one marker message, `Skill catalog dropped after a
+routing failure`, instead of dumping the catalog a second time. It also suggests nothing after a
+dump, because the dump showed every skill and nothing is suggestible for the rest of that
+window. A payload check for the marker is system-role only and reads list-shaped content, so a
+user message that quotes the marker text cannot silence routing. The marker names no skill and
+does not read as a routed block. A compaction that removes the prior blocks starts a new window,
+the durable record expires with it, and the catalog may be dumped once again. When the first
+failure arrives in a window the request is left unchanged, and on a later failure in the same
+window the rewrite is a clean catalog strip plus one marker message, never a partial strip. A
+completed pass whose selection is empty because everything was already suggested or fell below
+the cutoff is healthy, not a failure: it returns nothing and sets no dump record, so only a
+failed embed, rerank or index arm consumes the window's one dump.
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build failed`,

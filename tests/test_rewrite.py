@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
+from hermes_skill_router import search as search_module  # noqa: E402
 from hermes_skill_router.config import DEFAULTS, Config, load  # noqa: E402
 from hermes_skill_router.inject import (DROPPED_MESSAGE, HEADER, ONE_SHOT_HEADER, PINNED)  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
@@ -163,12 +164,15 @@ class FakeReranker:
 
 @pytest.fixture(autouse=True)
 def _fresh_process_state(monkeypatch):
-    """A fresh logger set and index memo per test, so one test's failure never silences another.
+    """A fresh logger set, index memo and dump record per test, so one test never leaks into another.
 
-    The host path lookup is replaced with a resolver that answers one absolute path per name, the way
-    the real ``skill_view`` resolver does on a host that carries every skill. A test that needs a
-    refused or raising lookup patches ``router_module.skill_path`` itself.
+    The dump record is keyed by session_id and many tests here use the empty id, so without this
+    clear one test's dump poisons every later test in the process. The host path lookup is replaced
+    with a resolver that answers one absolute path per name, the way the real ``skill_view``
+    resolver does on a host that carries every skill. A test that needs a refused or raising lookup
+    patches ``router_module.skill_path`` itself.
     """
+    search_module.clear_dumps()
     monkeypatch.setattr(router_module, "_LOGGED", set())
     monkeypatch.setattr(library_module, "_MEMO", {})
     monkeypatch.setattr(inject_module, "_PINNED_WARNED", set())
@@ -831,6 +835,105 @@ def test_a_partition_with_no_routed_row_returns_none(tmp_path):
     assert record_for(cfg)["status"] == "inert"
 
 
+def test_an_all_eager_config_that_selects_nothing_does_not_re_dump(tmp_path):
+    """P1-2, empty-selection branch: the first pass dumps once, the second strips.
+
+    Every row is eager, so no pass can select anything. Before the fix both passes returned
+    None and the whole catalog went out twice. Now the first pass is the one allowed dump
+    and the second pass in the same window strips the catalog instead.
+    """
+    cfg = make_config(tmp_path, eagerSkills=["alpha", "beta", "gamma", "delta"])
+    index = make_index()
+    payload = _payload()
+
+    first = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="all-eager-session")
+    assert first is None, "the first empty pass is the one allowed dump"
+
+    second = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="all-eager-session")
+    assert second is not None, "the second empty pass re-dumped the catalog"
+    system = second["request"]["messages"][0]["content"]
+    assert "## Skills" not in system
+    assert block_of(second) == DROPPED_MESSAGE
+
+
+def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
+    """P1-2, empty-block branch: a below-cutoff pass is healthy, not a failure.
+
+    A pass that selects nothing because every score fell below the cutoff returns None
+    without setting a dump record, so the next working pass routes normally instead of
+    stripping the catalog as if a dump had happened.
+    """
+    index = make_index()
+    payload = _payload()
+
+    first = rewrite(
+        payload,
+        cfg=make_config(tmp_path, cutoff=0.99),
+        index=index,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+    assert first is None
+
+    good = rewrite(
+        payload, cfg=make_config(tmp_path), index=index, embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert good is not None
+    assert "- beta: Beta skill" in block_of(good)
+
+
+def test_a_user_message_starting_with_the_marker_does_not_silence_routing(tmp_path):
+    """P3-5: only a system message can act as proof that the catalog already went out."""
+    payload = _payload()
+    crafted = {
+        **payload,
+        "messages": [
+            *_all_eager_payload_messages(payload),
+            {"role": "user", "content": DROPPED_MESSAGE + "\nplease route this"},
+        ],
+    }
+
+    result = rewrite(
+        crafted,
+        cfg=make_config(tmp_path),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="crafted-session",
+    )
+
+    assert result is not None
+    assert "- beta: Beta skill" in block_of(result)
+
+
+def _all_eager_payload_messages(payload):
+    return payload["messages"]
+
+
+def test_a_list_content_system_marker_is_recognised(tmp_path):
+    """P2-4: a list-shaped system message carrying the marker still counts."""
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+    payload_list = {
+        **payload,
+        "messages": [
+            payload["messages"][0],
+            {"role": "user", "content": payload["messages"][1]["content"]},
+            {"role": "system", "content": [{"type": "text", "text": DROPPED_MESSAGE}]},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next request"},
+        ],
+    }
+
+    result = rewrite(
+        payload_list, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    )
+
+    assert result is not None, "a list-shaped marker was not recognised"
+    system = result["request"]["messages"][0]["content"]
+    assert "## Skills" not in system
+
+
 # ---------------------------------------------------------------------------
 # No rewrite at all: no record, and the payload is never touched.
 # ---------------------------------------------------------------------------
@@ -1417,16 +1520,20 @@ def test_two_failing_passes_dump_the_catalog_once_and_no_name_twice(tmp_path):
 
 
 def test_a_fresh_window_allows_the_catalog_again(tmp_path):
-    """Invariant 3: a payload with no prior router block opens a new window."""
-    cfg = make_config(tmp_path)
+    """Invariant 3, decisive probe: a payload with no prior block and no durable fact opens a new window.
+
+    The first request fails and sets the durable fact for its session. A new session with the
+    same payload and no prior block has no fact, so it belongs to a new window: a failed pass
+    there leaves the catalog in place again, and a working pass routes normally.
+    """
     index = make_index()
     payload = _payload()
 
-    rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker())
-    fresh = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker())
+    rewrite(payload, cfg=make_config(tmp_path), index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(), session_id="old-session")
+    fresh = rewrite(payload, cfg=make_config(tmp_path), index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(), session_id="new-session")
 
     assert fresh is None, "a fresh window must not strip the catalog on a failed pass"
-    good = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker())
+    good = rewrite(payload, cfg=make_config(tmp_path), index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="third-session")
     assert good is not None
     assert "- beta: Beta skill" in block_of(good)
 
@@ -1475,6 +1582,30 @@ def test_a_first_failure_without_a_marker_returns_none(tmp_path):
 
     assert result is None
     assert payload == before
+
+
+def test_two_empty_session_tests_do_not_leak_a_dump(tmp_path):
+    """Two tests that both use the empty session id must not share a dump record.
+
+    The first test below fails routing and sets the dump record for the empty session. The
+    second test, which runs after it with no prior block in its payload, must route normally.
+    The autouse fixture clears the record before each test; this test pins that clearing.
+    """
+    index = make_index()
+    payload = _payload()
+    first_cfg = make_config(tmp_path)
+    assert rewrite(
+        payload, cfg=first_cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+    ) is None
+
+    search_module.clear_dumps()
+
+    second_cfg = make_config(tmp_path)
+    good = rewrite(
+        payload, cfg=second_cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert good is not None
+    assert "- beta: Beta skill" in block_of(good)
 
 
 def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):

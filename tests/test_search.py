@@ -41,7 +41,8 @@ QUERY = "draft a git commit message for a bug fix"
 
 @pytest.fixture(autouse=True)
 def _host_paths(monkeypatch):
-    """A host lookup that resolves every name, so a turn's block carries read paths."""
+    """A host lookup that resolves every name, and no dump record, so tests never leak into each other."""
+    search_module.clear_dumps()
     monkeypatch.setattr(router_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
 QUERY_VECTOR = [0.0, 1.0, 0.0]
 
