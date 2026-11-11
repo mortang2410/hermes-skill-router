@@ -1,16 +1,16 @@
-"""The searchable catalog record and the one selection pass (module M3, contracts C3 and C4).
+"""The searchable catalog record and the one selection pass the turn and the tool share.
 
 The middleware parses the skill catalog out of one Chat Completions request and partitions it. This
 module keeps the partition each session showed, so the model's search tool can rank exactly the rows
 the current prompt listed, and it runs the same embed, shortlist, rerank, cutoff and suggestion-cap
 pass the middleware runs for a turn. Nothing here scans the skill library: a session with no parsed
-partition has no rows, and no search falls back to the filesystem (D10).
+partition has no rows, and no search falls back to the filesystem.
 
 The partition record is written at the start of a turn, which is also when the previous record is
 dropped: a request that carries no catalog, a non-Chat-Completions request, and a request the
 middleware returns before parsing all leave the session with no searchable catalog. A parsed
 partition with no routed rows is different: the partition exists and the prompt listed nothing to
-search, which the tool reports as the healthy empty answer (D4, D10).
+search, which the tool reports as the healthy empty answer.
 
 The pass in :func:`rank` is the middleware's own: it takes the query vector inside the routing
 budget, shortlists the routed rows by cosine, reranks those documents and applies the configured
@@ -22,7 +22,7 @@ degraded envelope and the middleware to an unchanged request.
 The path of each returned row comes from the host's own skill lookup, the resolver ``skill_view``
 uses, and only for the rows the search selected: that lookup walks the skill directories, so calling
 it for every routed row would make one search scan the whole library for rows it never returns. A
-name the lookup refuses, or cannot resolve uniquely, keeps its row and omits the path (C4).
+name the lookup refuses, or cannot resolve uniquely, keeps its row and omits the path.
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ def select_rows(
     descriptions = dict(zip(index.names, index.descriptions))
     return SearchOutcome(
         rows=tuple(
-            SearchRow(name, descriptions.get(name, ""), resolve(name) if resolve is not None else None)
+            SearchRow(name, descriptions[name], resolve(name) if resolve is not None else None)
             for name, _probability in ranked.rows
         )
     )
@@ -196,14 +196,18 @@ def rank(
     """Run one routing pass over *index* for *query*: embed, shortlist, rerank, cutoff and cap.
 
     The budget starts here when *deadline* is ``None``; the caller passes an index already in hand,
-    so the cold build is never inside it. Each per-request timeout is capped by the milliseconds
-    left, so the pass cannot outlive the budget, and a pass that reaches the end of it returns
-    ``budget-expired``. An empty selection is a healthy outcome with no rows; only a failed endpoint
-    or an unbuildable shortlist names an arm.
+    so the cold build is never inside it. That one deadline covers both stages, and each per-request
+    timeout is capped by the milliseconds left, so the pass cannot outlive the budget: a stage that
+    returns after the deadline, or finds it already spent, ends as ``budget-expired``. An empty
+    selection is a healthy outcome with no rows; only a failed endpoint or an unbuildable shortlist
+    names another arm.
     """
+    deadline = _deadline(cfg, deadline)
     query_vector, failure = _query_vector(cfg, query, embed or default_embed, deadline)
     if failure is not None:
         return failure
+    if _budget_left(deadline) is None:
+        return _failed(BUDGET_EXPIRED, _budget_message(cfg))
     shortlisted = shortlist(index, query_vector, cfg.shortlist_size)
     if not shortlisted:
         return Ranked()
@@ -213,8 +217,15 @@ def rank(
     scores, failure = _rerank_scores(cfg, query, documents, rerank or default_rerank, deadline)
     if failure is not None:
         return failure
+    if _budget_left(deadline) is None:
+        return _failed(BUDGET_EXPIRED, _budget_message(cfg))
     chosen = select(scores, [name for name, _description in shortlisted], cfg)
     return Ranked(rows=tuple(chosen))
+
+
+def _budget_message(cfg: Config) -> str:
+    """The one budget-exhausted detail both passes report, so the log phrase stays stable."""
+    return f"routing budget {cfg.routing_timeout_ms} ms exhausted"
 
 
 def _query_vector(
@@ -225,7 +236,7 @@ def _query_vector(
 ) -> Tuple[Optional[List[float]], Optional[Ranked]]:
     """Embed the query inside the budget, or return the failure arm to report."""
     deadline = _deadline(cfg, deadline)
-    budget = f"routing budget {cfg.routing_timeout_ms} ms exhausted"
+    budget = _budget_message(cfg)
     left = _budget_left(deadline)
     if left is None:
         return None, _failed(BUDGET_EXPIRED, budget)
@@ -259,7 +270,7 @@ def _rerank_scores(
 ) -> Tuple[Optional[List[float]], Optional[Ranked]]:
     """Score the shortlist inside the budget, or return the failure arm to report."""
     deadline = _deadline(cfg, deadline)
-    budget = f"routing budget {cfg.routing_timeout_ms} ms exhausted"
+    budget = _budget_message(cfg)
     left = _budget_left(deadline)
     if left is None:
         return None, _failed(BUDGET_EXPIRED, budget)

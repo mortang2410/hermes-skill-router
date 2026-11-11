@@ -1,22 +1,23 @@
-"""The ``skill_router_search`` tool (module M5, contracts C5 and C6).
+"""The ``skill_router_search`` tool: envelope, failure arms and the host path lookup.
 
 The tool is the model's way to search the skill catalog the prompt showed when the injected shortlist
 had nothing for the task. It ranks the routed half of the session's parsed partition through
 :func:`hermes_skill_router.search.select_rows`, the same pass a turn runs, so its names and order
-are the ones a routed turn would have injected for the same query. The tool never scans the skill
-library: a session with no parsed partition answers ``no-catalog``, and a session whose prompt
-carried nothing searchable answers a healthy empty result (D4, D10).
+are the ones a routed turn would have injected for the same query. The tool never searches the skill
+library for candidates: it asks the host lookup for the path of each row it already selected, so a
+session with no parsed partition answers ``no-catalog``, and a session whose prompt carried nothing
+searchable answers a healthy empty result.
 
 Each returned row carries the name and the description the prompt showed, and the ``SKILL.md`` path
 the host's own lookup resolves for it, which is the resolver ``skill_view`` uses. A name that lookup
 refuses, or cannot resolve uniquely, keeps its row and omits the path. No score, probability, count
-or body ever reaches the result (C6).
+or body ever reaches the result.
 
 A healthy answer, an empty selection included, writes one display record with origin ``search`` and
 the selected names when ``showSuggestions`` is on; with it off the writer removes the record instead,
 because the setting governs both origins, and the rows are still returned. A failure or a switched
 off plugin writes no record and answers the degraded envelope with its reason, so the model can tell
-"nothing fits" from "the router could not answer" (D6). The query is never written anywhere, the
+"nothing fits" from "the router could not answer". The query is never written anywhere, the
 handler never raises, and no file beyond the existing record and cache is touched.
 """
 
@@ -137,6 +138,31 @@ def skill_path(name: str) -> Optional[str]:
     open. Any host import or lookup failure is ``None``: the row stays and omits its path rather than
     dropping a skill the search selected.
     """
+    return _host_lookup(name)
+
+
+def _host_lookup(name: str) -> Optional[str]:
+    """Resolve through the host lookup in whichever shape the running host ships.
+
+    The host's ``skills_tool`` has carried two signatures: today's public ``locate_skill`` plus
+    ``skill_search_dirs``, and the earlier private ``_locate_skill`` plus ``_skill_search_dirs``.
+    The public shape is tried first and wins when its probe rows resolve; a refused name never
+    falls through to the other shape, because both ask the same library.
+    """
+    try:
+        from tools.skills_tool import locate_skill, skill_search_dirs
+    except Exception:
+        locate_skill = None
+    if locate_skill is not None:
+        try:
+            roots, _active = skill_search_dirs()
+            error, _skill_dir, skill_md = locate_skill(name, None, roots)
+        except Exception:
+            logger.debug("skill search: the host lookup for %r failed", name, exc_info=True)
+            return None
+        if error is not None or skill_md is None:
+            return None
+        return str(skill_md)
     try:
         from tools.skills_tool import _locate_skill, _skill_search_dirs
     except Exception:

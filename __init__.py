@@ -14,9 +14,10 @@ raises ``TypeError``, which the dispatcher catches and skips, so routing would s
 the ids land in the display record, and the mode gates the rewrite (D8). A missing id stays an
 empty string, and a missing mode falls back to ``chat_completions``.
 
-Settings are read with ``ctx.get_config`` from ``plugins.entries.hermes-skill-router.settings``. Both
-registrations are wrapped in ``try/except Exception`` and return ``None`` on any failure, so a plugin
-bug can never abort a model call.
+Settings are read with ``ctx.get_config`` from ``plugins.entries.hermes-skill-router.settings``. The
+middleware callback catches every exception and returns ``None``, so a plugin bug inside a request
+can never abort a model call. Registration itself is not wrapped: a host that refuses the tool name
+fails the plugin load, which is the surface that should show that conflict.
 """
 
 from __future__ import annotations

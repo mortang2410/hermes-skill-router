@@ -235,8 +235,10 @@ shortlist, rerank, cutoff and cap, and returns `{"skills": [{"name", "descriptio
 prompt's shortlist is already in front of the model, so the tool description tells it not to call
 the tool for those rows. A search runs inside `routingTimeoutMs` and finds the index the turn
 already built; it writes the same display record with origin `search`, so both surfaces show it.
-The tool never scans the skill library: a session with no parsed catalog answers `no-catalog`, and
-with `showSuggestions` off the record stays hidden exactly as for a turn.
+The tool never searches the skill library for candidates: it asks the host lookup for the `SKILL.md`
+path of each row it already selected, at most `maxSuggestions` lookups per call. A session with no
+parsed catalog answers `no-catalog`, and with `showSuggestions` off the record stays hidden exactly
+as for a turn.
 
 The persisted index at `cachePath` is keyed by a fingerprint of every routed row's text and full
 description, `embedModelId`, the document format version, and `embedBaseUrl + embedPath`. A change

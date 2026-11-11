@@ -8,6 +8,7 @@ endpoint, and they compare it with the names a real turn injects for the same pa
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -288,6 +289,46 @@ def test_the_budget_ends_the_pass_with_its_own_arm(tmp_path):
     assert outcome.reason == BUDGET_EXPIRED
     assert embedder.calls == []
     assert reranker.calls == []
+
+
+def test_one_deadline_covers_both_stages(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    seen = {}
+
+    def query_vector(cfg, query, embedder, deadline):
+        seen["embed"] = deadline
+        return [0.0], None
+
+    def rerank_scores(cfg, query, documents, reranker, deadline):
+        seen["rerank"] = deadline
+        return [0.9] * len(documents), None
+
+    monkeypatch.setattr(search_module, "_query_vector", query_vector)
+    monkeypatch.setattr(search_module, "_rerank_scores", rerank_scores)
+
+    ranked = search_module.rank(cfg, make_index(), QUERY)
+
+    assert ranked.reason == ""
+    assert seen["embed"] == seen["rerank"]
+
+
+def test_a_slow_rerank_cannot_outlive_the_budget(tmp_path):
+    cfg = make_config(tmp_path, routingTimeoutMs=1000)
+
+    def slow_embed(cfg, texts):
+        time.sleep(0.95)
+        return [[0.0]]
+
+    def slow_rerank(cfg, query, documents):
+        time.sleep(0.2)
+        return [0.9] * len(documents)
+
+    started = time.monotonic()
+    ranked = search_module.rank(cfg, make_index(), QUERY, embed=slow_embed, rerank=slow_rerank)
+    elapsed = time.monotonic() - started
+
+    assert ranked.reason == BUDGET_EXPIRED
+    assert elapsed < 1.6
 
 
 def test_nothing_above_the_cutoff_is_a_healthy_empty_answer(tmp_path):

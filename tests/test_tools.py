@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -476,3 +477,54 @@ def test_the_standalone_plugin_manager_registers_the_search_tool(tmp_path):
     assert payload["tool"] == "skill_router_search"
     assert payload["toolset"] == "hermes-skill-router"
     assert payload["required"] == ["query"]
+
+
+def _fake_host(monkeypatch, module):
+    """Install *module* as ``tools.skills_tool`` for one test, as the host would ship it."""
+    package = ModuleType("tools")
+    package.skills_tool = module
+    monkeypatch.setitem(sys.modules, "tools", package)
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", module)
+
+
+def test_skill_path_uses_the_public_host_lookup(monkeypatch):
+    module = ModuleType("tools.skills_tool")
+    seen = {}
+
+    def skill_search_dirs():
+        return [(1, Path("/skills"))], Path("/skills")
+
+    def locate_skill(name, category, roots):
+        seen["name"] = name
+        seen["category"] = category
+        seen["roots"] = roots
+        return None, Path("/skills") / name, Path("/skills") / name / "SKILL.md"
+
+    module.skill_search_dirs = skill_search_dirs
+    module.locate_skill = locate_skill
+    _fake_host(monkeypatch, module)
+
+    assert tools_module.skill_path("alpha") == "/skills/alpha/SKILL.md"
+    assert seen == {"name": "alpha", "category": None, "roots": [(1, Path("/skills"))]}
+
+
+def test_a_refused_public_lookup_keeps_the_row_pathless(monkeypatch):
+    module = ModuleType("tools.skills_tool")
+    module.skill_search_dirs = lambda: ([(1, Path("/skills"))], Path("/skills"))
+    module.locate_skill = lambda name, category, roots: (f"{name}: not found", None, None)
+    _fake_host(monkeypatch, module)
+
+    assert tools_module.skill_path("missing") is None
+
+
+def test_skill_path_falls_back_to_the_private_host_lookup(monkeypatch):
+    module = ModuleType("tools.skills_tool")
+    module._skill_search_dirs = lambda: ([(1, Path("/project"))], [(1, Path("/all"))], Path("/all"))
+    module._locate_skill = lambda name, category, project, every: (
+        None,
+        Path("/all") / name,
+        Path("/all") / name / "SKILL.md",
+    )
+    _fake_host(monkeypatch, module)
+
+    assert tools_module.skill_path("beta") == "/all/beta/SKILL.md"
