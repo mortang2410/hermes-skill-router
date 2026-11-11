@@ -10,7 +10,7 @@ Three rules drive the shape of this module:
 
 * **Read-only.** The route never writes the record, never creates the cache directory and never
   calls the router. T5 owns the writer; this file only projects what is on disk.
-* **Names only.** :func:`hermes_skill_router.display.read` returns the six known fields and drops
+* **Names only.** :func:`hermes_skill_router.display.read` returns the seven known fields and drops
   anything else, so a stray ``text`` or ``messages`` key in the file can never reach a client, and
   request text is never read, stored or shown.
 * **It never raises.** The dashboard's plugin contract is that a handler folds every failure into
@@ -128,8 +128,9 @@ def answer(target: Any = None) -> Dict[str, Any]:
     *target* is a :class:`hermes_skill_router.config.Config`, a record path, or ``None`` for the
     path the active profile configures. The record is passed through as
     :func:`hermes_skill_router.display.read` returned it — schema, timestamp, session and turn id,
-    status and names, and no other key — so the schema the writer wrote is the schema the pane
-    receives, and no request text can ride along.
+    status, origin and names, and no other key — so the schema the writer wrote is the schema the
+    pane receives, the origin that says a model search produced the names is projected unchanged,
+    and no request text can ride along.
     """
     display, _ = _display_module()
     record = display.read(configured() if target is None else target)

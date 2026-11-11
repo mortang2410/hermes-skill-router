@@ -24,7 +24,7 @@ from hermes_skill_router import display as display_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
-from hermes_skill_router.display import FIELDS, INERT, ROUTED, read, record  # noqa: E402
+from hermes_skill_router.display import FIELDS, INERT, ROUTED, SEARCH, TURN, read, record, remove  # noqa: E402
 from hermes_skill_router.inject import HEADER  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
@@ -101,12 +101,57 @@ def test_a_routed_record_carries_the_schema_the_timestamp_and_the_names(tmp_path
     assert written is not None
     stored = read_file(cfg.suggestions_path)
     assert set(stored) == set(FIELDS)
-    assert stored["schema"] == 1
+    assert stored["schema"] == 2
     assert stored["status"] == "routed"
+    assert stored["origin"] == "turn"
     assert stored["names"] == ["alpha", "beta"]
     assert stored["session_id"] == "session-1"
     assert stored["turn_id"] == "turn-1"
     assert stored["at"].endswith("Z") and "T" in stored["at"]
+
+
+def test_the_origin_defaults_to_turn_when_the_caller_passes_none(tmp_path):
+    """The existing turn call sites pass no origin, so the default is what keeps them working."""
+    cfg = make_config(tmp_path)
+
+    record(cfg, status=ROUTED, names=["alpha"])
+
+    assert read_file(cfg.suggestions_path)["origin"] == TURN
+
+
+def test_a_search_record_carries_origin_search_and_no_turn_id(tmp_path):
+    cfg = make_config(tmp_path)
+
+    written = record(cfg, status=ROUTED, origin=SEARCH, names=["alpha"], session_id="session-1")
+
+    assert written is not None
+    stored = read_file(cfg.suggestions_path)
+    assert stored["schema"] == 2
+    assert stored["origin"] == SEARCH
+    assert stored["status"] == ROUTED
+    assert stored["names"] == ["alpha"]
+    assert stored["turn_id"] == ""
+    assert stored["session_id"] == "session-1"
+
+
+def test_an_empty_search_selection_is_written_because_the_search_did_answer(tmp_path):
+    cfg = make_config(tmp_path)
+
+    record(cfg, status=ROUTED, origin=SEARCH, names=[])
+
+    stored = read_file(cfg.suggestions_path)
+    assert stored["origin"] == SEARCH
+    assert stored["names"] == []
+
+
+def test_an_unknown_origin_is_refused(tmp_path, caplog):
+    cfg = make_config(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.display"):
+        assert record(cfg, status=ROUTED, origin="elsewhere", names=["alpha"]) is None
+
+    assert not Path(cfg.suggestions_path).exists()
+    assert any("refusing record origin" in message for message in caplog.messages)
 
 
 def test_names_are_capped_at_max_display_names(tmp_path):
@@ -359,3 +404,153 @@ def test_the_rewrite_records_routed_names_and_lists_kept_rows(tmp_path):
     block = result["request"]["messages"][-1]["content"]
     assert block.startswith(HEADER)
     assert "- alpha: Alpha skill" in block.split("\n")
+
+
+# ---------------------------------------------------------------------------
+# Schema 2: origin, the schema 1 compatibility read, and the setting gate.
+# ---------------------------------------------------------------------------
+
+
+def test_a_record_with_the_same_names_and_another_origin_is_written(tmp_path):
+    """Origin is part of identity, so a search with the turn's names still rewrites the marker."""
+    cfg = make_config(tmp_path)
+    assert record(cfg, status=ROUTED, origin=TURN, names=["alpha"]) is not None
+
+    second = record(cfg, status=ROUTED, origin=SEARCH, names=["alpha"])
+
+    assert second is not None
+    assert read_file(cfg.suggestions_path)["origin"] == SEARCH
+
+
+def test_a_schema_1_record_still_reads_with_origin_turn(tmp_path):
+    cfg = make_config(tmp_path)
+    Path(cfg.suggestions_path).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "at": "2026-11-10T00:00:00Z",
+                "session_id": "s",
+                "turn_id": "t",
+                "status": "routed",
+                "names": ["alpha"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stored = read(cfg)
+
+    assert stored["schema"] == 2
+    assert stored["origin"] == TURN
+    assert stored["names"] == ["alpha"]
+
+
+def test_read_returns_origin_for_a_schema_2_record(tmp_path):
+    cfg = make_config(tmp_path)
+    record(cfg, status=ROUTED, origin=SEARCH, names=["alpha"])
+
+    assert read(cfg)["origin"] == SEARCH
+    assert set(read(cfg)) == set(FIELDS)
+
+
+def test_read_ignores_the_file_when_show_suggestions_is_false(tmp_path):
+    """The setting is authoritative: a leftover record cannot reach the route or the pane."""
+    shown = make_config(tmp_path)
+    record(shown, status=ROUTED, names=["alpha"])
+    hidden = make_config(tmp_path, showSuggestions=False)
+
+    assert read(hidden) is None
+    assert read(shown.suggestions_path)["names"] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Removal outcomes: removed, missing, refused, and the refused-removal replacement.
+# ---------------------------------------------------------------------------
+
+
+def test_remove_reports_removed_missing_or_refused(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path)
+    assert remove(cfg) == "missing"
+
+    record(cfg, status=ROUTED, names=["alpha"])
+    assert remove(cfg) == "removed"
+
+    record(cfg, status=ROUTED, names=["alpha"])
+
+    def boom(*args, **kwargs):
+        raise OSError("unlink refused")
+
+    monkeypatch.setattr(display_module.os, "unlink", boom)
+
+    assert remove(cfg) == "refused"
+
+
+def test_with_show_suggestions_false_and_no_record_the_writer_creates_no_file(tmp_path):
+    hidden = make_config(tmp_path, showSuggestions=False)
+
+    assert record(hidden, status=ROUTED, names=["alpha"]) is None
+    assert record(hidden, status=ROUTED, origin=SEARCH, names=["alpha"]) is None
+    assert not Path(hidden.suggestions_path).exists()
+    assert read(hidden) is None
+
+
+def test_a_refused_removal_replaces_the_record_with_an_inert_one(tmp_path, monkeypatch, caplog):
+    shown = make_config(tmp_path)
+    record(shown, status=ROUTED, names=["alpha"])
+    hidden = make_config(tmp_path, showSuggestions=False)
+
+    def boom(*args, **kwargs):
+        raise OSError("unlink refused")
+
+    monkeypatch.setattr(display_module.os, "unlink", boom)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.display"):
+        assert record(hidden, status=ROUTED, origin=SEARCH, names=["alpha"]) is None
+
+    stored = read_file(hidden.suggestions_path)
+    assert stored["schema"] == 2
+    assert stored["status"] == "inert"
+    assert stored["names"] == []
+    assert read(hidden) is None, "the reader stays idle even though the inert file survives"
+    assert any("cannot remove" in message for message in caplog.messages)
+
+
+def test_a_double_failure_keeps_the_old_file_and_logs_both_paths(tmp_path, monkeypatch, caplog):
+    shown = make_config(tmp_path)
+    record(shown, status=ROUTED, names=["alpha"])
+    hidden = make_config(tmp_path, showSuggestions=False)
+
+    def unlink_boom(*args, **kwargs):
+        raise OSError("unlink refused")
+
+    def replace_boom(*args, **kwargs):
+        raise OSError("replace refused")
+
+    monkeypatch.setattr(display_module.os, "unlink", unlink_boom)
+    monkeypatch.setattr(display_module.os, "replace", replace_boom)
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.display"):
+        assert record(hidden, status=ROUTED, names=["alpha"]) is None
+
+    stored = read_file(hidden.suggestions_path)
+    assert stored["names"] == ["alpha"], "the old file survives both failures"
+    assert read(hidden) is None, "the reader still treats the setting as authoritative"
+    path = str(Path(hidden.suggestions_path).resolve())
+    remove_logs = [message for message in caplog.messages if "cannot remove" in message]
+    write_logs = [message for message in caplog.messages if "cannot write" in message]
+    assert remove_logs and path in remove_logs[0]
+    assert write_logs and path in write_logs[0]
+    assert any("inert replacement" in message and path in message for message in caplog.messages)
+
+
+def test_the_next_routed_turn_replaces_a_search_record(tmp_path):
+    cfg = make_config(tmp_path)
+    record(cfg, status=ROUTED, origin=SEARCH, names=["alpha"], session_id="session-1")
+    assert read(cfg)["origin"] == SEARCH
+
+    record(cfg, status=ROUTED, names=["beta"], session_id="session-1", turn_id="turn-1")
+
+    stored = read_file(cfg.suggestions_path)
+    assert stored["origin"] == TURN
+    assert stored["turn_id"] == "turn-1"
+    assert stored["names"] == ["beta"]

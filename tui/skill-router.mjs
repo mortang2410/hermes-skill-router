@@ -10,8 +10,9 @@
  * reads plugin config, which is why a disabled display is simply a missing record.
  *
  * It shows the skill names the router suggested on the last turn, names only, with one muted caption
- * naming the turn and its local clock time from the record's own identifiers. The record's six
- * fields are projected down to status, names, timestamp and turn id, so text from a request can
+ * naming the turn — or the model search, when the record says a model called the search tool — and
+ * its local clock time from the record's own identifiers. The record's seven fields are projected
+ * down to status, origin, names, timestamp and turn id, so text from a request can
  * never reach the card. It re-reads the file every 500 ms and lands each update through
  * `sdk.updateWidget`, which no-ops once the widget is closed, and the dock's own launch toggle
  * collapses it on a second `/skills-routed`. A missing, corrupt or `idle` record paints one line.
@@ -37,8 +38,15 @@ export const ACCORDION_TITLE = 'Suggestions'
 /** How often the widget re-reads the record file. */
 export const POLL_MS = 500
 
-/** The record's schema; a file with any other value reads as idle, like an unreadable one. */
-const SCHEMA = 1
+/** The record's current schema; a schema 1 file still reads, as a turn record. */
+const SCHEMA = 2
+const LEGACY_SCHEMA = 1
+
+/** Who produced the record: the automatic turn pass, or a model call to the search tool. */
+const ORIGINS = ['turn', 'search']
+
+/** The marker a search record paints where a routed turn paints its turn id. */
+export const MODEL_SEARCH_LABEL = 'model search'
 
 /** The two decisions a record may carry. */
 const STATUSES = ['routed', 'inert']
@@ -49,16 +57,17 @@ const EMPTY_LINE = 'the last routed turn suggested nothing'
 
 /** The idle answer for a record that is absent, unreadable or not a record. */
 export function idleRecord() {
-  return { at: '', names: [], status: 'idle', turn_id: '' }
+  return { at: '', names: [], origin: '', status: 'idle', turn_id: '' }
 }
 
 /**
- * Read one record file into `{status, names, at, turn_id}`; never throws.
+ * Read one record file into `{status, names, at, turn_id, origin}`; never throws.
  *
  * Absent, unreadable, non-JSON, wrong-schema or wrong-shaped files all return :func:`idleRecord`,
- * so the widget has exactly one shape to render. Only those four fields leave this function: the
- * names are the record's own suggestion names (a kept row is never in the file), and no message,
- * prompt or any other text is read out of it.
+ * so the widget has exactly one shape to render. A schema 1 file still reads, with origin `turn`,
+ * so an installed older writer does not blank a newer card. Only those five fields leave this
+ * function: the names are the record's own suggestion names (a kept row is never in the file), and
+ * no message, prompt or any other text is read out of it.
  */
 export function readRecord(file) {
   let data
@@ -73,7 +82,13 @@ export function readRecord(file) {
     return idleRecord()
   }
 
-  if (data.schema !== SCHEMA || !STATUSES.includes(data.status)) {
+  if (![LEGACY_SCHEMA, SCHEMA].includes(data.schema) || !STATUSES.includes(data.status)) {
+    return idleRecord()
+  }
+
+  const origin = data.schema === LEGACY_SCHEMA ? 'turn' : data.origin
+
+  if (!ORIGINS.includes(origin)) {
     return idleRecord()
   }
 
@@ -84,6 +99,7 @@ export function readRecord(file) {
   return {
     at: typeof data.at === 'string' ? data.at : '',
     names: data.status === 'routed' ? data.names.filter(name => name.trim() !== '') : [],
+    origin,
     status: data.status,
     turn_id: typeof data.turn_id === 'string' ? data.turn_id : ''
   }
@@ -110,15 +126,21 @@ export function shortTime(value) {
 }
 
 /**
- * The one caption line above the list: which turn the names came from and when.
+ * The one caption line above the list: which decision the names came from and when.
  *
- * Built from the record's own `turn_id` and `at` only — never from a message, a prompt or any other
- * field — and empty for `inert` and for an absent record, so a stale turn id can never sit under an
- * inactive or idle state. `turn <id> · <local HH:MM>`, dropping either half when it is missing.
+ * Built from the record's own `origin`, `turn_id` and `at` only — never from a message, a prompt or
+ * any other field — and empty for `inert` and for an absent record, so a stale turn id can never
+ * sit under an inactive or idle state. A `search` record paints the model-search marker instead of
+ * a turn id, because a lookup belongs to no turn: `model search · <local HH:MM>`. A `turn` record
+ * keeps `turn <id> · <local HH:MM>`, dropping either half when it is missing.
  */
 export function captionFor(record) {
   if (!record || typeof record !== 'object' || record.status !== 'routed') {
     return ''
+  }
+
+  if (record.origin === 'search') {
+    return [MODEL_SEARCH_LABEL, shortTime(record.at)].filter(Boolean).join(' · ')
   }
 
   const turn = typeof record.turn_id === 'string' ? record.turn_id.trim() : ''

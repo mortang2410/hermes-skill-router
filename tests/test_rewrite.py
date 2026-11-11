@@ -475,7 +475,8 @@ def test_the_record_holds_the_selected_suggestion_names_only(tmp_path):
     )
 
     record = record_for(cfg)
-    assert record["schema"] == 1
+    assert record["schema"] == 2
+    assert record["origin"] == "turn", "the turn call site passes no origin, so the writer defaults it"
     assert record["status"] == "routed"
     assert record["names"] == ["beta", "delta"]
     assert record["session_id"] == "session-1"

@@ -7,7 +7,8 @@
  * the desktop rail on the right, 260 px wide, collapsed by default, and it lists the skill names
  * the router suggested on the last turn — never a kept row, never text from a request. Under the
  * heading sits one muted caption naming the turn and its local clock time, built from the record's
- * own `turn_id` and `at`.
+ * own `turn_id` and `at`; when the record says a model search produced the names, the caption
+ * paints the model-search marker instead, because a lookup belongs to no turn.
  *
  * The data comes from the plugin's own backend route, `GET /suggestions` (dashboard/plugin_api.py,
  * mounted at `/api/plugins/hermes-skill-router/`), through `ctx.rest`, so the desktop half never
@@ -79,6 +80,9 @@ export function isMissingRoute(error) {
   return /^\s*(?:Error:\s*)?404\b/.test(String(error.message ?? error))
 }
 
+/** The marker a search record paints where a routed turn paints its turn id. */
+export const MODEL_SEARCH_LABEL = 'model search'
+
 /**
  * The local clock time of an ISO 8601 record timestamp, `HH:MM`, or `""` when it does not parse.
  *
@@ -100,15 +104,21 @@ export function shortTime(value) {
 }
 
 /**
- * The one caption line under the heading: which turn the names came from and when.
+ * The one caption line under the heading: which decision the names came from and when.
  *
- * Built from the record's own `turn_id` and `at` only — never from a message, a prompt or any other
- * field — and empty for `inert` and for an absent record, so a stale turn id can never sit under an
- * inactive or idle state. `turn <id> · <local HH:MM>`, dropping either half when it is missing.
+ * Built from the record's own `origin`, `turn_id` and `at` only — never from a message, a prompt or
+ * any other field — and empty for `inert` and for an absent record, so a stale turn id can never
+ * sit under an inactive or idle state. A `search` record paints the model-search marker instead of
+ * a turn id: `model search · <local HH:MM>`. A `turn` record keeps `turn <id> · <local HH:MM>`,
+ * dropping either half when it is missing.
  */
 export function captionFor(record) {
   if (!record || typeof record !== 'object' || record.status !== 'routed') {
     return ''
+  }
+
+  if (record.origin === 'search') {
+    return [MODEL_SEARCH_LABEL, shortTime(record.at)].filter(Boolean).join(' · ')
   }
 
   const turn = typeof record.turn_id === 'string' ? record.turn_id.trim() : ''

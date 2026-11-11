@@ -13,7 +13,7 @@ display:
   registering anything or touching a global;
 * neither surface reads or shows anything but the record's names and identifiers — a record that
   carries a request message or a ``text`` key renders nothing from it, and no route answer holds a
-  key outside the six-field schema.
+  key outside the seven-field schema.
 
 Both surfaces are runtimes this test cannot host (a React renderer, an Ink app), so the JS halves
 are loaded in Node with stub modules on ``node_modules`` and a stub SDK/context. That exercises the
@@ -54,11 +54,12 @@ DEFAULT_RECORD_PATH = os.path.expanduser(DEFAULTS["suggestionsPath"])
 NAMESPACE = "/api/plugins/hermes-skill-router"
 
 RECORD = {
-    "schema": 1,
+    "schema": 2,
     "at": "2026-11-10T07:20:31Z",
     "session_id": "session-1",
     "turn_id": "turn-1",
     "status": "routed",
+    "origin": "turn",
     "names": ["alpha", "beta", "gamma"],
 }
 
@@ -155,11 +156,12 @@ def test_the_route_answers_the_record_it_reads(tmp_path, plugin_api):
     assert list(answer) == list(FIELDS)
     assert answer == read(path)
     assert answer == {
-        "schema": 1,
+        "schema": 2,
         "at": "2026-11-10T07:20:31Z",
         "session_id": "session-1",
         "turn_id": "turn-1",
         "status": "routed",
+        "origin": "turn",
         "names": ["alpha", "beta", "gamma"],
     }
 
@@ -190,13 +192,24 @@ def test_the_route_passes_the_inert_status_through(tmp_path, plugin_api):
     path = write_record(tmp_path / "suggestions.json", status="inert", names=[])
 
     assert plugin_api.answer(path) == {
-        "schema": 1,
+        "schema": 2,
         "at": "2026-11-10T07:20:31Z",
         "session_id": "session-1",
         "turn_id": "turn-1",
         "status": "inert",
+        "origin": "turn",
         "names": [],
     }
+
+
+def test_the_route_projects_origin_for_a_search_record(tmp_path, plugin_api):
+    path = write_record(tmp_path / "suggestions.json", origin="search", turn_id="")
+
+    answer = plugin_api.answer(path)
+
+    assert answer["origin"] == "search"
+    assert answer["turn_id"] == ""
+    assert list(answer) == list(FIELDS), "origin is projected with no added key"
 
 
 def test_the_route_returns_no_request_content_even_from_a_tampered_record(tmp_path, plugin_api):
@@ -207,6 +220,7 @@ def test_the_route_returns_no_request_content_even_from_a_tampered_record(tmp_pa
                 **RECORD,
                 "text": REQUEST_TEXT,
                 "messages": [{"role": "user", "content": REQUEST_TEXT}],
+                "query": REQUEST_TEXT,
                 "system": REQUEST_TEXT,
             }
         ),
@@ -442,6 +456,7 @@ out.summary = {
   idle: summary(null),
   inert: summary({ at: STAMP, names: ['ignored'], status: 'inert', turn_id: 'turn-1' }),
   routed: summary({ at: STAMP, names: NAMES, session_id: 'session-1', status: 'routed', turn_id: 'turn-1' }),
+  search: summary({ at: STAMP, names: NAMES, origin: 'search', status: 'routed', turn_id: '' }),
   tampered: summary({
     at: STAMP,
     messages: [{ content: 'SECRET' }],
@@ -459,7 +474,8 @@ out.captions = {
   inert: captionFor({ at: STAMP, names: [], status: 'inert', turn_id: 'turn-1' }),
   noAt: captionFor({ names: NAMES, status: 'routed', turn_id: 'turn-1' }),
   noTurn: captionFor({ at: STAMP, names: NAMES, status: 'routed' }),
-  routed: captionFor({ at: STAMP, names: NAMES, status: 'routed', turn_id: 'turn-1' })
+  routed: captionFor({ at: STAMP, names: NAMES, status: 'routed', turn_id: 'turn-1' }),
+  search: captionFor({ at: STAMP, names: NAMES, origin: 'search', status: 'routed', turn_id: '' })
 }
 out.times = {
   bad: shortTime('not-a-date'),
@@ -467,6 +483,7 @@ out.times = {
   good: shortTime(STAMP),
   missing: shortTime(undefined)
 }
+
 
 out.failure = {
   missing: isMissingRoute(new Error('404: Not Found')),
@@ -531,6 +548,10 @@ out.tampered = {
 // The first fetch paints no idle line or caption before the route answers.
 globalThis.__t8Result = { isPending: true }
 out.loading = { text: text(render()) }
+
+// A search record paints the model-search marker where a turn paints its turn id.
+globalThis.__t8Result = { data: { at: STAMP, names: NAMES, origin: 'search', status: 'routed', turn_id: '' } }
+out.searchPane = { text: text(render()) }
 
 // An inert record paints its idle line with no stale turn, and an idle answer has no caption.
 globalThis.__t8Result = { data: { at: STAMP, names: [], status: 'inert', turn_id: 'turn-1' } }
@@ -672,6 +693,18 @@ out.times = {
   good: shortTime(STAMP),
   missing: shortTime(undefined)
 }
+
+// A search record reads with origin search and paints the model-search marker.
+out.searchCaption = captionFor({ at: STAMP, names: NAMES, origin: 'search', status: 'routed', turn_id: '' })
+dump('search.json', record({ origin: 'search', schema: 2, turn_id: '' }))
+const searchCard = render('search.json')
+out.search = {
+  caption: captionOf(searchCard),
+  record: readRecord('search.json')
+}
+// A schema 2 turn record reads with origin turn.
+dump('turn2.json', { ...record({}), schema: 2, origin: 'turn' })
+out.schemaTwoTurn = readRecord('turn2.json')
 
 // The poll re-reads the file and lands the result through updateWidget.
 dump('routed.json', record({ names: ['delta', 'epsilon'] }))
@@ -902,6 +935,16 @@ def test_the_desktop_pane_paints_no_idle_line_before_the_route_answers(desktop):
     assert "No suggestions recorded yet." not in desktop["loading"]["text"]
 
 
+def test_the_desktop_pane_marks_a_model_search(desktop):
+    marker = f"model search · {CAPTION_TIME}"
+
+    assert desktop["captions"]["search"] == marker
+    assert desktop["summary"]["search"]["caption"] == marker
+    assert desktop["summary"]["search"]["names"] == ["alpha", "beta", "gamma"]
+    assert "model search" in desktop["searchPane"]["text"]
+    assert "turn turn-1" not in desktop["searchPane"]["text"]
+
+
 def test_the_tui_widget_declares_an_ambient_fixed_width_card(tui):
     assert tui["registered"] == 1
     assert tui["widget"]["id"] == "skills-routed"
@@ -959,6 +1002,16 @@ def test_the_tui_widget_paints_one_muted_turn_caption(tui):
     assert tui["empty"]["caption"] == CAPTION
 
 
+def test_the_tui_widget_marks_a_model_search(tui):
+    marker = f"model search · {CAPTION_TIME}"
+
+    assert tui["searchCaption"] == marker
+    assert tui["search"]["caption"] == marker
+    assert tui["search"]["record"]["origin"] == "search"
+    assert tui["search"]["record"]["names"] == ["alpha", "beta", "gamma"]
+    assert tui["schemaTwoTurn"]["origin"] == "turn"
+
+
 def test_the_tui_widget_rereads_the_record_on_its_poll(tui):
     assert tui["poll"] == [500]
     assert tui["pollsAfterRelaunch"] == [500, 500]
@@ -981,14 +1034,15 @@ def test_the_tui_widget_shows_one_line_for_the_states_without_names(tui):
     assert tui["corrupt"]["bodyType"] == "Text"
     assert "no suggestions recorded yet" in tui["corrupt"]["body"]
     assert tui["corrupt"]["caption"] == ""
-    assert tui["missing"]["record"] == {"at": "", "names": [], "status": "idle", "turn_id": ""}
-    assert tui["corrupt"]["record"] == {"at": "", "names": [], "status": "idle", "turn_id": ""}
+    assert tui["missing"]["record"] == {"at": "", "names": [], "origin": "", "status": "idle", "turn_id": ""}
+    assert tui["corrupt"]["record"] == {"at": "", "names": [], "origin": "", "status": "idle", "turn_id": ""}
 
 
 def test_the_tui_widget_shows_no_request_text(tui):
     assert tui["tampered"]["projection"] == {
         "at": "2026-11-10T07:20:31Z",
         "names": ["alpha", "beta", "gamma"],
+        "origin": "turn",
         "status": "routed",
         "turn_id": "turn-1",
     }

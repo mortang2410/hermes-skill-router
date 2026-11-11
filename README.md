@@ -521,11 +521,12 @@ The record is one JSON file at `suggestionsPath`:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "at": "2026-11-10T07:20:31Z",
   "session_id": "<session id when the dispatcher supplies one, else an empty string>",
   "turn_id": "<turn id when the dispatcher supplies one, else an empty string>",
   "status": "routed",
+  "origin": "turn",
   "names": ["github-pr-workflow", "code-review"]
 }
 ```
@@ -533,14 +534,16 @@ The record is one JSON file at `suggestionsPath`:
 `names` holds the selected suggestion names only, capped at `maxDisplayNames`. A kept row is never
 recorded, so the display cannot present a pinned or deferred-excluded skill as a suggestion. The
 record never carries request text. `status` is `routed` when the block was injected and `inert`
-when the catalog stayed in place. The newest record wins, and it carries the session and turn ids
+when the catalog stayed in place. `origin` is `turn` for the automatic pass and `search` for a model
+call to the search tool, and a schema 1 file still reads with origin `turn`. The newest record wins, and it carries the session and turn ids
 the dispatcher supplies so a second session or a fork replacing it is visible on screen when the
 ids are present. `showSuggestions: false` stops the writes and removes an existing record, which
 turns both surfaces idle.
 
 Desktop pane: `Skills routed` is a collapsed-by-default pane on the right side, 260 px wide. Its
 heading carries the count, its list shows the names, and for a routed record one muted caption line
-reads `turn <turn_id> · <local HH:MM>` from the record's own `turn_id` and `at`. The caption is
+reads `turn <turn_id> · <local HH:MM>` from the record's own `turn_id` and `at`, or
+`model search · <local HH:MM>` when a model search produced the names. The caption is
 shown only for a routed record, so a stale turn cannot sit under an inert or idle state. It
 refreshes on mount and when the plugin broadcasts
 `plugin.hermes-skill-router.suggestions.updated`. It reads the plugin's own route,
