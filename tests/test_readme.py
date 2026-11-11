@@ -1,9 +1,13 @@
-"""Ticket T7: the README documents every config key with its default, bound and effect.
+"""Ticket T7: the documentation records every config key with its default, bound and effect.
 
-The test reads the table between the two ``config-defaults`` markers in README.md and compares it
-with ``DEFAULTS`` from the plugin config module. A key added to the module without a README row
-fails, a README row for a key that does not exist fails, and a changed default fails. A row whose
-bound or effect cell is empty fails too, so the table cannot drift into a bare key list.
+The README is the short version and the technical documentation carries the reference, so the tests
+that pin reference material read ``technical-documentation.md``: the table between the two
+``config-defaults`` markers, the two injected headers, the display caption, the once-only logging
+rules and the base URL rejection. They compare the table with ``DEFAULTS`` from the plugin config
+module. A key added to the module without a row fails, a row for a key that does not exist fails, and
+a changed default fails. A row whose bound or effect cell is empty fails too, so the table cannot
+drift into a bare key list. The README keeps the MIT notice, the link to the reference, and the
+promise that neither file uses an em dash.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from hermes_skill_router.config import DEFAULTS  # noqa: E402
 from hermes_skill_router.inject import HEADER, ONE_SHOT_HEADER  # noqa: E402
 
 README = ROOT / "README.md"
+DOCS = ROOT / "technical-documentation.md"
 LICENSE_FILE = ROOT / "LICENSE"
 
 START = "<!-- config-defaults:start -->"
@@ -28,9 +33,9 @@ COLUMNS = ("key", "default", "bound", "effect")
 
 def _rows() -> list[list[str]]:
     """Return every table row between the config-defaults markers, cells stripped."""
-    text = README.read_text(encoding="utf-8")
-    assert START in text, f"README.md has no {START} marker"
-    assert END in text, f"README.md has no {END} marker"
+    text = DOCS.read_text(encoding="utf-8")
+    assert START in text, f"technical-documentation.md has no {START} marker"
+    assert END in text, f"technical-documentation.md has no {END} marker"
     region = text.split(START, 1)[1].split(END, 1)[0]
     rows = []
     for line in region.splitlines():
@@ -54,7 +59,7 @@ def _plain(cell: str) -> str:
 
 
 def _rendered(value: object) -> str:
-    """Return the default as the README spells it."""
+    """Return the default as the documentation spells it."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (tuple, list)):
@@ -74,16 +79,18 @@ def test_every_config_key_appears_once_with_its_default() -> None:
     assert len(rows) >= 2, "the config table has no body rows"
     body = rows[2:]  # the header and the separator row
     documented = [_plain(row[0]) for row in body]
-    assert len(documented) == len(set(documented)), "a config key appears twice in README.md"
+    assert len(documented) == len(set(documented)), (
+        "a config key appears twice in technical-documentation.md"
+    )
     assert set(documented) == set(DEFAULTS), (
-        "the README table and DEFAULTS disagree: "
+        "the documentation table and DEFAULTS disagree: "
         f"missing {sorted(set(DEFAULTS) - set(documented))}, "
         f"extra {sorted(set(documented) - set(DEFAULTS))}"
     )
     for row in body:
         key = _plain(row[0])
         assert _plain(row[1]) == _rendered(DEFAULTS[key]), (
-            f"{key}: README default {_plain(row[1])!r} does not match DEFAULTS {DEFAULTS[key]!r}"
+            f"{key}: documented default {_plain(row[1])!r} does not match DEFAULTS {DEFAULTS[key]!r}"
         )
 
 
@@ -97,65 +104,77 @@ def test_every_row_has_a_bound_and_an_effect() -> None:
 
 
 def _prose() -> str:
-    """Return the README with every whitespace run collapsed, for phrase checks across line wraps."""
-    return " ".join(README.read_text(encoding="utf-8").split())
+    """Return the docs with every whitespace run collapsed, for phrase checks across line wraps."""
+    return " ".join(DOCS.read_text(encoding="utf-8").split())
 
 
-def test_the_readme_quotes_both_headers_and_their_shared_first_line() -> None:
+def test_the_readme_links_the_technical_documentation_and_back() -> None:
+    readme = README.read_text(encoding="utf-8")
+    docs = DOCS.read_text(encoding="utf-8")
+    assert "(technical-documentation.md)" in readme, (
+        "README.md does not link technical-documentation.md"
+    )
+    assert "(README.md)" in docs, "technical-documentation.md does not link README.md"
+
+
+def test_the_documentation_quotes_both_headers_and_their_shared_first_line() -> None:
     shared = HEADER.split("\n", 1)[0]
     assert shared == ONE_SHOT_HEADER.split("\n", 1)[0], (
         "the normal and one-shot headers no longer share the first line the "
         "double-injection guard uses"
     )
-    readme = README.read_text(encoding="utf-8")
-    assert HEADER in readme, (
-        "README.md does not quote the normal-turn header exactly as the plugin sends it"
+    docs = DOCS.read_text(encoding="utf-8")
+    assert HEADER in docs, (
+        "technical-documentation.md does not quote the normal-turn header exactly as the plugin "
+        "sends it"
     )
-    assert ONE_SHOT_HEADER in readme, (
-        "README.md does not quote the one-shot header exactly as the plugin sends it"
+    assert ONE_SHOT_HEADER in docs, (
+        "technical-documentation.md does not quote the one-shot header exactly as the plugin "
+        "sends it"
     )
-    assert shared in readme, "README.md does not show the first line both headers share"
+    assert shared in docs, "technical-documentation.md does not show the first line both headers share"
 
 
-def test_the_readme_documents_the_display_caption() -> None:
+def test_the_documentation_documents_the_display_caption() -> None:
     prose = _prose()
     assert prose.count("carries the count") >= 2, (
-        "README.md does not say both display surfaces carry the count in the heading"
+        "the documentation does not say both display surfaces carry the count in the heading"
     )
     assert prose.count("muted caption line") >= 2, (
-        "README.md does not describe the muted caption on both display surfaces"
+        "the documentation does not describe the muted caption on both display surfaces"
     )
     assert "turn <turn_id> · <local HH:MM>" in prose, (
-        "README.md does not show the caption's turn id and local clock time format"
+        "the documentation does not show the caption's turn id and local clock time format"
     )
     assert prose.count("shown only for a routed record") >= 2, (
-        "README.md does not say the caption is shown only for a routed record"
+        "the documentation does not say the caption is shown only for a routed record"
     )
 
 
-def test_the_readme_documents_once_only_logging_and_url_reduction() -> None:
+def test_the_documentation_documents_once_only_logging_and_url_reduction() -> None:
     prose = _prose()
     assert "unknown eager or deferred name warns once per process" in prose, (
-        "README.md does not say an unknown eager or deferred name warns once per process"
+        "the documentation does not say an unknown eager or deferred name warns once per process"
     )
     assert "Each rejected setting is logged once per process" in prose, (
-        "README.md does not say a rejected setting is logged once per process"
+        "the documentation does not say a rejected setting is logged once per process"
     )
     assert "reduced to its scheme and host" in prose, (
-        "README.md does not say an endpoint URL is reduced to scheme and host before logging"
+        "the documentation does not say an endpoint URL is reduced to scheme and host before logging"
     )
     assert "credentials never reach the log" in prose, (
-        "README.md does not state that credentials never reach the log"
+        "the documentation does not state that credentials never reach the log"
     )
 
 
-def test_the_readme_documents_the_base_url_query_and_fragment_rejection() -> None:
+def test_the_documentation_documents_the_base_url_query_and_fragment_rejection() -> None:
     prose = _prose()
     assert "query or a fragment is rejected" in prose, (
-        "README.md does not say a base URL with a query or fragment is rejected"
+        "the documentation does not say a base URL with a query or fragment is rejected"
     )
     assert "falls back to the default with one warning" in prose, (
-        "README.md does not say a rejected base URL falls back to the default with one warning"
+        "the documentation does not say a rejected base URL falls back to the default with one "
+        "warning"
     )
 
 
@@ -167,5 +186,6 @@ def test_the_mit_license_is_present_and_named_in_the_readme() -> None:
     assert "LICENSE" in readme, "README.md does not point at LICENSE"
 
 
-def test_the_readme_uses_no_em_dash() -> None:
-    assert "\u2014" not in README.read_text(encoding="utf-8"), "README.md contains an em dash"
+def test_both_documents_use_no_em_dash() -> None:
+    for path in (README, DOCS):
+        assert "\u2014" not in path.read_text(encoding="utf-8"), f"{path.name} contains an em dash"
