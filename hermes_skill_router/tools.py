@@ -146,8 +146,9 @@ def _host_lookup(name: str) -> Optional[str]:
 
     The host's ``skills_tool`` has carried two signatures: today's public ``locate_skill`` plus
     ``skill_search_dirs``, and the earlier private ``_locate_skill`` plus ``_skill_search_dirs``.
-    The public shape is tried first and wins when its probe rows resolve; a refused name never
-    falls through to the other shape, because both ask the same library.
+    The public shape is used whenever both its entry points import; a call that raises, and a
+    name the lookup refuses, both leave the row without a path. The private shape is the fallback
+    only for a host that does not export the public pair at all.
     """
     try:
         from tools.skills_tool import locate_skill, skill_search_dirs

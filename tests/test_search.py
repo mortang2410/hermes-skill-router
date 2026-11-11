@@ -309,6 +309,7 @@ def test_one_deadline_covers_both_stages(tmp_path, monkeypatch):
     ranked = search_module.rank(cfg, make_index(), QUERY)
 
     assert ranked.reason == ""
+    assert seen["embed"] is not None
     assert seen["embed"] == seen["rerank"]
 
 
