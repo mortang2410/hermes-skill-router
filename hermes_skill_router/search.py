@@ -107,7 +107,40 @@ class Ranked:
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
 _PARTITIONS: Dict[str, Partition] = {}
+#: Sessions in which the whole catalog already went out in the current compaction window.
+#: Hermes rebuilds every request from message history and never copies the middleware's
+#: ``api_kwargs`` messages back into history, so a marker appended to that payload never
+#: reaches the next turn. This record is that durable fact instead. The rewrite clears a
+#: session's entry when a request shows no prior router block, so a compaction that removes
+#: the window's blocks starts a new window and the record expires with it, never forever.
+#: The search tool reads it to answer healthy-empty after a dump, so a name the dump already
+#: showed is never suggested again.
+_DUMPED: set[str] = set()
 _PARTITIONS_LOCK = threading.Lock()
+
+
+def remember_dump(session_id: str) -> None:
+    """Record that the whole catalog went out in *session_id*'s current compaction window."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.add(session_id)
+
+
+def clear_dumps() -> None:
+    """Expire every session's dump record. Tests call this; production never needs it."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.clear()
+
+
+def clear_dump(session_id: str) -> None:
+    """Expire the dump record for *session_id*; a payload with no prior block is a new window."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.discard(session_id)
+
+
+def dumped(session_id: str) -> bool:
+    """Return whether the whole catalog already went out in this session's current window."""
+    with _PARTITIONS_LOCK:
+        return session_id in _DUMPED
 
 
 def remember_partition(session_id: str, partition: Partition) -> None:

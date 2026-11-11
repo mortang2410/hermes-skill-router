@@ -81,7 +81,7 @@ from .embed import embed_texts as default_embed
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
-from .search import Ranked, forget_session, rank, remember_partition
+from .search import Ranked, clear_dump, dumped, forget_session, rank, remember_dump, remember_partition
 from .select import Suggestion, select
 from .tools import skill_path
 
@@ -196,6 +196,11 @@ def _compose(
         return None
     previous = _prior_blocks(messages)
     dropped_before = _dropped_before(messages)
+    dumped_before = dumped(session_id)
+    if dumped_before:
+        dropped_before = True
+    elif not previous and not dropped_before:
+        clear_dump(session_id)
     stripped, partition = strip_catalog(
         payload, eager=cfg.eager_skills, deferred=cfg.deferred_skills
     )
@@ -218,7 +223,8 @@ def _compose(
         """
         _log_once(reason)
         inert()
-        if not previous and not dropped_before:
+        if not previous and not dropped_before and not dumped_before:
+            remember_dump(session_id)
             return None
         return {
             "request": {
@@ -234,11 +240,8 @@ def _compose(
     if not query:
         return _fail("no user text")
     if not partition.routed.names:
-        # Every row was kept: there is nothing to suggest and nothing a block would replace.
-        # This is the empty-selection case: the strip without a replacement would lose the
-        # catalog for nothing, so the whole request is returned untouched on every pass.
-        inert()
-        return None
+        # All-eager config: no pass can select anything. First pass is the allowed dump.
+        return _fail("no routed skill to suggest")
     if index is None:
         try:
             index = load_or_build(cfg, partition.routed, embed)
@@ -248,9 +251,8 @@ def _compose(
         if index is None:
             return _fail("index build failed")
     if not index.names:
-        inert()
-        return None
-    if dropped_before:
+        return _fail("the skill index carries no row")
+    if dropped_before or dumped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
         # for the rest of the window even when ranking would succeed now.
         return _fail("catalog already dumped in this window")
@@ -371,10 +373,26 @@ def _prior_blocks(messages: Any) -> List[str]:
     if not isinstance(messages, list):
         return blocks
     for message in messages:
-        content = message.get("content") if isinstance(message, Mapping) else None
-        if isinstance(content, str) and content.startswith(INJECTED_HEADER):
-            blocks.append(content)
+        if not isinstance(message, Mapping) or message.get("role") != "system":
+            continue
+        text = _message_text(message)
+        if text.startswith(INJECTED_HEADER):
+            blocks.append(text)
     return blocks
+
+
+def _message_text(message: Any) -> str:
+    """Return one message's text from a string or a list of text parts, else ``""``."""
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        )
+    return ""
 
 
 def _dropped_before(messages: Any) -> bool:
@@ -387,8 +405,9 @@ def _dropped_before(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
     for message in messages:
-        content = message.get("content") if isinstance(message, Mapping) else None
-        if isinstance(content, str) and content.startswith(DROPPED_HEADER_LINE):
+        if not isinstance(message, Mapping) or message.get("role") != "system":
+            continue
+        if _message_text(message).startswith(DROPPED_HEADER_LINE):
             return True
     return False
 

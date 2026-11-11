@@ -12,6 +12,7 @@ change to either side that moves the fused order fails on the side that moved.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hermes_skill_router import associations  # noqa: E402
+from hermes_skill_router import bm25  # noqa: E402
 from hermes_skill_router import fusion  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
@@ -337,5 +339,178 @@ def test_an_unreadable_store_leaves_the_other_channels_routing_with_one_warning(
         record for record in caplog.records if "association database" in record.getMessage()
     ]
     assert len(warnings) == 1
+
+
+# ---------------------------------------------------------------------------
+# The parity fixture, recorded once from the reference router.
+# ---------------------------------------------------------------------------
+
+
+def test_the_parity_fixture_replays_the_recorded_fused_order():
+    """Replay one recorded candidate set from the reference router's own modules.
+
+    The fixture lives in ``tests/parity-fusion.json`` and its ``comment`` field names
+    the generating command and the reference commit ``c5f33fa``. The test asserts the
+    recorded BM25 order, the fused order, the bumped order, the cut order and the
+    cut diagnostics, so a change on either side that moves one of them fails here.
+    The assertion covers identical inputs only; it is not a comparison of two live
+    routers.
+    """
+    fixture = json.loads((ROOT / "tests" / "parity-fusion.json").read_text(encoding="utf-8"))
+    assert "c5f33fa" in fixture["comment"]
+
+    rows = [(entry["name"], entry["name"] + "\n" + entry["description"]) for entry in fixture["catalog"]]
+    term_index = bm25.build_term_index(rows)
+    assert bm25.score_ranks(term_index, fixture["query"], len(rows)) == fixture["bm25"]
+
+    fused = fuse_rankings(
+        {
+            "cosine": fixture["cosine"],
+            "semantic": fixture["semantic"],
+            "bm25": fixture["bm25"],
+            "associations": fixture["associations"],
+        }
+    )
+    assert [record.name for record in fused] == fixture["fused_order"]
+
+    bumped = apply_frecency(fused, fixture["usage"], {"frecency": {"capPositions": 5}})
+    assert [record.name for record in bumped] == fixture["bumped_order"]
+
+    cut = cut_shortlist(bumped, fixture["limit"])
+    assert [record.name for record in cut] == fixture["cut_order"]
+    for record, expected in zip(cut, fixture["diagnostics"]):
+        assert record.name == expected["name"]
+        assert record.semantic_rank == expected["semantic_rank"]
+        assert record.bm25_rank == expected["bm25_rank"]
+        assert record.association_rank == expected["association_rank"]
+        assert record.frecency_movement == expected["frecency_movement"]
+        assert record.final_shortlist_position == expected["final_shortlist_position"]
+
+
+# ---------------------------------------------------------------------------
+# End to end: seeded association rows contribute ranks to a fused order.
+# ---------------------------------------------------------------------------
+
+
+def _seed_association_rank(store, skill_name, term, now_ms, prompts=3):
+    """Give *skill_name* one (term, skill) row with *prompts* distinct supports.
+
+    The seed adds extra non-loading prompts so the skill stays below the ambient
+    threshold: 3 loads in 3 prompts would be ambient and rank nothing.
+    """
+    skill = associations.resolve_skill_name(store, skill_name)
+    assert skill is not None
+    for index in range(prompts):
+        cursor = store.conn.execute(
+            """INSERT INTO prompt_event
+               (session_id, turn, prompt_hash, terms, length, observed_ms)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (f"assoc-session-{index}", 1, f"assoc-hash-{skill_name}-{term}-{index}", term, 20, now_ms - DAY),
+        )
+        store.conn.execute(
+            """INSERT INTO load_event
+               (prompt_event_id, skill_id, evidence, strength, origin, source, observed_ms,
+                dedup_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(cursor.lastrowid),
+                skill.id,
+                "tool",
+                1.0,
+                "human",
+                "backfill",
+                now_ms - DAY,
+                f"{skill_name}:{term}:{index}",
+            ),
+        )
+    for index in range(10):
+        store.conn.execute(
+            """INSERT INTO prompt_event
+               (session_id, turn, prompt_hash, terms, length, observed_ms)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (f"filler-session-{index}", 1, f"filler-hash-{index}", term, 20, now_ms - DAY),
+        )
+    store.conn.execute(
+        "INSERT OR REPLACE INTO association (skill_id, term, weight, support, first_ms, last_ms) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (skill.id, term, 0.8, prompts, now_ms - DAY, now_ms - DAY),
+    )
+
+
+def test_seeded_association_rows_contribute_ranks_to_the_fused_order(tmp_path):
+    """A skill with support>=3 for a query term ranks in the fused order."""
+    now_ms = T0 + DAY
+    cfg = load(
+        {
+            "cachePath": str(tmp_path / "index.json"),
+            "associationDbPath": str(tmp_path / "associations.db"),
+            "channelsBm25": False,
+            "channelsAssociations": True,
+        }
+    )
+    names = ("alpha", "beta", "gamma", "delta", "epsilon", "zeta")
+    store = associations.open_store(str(tmp_path / "associations.db"))
+    try:
+        from hermes_skill_router.associations import CatalogSkill
+
+        associations.reconcile_catalog(store, [CatalogSkill(name) for name in names], now_ms)
+        # beta gets term "zed" with support 3, so the association channel ranks it.
+        _seed_association_rank(store, "beta", "zed", now_ms, prompts=3)
+    finally:
+        store.close()
+
+    index = make_index(names)
+    records = []
+    rows = shortlist(
+        index,
+        [1.0],
+        "zed",
+        6,
+        cfg=cfg,
+        resolver=lambda name: f"/skills/{name}/SKILL.md",
+        now_ms=now_ms,
+        on_diagnostic=records.append,
+    )
+    assert [name for name, _description in rows] == [record.name for record in records]
+    by_name = {record.name: record for record in records}
+    assert by_name["beta"].association_rank == 1, "the seeded row must contribute an association rank"
+    assert by_name["alpha"].association_rank is None
+    assert by_name["alpha"].semantic_rank is not None
+
+
+def test_association_rows_below_the_floor_contribute_no_rank_end_to_end(tmp_path):
+    """Support 2 on the only (term, skill) row leaves the fused order channel-free."""
+    now_ms = T0 + DAY
+    cfg = load(
+        {
+            "cachePath": str(tmp_path / "index.json"),
+            "associationDbPath": str(tmp_path / "associations.db"),
+            "channelsBm25": False,
+            "channelsAssociations": True,
+        }
+    )
+    names = ("alpha", "beta", "gamma", "delta")
+    store = associations.open_store(str(tmp_path / "associations.db"))
+    try:
+        from hermes_skill_router.associations import CatalogSkill
+
+        associations.reconcile_catalog(store, [CatalogSkill(name) for name in names], now_ms)
+        _seed_association_rank(store, "beta", "zed", now_ms, prompts=2)
+    finally:
+        store.close()
+
+    index = make_index(names)
+    records = []
+    shortlist(
+        index,
+        [1.0],
+        "zed",
+        4,
+        cfg=cfg,
+        resolver=lambda name: f"/skills/{name}/SKILL.md",
+        now_ms=now_ms,
+        on_diagnostic=records.append,
+    )
+    assert all(record.association_rank is None for record in records), "support below 3 must not rank"
 
 

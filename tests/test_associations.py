@@ -73,6 +73,7 @@ from hermes_skill_router.associations import (  # noqa: E402
     reset_associations,
     resolve_skill_name,
     resolve_skill_path,
+    usage_scores,
     upsert_events,
     upsert_prompts,
     write_meta,
@@ -1278,3 +1279,176 @@ def test_an_unclassified_session_source_is_refused_and_stores_no_prompt(hermes, 
     assert report.prompts == 0, "an unclassified session does not enter the ubiquity denominator"
     assert rows(store, "SELECT count(*) FROM load_event")[0][0] == 0
     store.close()
+
+
+# --------------------------------------------------------------------------------------------------
+# Ticket 05: the fusion read path, usage scores, the support floor, the ambient filter, the CLI.
+# --------------------------------------------------------------------------------------------------
+
+
+def _reconciled_store(tmp_path: Path, label: str = "fusion"):
+    """Open one store with the standard catalog reconciled, as the fusion tests need."""
+    store = temp_store(tmp_path, label)
+    reconcile_catalog(store, CATALOG, T0)
+    return store
+
+
+def test_usage_scores_decay_and_count_one_use_per_session_turn(tmp_path: Path):
+    """usage_scores sums 0.5 ** (age_days / half_life) per session-turn, once per turn."""
+    store = _reconciled_store(tmp_path, "usage")
+    seed_prompts(store, 10)
+    now = T0 + 5 * DAY
+    # code-review loaded twice in one session-turn and once a day later, all within the window.
+    upsert_events(
+        store,
+        [
+            load_of(0, observed_ms=now - 2 * DAY),
+            load_of(0, evidence="skill_md_read", strength=EXPLICIT_STRENGTH, observed_ms=now - 2 * DAY + 1),
+            load_of(1, observed_ms=now - DAY),
+        ],
+    )
+    scores = usage_scores(store, 14, now)
+    # Two distinct session-turns at ages 2 days and 1 day, not three loads.
+    assert scores["code-review"] == pytest.approx(0.5 ** (2 / 14) + 0.5 ** (1 / 14))
+    assert "handoff-doc" not in scores, "a skill with no load history is absent, not zero"
+    store.close()
+
+
+def test_usage_scores_exclude_ambient_and_soft_deleted_skills(tmp_path: Path):
+    """An ambient skill and a soft-deleted skill never reach the usage map."""
+    store = _reconciled_store(tmp_path, "usage-gate")
+    seed_prompts(store, 10)
+    now = T0 + 5 * DAY
+    upsert_events(
+        store,
+        [
+            load_of(0),
+            load_of(1),
+            load_of(2),
+            load_of(3, skill_name="handoff-doc", skill_path=catalog_path("handoff-doc")),
+        ],
+    )
+    # 3 of 10 prompts is above the 25% threshold: code-review is ambient.
+    code_review = resolve_skill_name(store, "code-review").id
+    assert code_review in ambient_skill_ids(store, now)
+    assert "code-review" not in usage_scores(store, 14, now), "an ambient skill has no usage score"
+    assert "handoff-doc" in usage_scores(store, 14, now)
+
+    reconcile_catalog(store, (CATALOG[0], CATALOG[2]), now)
+    assert "handoff-doc" not in usage_scores(store, 14, now), "a soft-deleted skill has no usage score"
+    store.close()
+
+
+def test_usage_scores_writes_nothing_to_the_store(tmp_path: Path):
+    """The grouped scan is read-only: row counts never move."""
+    store = _reconciled_store(tmp_path, "usage-readonly")
+    seed_prompts(store, 10)
+    upsert_events(store, [load_of(0), load_of(1)])
+    before = {table: rows(store, f"SELECT count(*) FROM {table}")[0][0] for table in ("skill", "prompt_event", "load_event", "association")}
+    usage_scores(store, 14, T0 + DAY)
+    after = {table: rows(store, f"SELECT count(*) FROM {table}")[0][0] for table in ("skill", "prompt_event", "load_event", "association")}
+    assert after == before
+    store.close()
+
+
+def test_the_support_floor_is_per_term_skill_row_before_summing(tmp_path: Path):
+    """support_floor=3 filters each (term, skill) row before the per-skill sum."""
+    store = _reconciled_store(tmp_path, "floor")
+    seed_prompts(store, 12)
+    now = T0 + 8 * DAY
+    # Each (term, code-review) row has support 1: the skill total reaches 3
+    # through disjoint terms, so a per-skill floor would admit it but the
+    # per-row floor must not.
+    upsert_events(
+        store,
+        [
+            load_of(0, prompt_text="Alpha first review", prompt_observed_ms=T0 + DAY, observed_ms=T0 + DAY),
+            load_of(1, prompt_text="Beta second review", prompt_observed_ms=T0 + DAY, observed_ms=T0 + DAY),
+            load_of(2, prompt_text="Gamma third review", prompt_observed_ms=T0 + DAY, observed_ms=T0 + DAY),
+        ],
+    )
+    ranked = decayed_weights(store, ["alpha", "beta", "gamma"], now, support_floor=3)
+    assert ranked == [], "no (term, skill) row clears the floor, so no rank is contributed"
+    assert decayed_weights(store, ["alpha", "beta", "gamma"], now, support_floor=1), "without the floor the rows rank"
+    assert decayed_weights(store, ["alpha", "beta", "gamma"], now, support_floor=2) == [], "a floor of 2 still admits no row of support 1"
+    store.close()
+
+
+def test_aux_filter_follows_the_ubiquity_threshold(tmp_path: Path):
+    """Above the threshold a skill is ambient; at exactly the threshold it is not."""
+    store = _reconciled_store(tmp_path, "aux")
+    seed_prompts(store, 12)
+    now = T0 + 6 * DAY
+    # 4 of 12 is above 25%: ambient. 3 of 12 is exactly 25%: not ambient.
+    upsert_events(store, [load_of(0), load_of(1), load_of(2), load_of(5)])
+    upsert_events(
+        store,
+        [
+            load_of(3, skill_name="handoff-doc", skill_path=catalog_path("handoff-doc")),
+            load_of(4, skill_name="handoff-doc", skill_path=catalog_path("handoff-doc")),
+            load_of(6, skill_name="handoff-doc", skill_path=catalog_path("handoff-doc")),
+        ],
+    )
+    ambient = ambient_skill_ids(store, now)
+    assert resolve_skill_name(store, "code-review").id in ambient
+    assert resolve_skill_name(store, "handoff-doc").id not in ambient
+    ranked_names = {row.name for row in decayed_weights(store, ["review"], now, support_floor=1)}
+    assert "code-review" not in ranked_names
+    assert "handoff-doc" in ranked_names
+    store.close()
+
+
+def test_the_backfill_cli_main_writes_only_the_association_store(hermes, tmp_path: Path, capsys):
+    """main() runs the bounded backfill against a fixture state store and prints JSON."""
+    hermes.session("s-main")
+    hermes.user("s-main", SUBSTANTIVE, T0 + 1000)
+    hermes.skill_view("s-main", "code-review", T0 + 2000)
+    hermes.commit()
+
+    db_path = tmp_path / "cli.db"
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(json.dumps([skill.name for skill in CATALOG]), encoding="utf-8")
+    state_before = hermes.path.read_bytes()
+
+    code = associations_module.main(
+        [
+            "--db", str(db_path),
+            "--state-db", str(hermes.path),
+            "--catalog", str(catalog_path),
+            "--max-sessions", "5",
+            "--now-ms", str(T0 + 10 * DAY),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    report = json.loads(captured.out)
+    assert report["sessions_found"] == 1
+    assert report["sessions_scanned"] == 1
+    assert report["loads"] == 1, "one skill_view produces one load"
+    assert hermes.path.read_bytes() == state_before, "the state store is never written"
+
+    store = open_store(str(db_path))
+    assert rows(store, "SELECT count(*) FROM load_event")[0][0] == 1
+    store.close()
+
+    # A second run is idempotent by the store's own uniqueness.
+    code = associations_module.main(
+        [
+            "--db", str(db_path),
+            "--state-db", str(hermes.path),
+            "--catalog", str(catalog_path),
+            "--max-sessions", "5",
+            "--now-ms", str(T0 + 10 * DAY),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out)["loads"] == 0, "a second run inserts nothing new"
+
+
+def test_the_backfill_cli_main_refuses_an_unreadable_catalog(tmp_path: Path, capsys):
+    db_path = tmp_path / "cli.db"
+    code = associations_module.main(["--db", str(db_path), "--catalog", str(tmp_path / "missing.json"), "--now-ms", str(T0)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "cannot read catalog" in captured.err
