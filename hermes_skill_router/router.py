@@ -36,6 +36,13 @@ names, or ``inert`` with no names. The record is written after the payload is bu
 enters it, so the display costs no token. A written record is announced on the plugin event
 ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
 
+A completed pass also writes one info line to the plugin log, beginning ``skill router: query=``.
+The line carries the query as a JSON string, every shortlisted candidate with the score the selector
+compared, the cutoff, the suggestions and the embed, rerank and total timings, so an operator can
+answer "why this skill" and "why not that skill" without replaying the request. A pass that failed,
+timed out or spent its budget writes no decision line; its one warning names the reason and never the
+query, because that line is the only place the plugin logs the user's text.
+
 The returned mapping holds exactly one key, ``request``, because the middleware replaces the whole
 provider payload with what it returns: dropping ``model``, ``tools`` or any other top-level key
 would break the call. The result is deterministic for one payload and one index, which matters
@@ -44,6 +51,7 @@ because Hermes replays recorded request bytes on later turns.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -54,7 +62,7 @@ from .embed import embed_texts as default_embed
 from .inject import HEADER, render
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
-from .search import forget_session, rank, remember_partition
+from .search import Ranked, forget_session, rank, remember_partition
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +203,7 @@ def _compose(
         _log_once(ranked.detail)
         inert()
         return None
+    _log_decision(cfg, query, ranked)
     # The partition's variant chooses the header, so the block matches the prose this request lost.
     block = render(ranked.rows, partition.kept, index, cfg, partition.one_shot)
     if not block:
@@ -289,6 +298,29 @@ def _broadcast(turn_id: str) -> None:
     except Exception:
         return
     broadcast_plugin_event(PLUGIN_ID, EVENT, {"turn_id": turn_id})
+
+
+def _log_decision(cfg: Config, query: str, ranked: Ranked) -> None:
+    """Write the one decision line for a completed pass.
+
+    The line carries the query as a JSON string, every shortlisted candidate with the score the
+    selector compared, the cutoff, the suggestions and the three stage timings. It is the only place
+    the plugin logs the user's text; a warning never carries it. Candidates the cutoff rejected stay
+    in the line with their scores, so a name missing from the block still has an answer.
+    """
+    candidates = ",".join(f"{name}:{score!r}" for name, score in ranked.candidates) or "-"
+    suggestions = ",".join(f"{name}:{score!r}" for name, score in ranked.rows) or "-"
+    logger.info(
+        "skill router: query=%s candidates=%s cutoff=%r suggestions=%s "
+        "embed_ms=%.1f rerank_ms=%.1f total_ms=%.1f",
+        json.dumps(query),
+        candidates,
+        cfg.cutoff,
+        suggestions,
+        ranked.embed_ms,
+        ranked.rerank_ms,
+        ranked.total_ms,
+    )
 
 
 def _log_once(reason: str) -> None:

@@ -167,6 +167,46 @@ def test_the_documentation_documents_once_only_logging_and_url_reduction() -> No
     )
 
 
+def test_the_documentation_documents_the_decision_line_and_its_privacy_boundary() -> None:
+    prose = _prose()
+    assert "skill router: query=" in prose, (
+        "the documentation does not name the line that carries the query"
+    )
+    assert "request text is never logged" not in prose, (
+        "the documentation still claims that request text is never logged at all"
+    )
+    assert "never written to the display record" in prose, (
+        "the documentation does not say request text is never written to the display record"
+    )
+    assert "never written to the index cache" in prose, (
+        "the documentation does not say request text is never written to the index cache"
+    )
+    assert "never appears in a warning" in prose, (
+        "the documentation does not say request text never appears in a warning"
+    )
+    assert "The one exception is the decision line" in prose, (
+        "the documentation does not name the one place the query is logged"
+    )
+    assert "every shortlisted candidate as `name:score`" in prose, (
+        "the documentation does not say the line carries every shortlisted candidate with its score"
+    )
+    assert "including the candidates the cutoff rejected" in prose, (
+        "the documentation does not say the rejected candidates stay in the line"
+    )
+    assert "the values the selector compared with the cutoff" in prose, (
+        "the documentation does not say the logged scores are the ones the selector compared"
+    )
+    assert "writes no decision line" in prose, (
+        "the documentation does not say a failed pass writes no decision line"
+    )
+    assert "like every warning, carries no user text" in prose, (
+        "the documentation does not say the failure warnings still carry no user text"
+    )
+    assert "no warning contains the user's text" in prose, (
+        "the Failure behaviour promise that no warning contains user text is gone"
+    )
+
+
 def test_the_documentation_documents_the_base_url_query_and_fragment_rejection() -> None:
     prose = _prose()
     assert "query or a fragment is rejected" in prose, (

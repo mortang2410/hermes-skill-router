@@ -1,18 +1,21 @@
-"""Contract C9: the composed rewrite — strip, shortlist, rerank, select, inject, record.
+"""Contract C9: the composed rewrite, strip, shortlist, rerank, select, inject, record, log.
 
 Every test drives :func:`hermes_skill_router.router.rewrite` with a fake embedder and a fake
 reranker, so the suite needs no endpoint, no model and no network. What is asserted is the shape
 the middleware contract depends on: one appended system message on success, ``None`` on every
-failure (which keeps the catalog), only the ``request`` key in the result, and a display record
-that carries selected suggestion names only.
+failure (which keeps the catalog), only the ``request`` key in the result, a display record that
+carries selected suggestion names only, and one decision line per completed pass carrying the
+query, the scored shortlist, the cutoff, the suggestions and the stage timings.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -768,3 +771,226 @@ def test_an_unreachable_reranker_logs_once_per_process(tmp_path, caplog):
 
     reasons = [message for message in caplog.messages if "rerank unreachable" in message]
     assert len(reasons) == 1
+
+
+# ---------------------------------------------------------------------------
+# The decision line: one info line per completed pass, none on a failed one.
+# ---------------------------------------------------------------------------
+
+DECISION_PREFIX = "skill router: query="
+
+# The hash of ``json.dumps(result, ensure_ascii=False, sort_keys=True)`` for the payload
+# ``_payload()`` rewritten with ``FakeEmbedder()``, ``FakeReranker()``, session ``s-1`` and turn
+# ``t-1``. It was captured from the build before the decision line existed, at
+# 87d3e72d8b3d35da4edf7890dc39b458203e6b62, so a change to the returned payload fails the test.
+GOLDEN_PAYLOAD_SHA256 = "8d3c9771a11f88ada7e6f5389edd76a2ac1d1fac9aed4de7f4033c4501588975"
+
+# The display record the same call wrote, minus its unstable ``at`` timestamp.
+GOLDEN_RECORD = {
+    "schema": 2,
+    "session_id": "s-1",
+    "turn_id": "t-1",
+    "status": "routed",
+    "origin": "turn",
+    "names": ["beta", "delta", "alpha", "gamma"],
+}
+
+
+def _decision_lines(caplog):
+    """Return the decision lines in the captured log."""
+    return [message for message in caplog.messages if message.startswith(DECISION_PREFIX)]
+
+
+def test_a_routed_turn_writes_one_decision_line(tmp_path, caplog):
+    cfg = make_config(tmp_path, cutoff=0.1)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert result is not None
+    lines = _decision_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.startswith(f'{DECISION_PREFIX}"{QUERY}"'), "the query is JSON-quoted"
+    assert "candidates=beta:0.9,delta:0.2,alpha:0.05,gamma:0.01" in line, (
+        "every shortlisted candidate is named with the score the selector compared, including the "
+        "candidates the cutoff rejected"
+    )
+    assert "cutoff=0.1" in line
+    assert "suggestions=beta:0.9,delta:0.2" in line
+    for field in ("embed_ms=", "rerank_ms=", "total_ms="):
+        assert field in line, f"the decision line carries no {field}"
+
+
+def test_each_routed_turn_writes_its_own_decision_line(tmp_path, caplog):
+    cfg = make_config(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+        rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert len(_decision_lines(caplog)) == 2
+
+
+def test_the_logged_query_is_json_quoted(tmp_path, caplog):
+    query = 'say "hi"\nnow'
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        rewrite(
+            _payload(user=query),
+            cfg=make_config(tmp_path),
+            embed=FakeEmbedder(),
+            rerank=FakeReranker(),
+        )
+
+    line = _decision_lines(caplog)[0]
+    assert 'query="say \\"hi\\"\\nnow"' in line, (
+        "the query is not JSON-quoted, so a quote or newline in it would break the line"
+    )
+
+
+def test_the_decision_line_times_the_stages(tmp_path, caplog):
+    def slow_embed(cfg, texts):
+        time.sleep(0.01)
+        return FakeEmbedder()(cfg, texts)
+
+    def slow_rerank(cfg, query, documents):
+        time.sleep(0.01)
+        return FakeReranker()(cfg, query, documents)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        rewrite(
+            _payload(),
+            cfg=make_config(tmp_path),
+            embed=slow_embed,
+            rerank=slow_rerank,
+        )
+
+    line = _decision_lines(caplog)[0]
+    timings = {
+        field: float(line.split(field + "=")[1].split(" ")[0])
+        for field in ("embed_ms", "rerank_ms", "total_ms")
+    }
+    assert timings["embed_ms"] >= 5.0
+    assert timings["rerank_ms"] >= 5.0
+    assert timings["total_ms"] >= timings["embed_ms"] + timings["rerank_ms"] - 0.2
+
+
+def test_a_completed_pass_with_no_suggestion_still_writes_its_line(tmp_path, caplog):
+    cfg = make_config(tmp_path, cutoff=0.99)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert result is None, "nothing cleared the cutoff, so the catalog stays in the request"
+    line = _decision_lines(caplog)[0]
+    assert "candidates=beta:0.9,delta:0.2,alpha:0.05,gamma:0.01" in line
+    assert "suggestions=-" in line, "the line says no name cleared the cutoff"
+
+
+def test_a_failed_rerank_writes_no_decision_line_and_keeps_one_warning(tmp_path, caplog):
+    cfg = make_config(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker(result=None))
+
+    assert result is None
+    assert _decision_lines(caplog) == []
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "hermes_skill_router.router"
+    ]
+    assert len(warnings) == 1
+    assert "rerank unreachable" in warnings[0].getMessage()
+    assert QUERY not in warnings[0].getMessage(), "a warning carries no user text"
+
+
+def test_an_embed_timeout_writes_no_decision_line(tmp_path, caplog):
+    def slow(cfg, texts):
+        raise TimeoutError("too slow")
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(
+            _payload(),
+            cfg=make_config(tmp_path),
+            index=make_index(),
+            embed=slow,
+            rerank=FakeReranker(),
+        )
+
+    assert result is None
+    assert _decision_lines(caplog) == []
+    assert any("embed timeout" in message for message in caplog.messages)
+
+
+def test_a_rerank_timeout_writes_no_decision_line(tmp_path, caplog):
+    def timed_out(cfg, query, documents):
+        raise TimeoutError("too slow")
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(
+            _payload(),
+            cfg=make_config(tmp_path),
+            embed=FakeEmbedder(),
+            rerank=timed_out,
+        )
+
+    assert result is None
+    assert _decision_lines(caplog) == []
+    assert any("rerank unreachable" in message for message in caplog.messages)
+
+
+def test_a_spent_budget_writes_no_decision_line(tmp_path, caplog):
+    cfg = make_config(tmp_path, routingTimeoutMs=1000)
+
+    def slow_embed(cfg, texts):
+        time.sleep(1.05)
+        return FakeEmbedder()(cfg, texts)
+
+    with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
+        result = rewrite(
+            _payload(),
+            cfg=cfg,
+            index=make_index(),
+            embed=slow_embed,
+            rerank=FakeReranker(),
+        )
+
+    assert result is None
+    assert _decision_lines(caplog) == []
+    assert any("routing budget 1000 ms exhausted" in message for message in caplog.messages)
+
+
+def test_the_returned_payload_is_byte_identical_to_the_pre_change_build(tmp_path):
+    result = rewrite(
+        _payload(),
+        cfg=make_config(tmp_path),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="s-1",
+        turn_id="t-1",
+    )
+
+    encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    assert hashlib.sha256(encoded.encode()).hexdigest() == GOLDEN_PAYLOAD_SHA256
+    assert list(result["request"]) == ["model", "tools", "unrelated_key", "messages"], (
+        "the top-level key order is part of the bytes the provider receives"
+    )
+
+
+def test_the_display_record_is_byte_identical_to_the_pre_change_build(tmp_path):
+    cfg = make_config(tmp_path)
+
+    rewrite(
+        _payload(),
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="s-1",
+        turn_id="t-1",
+    )
+
+    record = record_for(cfg)
+    record.pop("at")
+    assert record == GOLDEN_RECORD

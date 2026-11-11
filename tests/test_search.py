@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hermes_skill_router import search as search_module  # noqa: E402
+from hermes_skill_router import tools as tools_module  # noqa: E402
 from hermes_skill_router.catalog import CatalogRows, Partition  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
 from hermes_skill_router.display import read  # noqa: E402
@@ -31,6 +32,7 @@ from hermes_skill_router.search import (  # noqa: E402
     remember_partition,
     select_rows,
 )
+from hermes_skill_router.select import select  # noqa: E402
 
 QUERY = "draft a git commit message for a bug fix"
 QUERY_VECTOR = [0.0, 1.0, 0.0]
@@ -403,3 +405,85 @@ def test_a_second_catalog_replaces_the_first_rows(tmp_path):
     )
 
     assert [row.name for row in catalog_rows(cfg, "session-1")] == ["zeta"]
+
+
+# ---------------------------------------------------------------------------
+# The pass hands back the scores the selector compared, so the decision line can carry them.
+# ---------------------------------------------------------------------------
+
+# The envelope the tool answered before this change, for the partition fixture, the default
+# ``FakeEmbedder`` and ``FakeReranker`` and a resolver that answers one path per name. It was
+# captured from the build at 87d3e72d8b3d35da4edf7890dc39b458203e6b62.
+GOLDEN_ENVELOPE = (
+    '{"skills": [{"name": "alpha", "description": "Alpha skill", "path": "/skills/alpha/SKILL.md"}, '
+    '{"name": "beta", "description": "Beta skill", "path": "/skills/beta/SKILL.md"}, '
+    '{"name": "gamma", "description": "Gamma skill", "path": "/skills/gamma/SKILL.md"}]}'
+)
+
+
+def test_the_pass_hands_back_every_score_it_compared(tmp_path):
+    cfg = make_config(tmp_path, cutoff=0.5)
+
+    ranked = search_module.rank(
+        cfg,
+        make_index(),
+        QUERY,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.2, 0.9, 0.1)),
+    )
+
+    assert ranked.reason == ""
+    assert ranked.candidates == (("beta", 0.2), ("alpha", 0.9), ("gamma", 0.1)), (
+        "the pass does not hand back every shortlisted candidate with the score the selector saw"
+    )
+    assert ranked.rows == (("alpha", 0.9),)
+    assert list(ranked.rows) == select([0.2, 0.9, 0.1], ["beta", "alpha", "gamma"], cfg)
+
+
+def test_the_pass_times_each_stage(tmp_path):
+    def slow_embed(cfg, texts):
+        time.sleep(0.01)
+        return FakeEmbedder()(cfg, texts)
+
+    def slow_rerank(cfg, query, documents):
+        time.sleep(0.01)
+        return FakeReranker()(cfg, query, documents)
+
+    ranked = search_module.rank(
+        make_config(tmp_path), make_index(), QUERY, embed=slow_embed, rerank=slow_rerank
+    )
+
+    assert ranked.reason == ""
+    assert ranked.embed_ms >= 5.0
+    assert ranked.rerank_ms >= 5.0
+    assert ranked.total_ms >= ranked.embed_ms + ranked.rerank_ms
+
+
+def test_a_failed_pass_hands_back_no_candidate_scores(tmp_path):
+    ranked = search_module.rank(
+        make_config(tmp_path),
+        make_index(),
+        QUERY,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(result=None),
+    )
+
+    assert ranked.reason == RERANK_FAILED
+    assert ranked.candidates == ()
+    assert ranked.rows == ()
+
+
+def test_the_search_tool_envelope_is_byte_identical_to_the_pre_change_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
+    monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
+    forget_session("envelope-session")
+    remember_partition("envelope-session", partition())
+
+    answer = tools_module.handle(
+        {"query": QUERY},
+        settings={"cachePath": "", "suggestionsPath": str(tmp_path / "envelope.json")},
+        session_id="envelope-session",
+    )
+
+    assert answer == GOLDEN_ENVELOPE

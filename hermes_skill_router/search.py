@@ -14,10 +14,12 @@ search, which the tool reports as the healthy empty answer.
 
 The pass in :func:`rank` is the middleware's own: it takes the query vector inside the routing
 budget, shortlists the routed rows by cosine, reranks those documents and applies the configured
-cutoff and cap. The rewrite renders its block from the same result, so a turn and a search for the
-same query and catalog can never disagree. A failure names its arm (``embed-failed``,
-``rerank-failed``, ``budget-expired``) instead of a partial list; the handler maps that to the
-degraded envelope and the middleware to an unchanged request.
+cutoff and cap. It also hands every candidate's score and the stage timings back with the selection,
+so the turn can write its decision line from the values the selector compared. The rewrite renders
+its block from the same result, so a turn and a search for the same query and catalog can never
+disagree. A failure names its arm (``embed-failed``, ``rerank-failed``, ``budget-expired``) instead of
+a partial list; the handler maps that to the degraded envelope and the middleware to an unchanged
+request.
 
 The path of each returned row comes from the host's own skill lookup, the resolver ``skill_view``
 uses, and only for the rows the search selected: that lookup walks the skill directories, so calling
@@ -82,11 +84,20 @@ class SearchOutcome:
 
 @dataclass(frozen=True)
 class Ranked:
-    """The selection pass' answer: name and probability pairs best first, or a failure arm."""
+    """The selection pass' answer: name and probability pairs best first, or a failure arm.
+
+    ``candidates`` carries every shortlisted name with the rerank probability the selector compared,
+    in shortlist order, so a caller can report a candidate the cutoff rejected. The three timings
+    are milliseconds: the embed stage, the rerank stage and the whole pass.
+    """
 
     rows: Tuple[Tuple[str, float], ...] = ()
     reason: str = ""
     detail: str = ""
+    candidates: Tuple[Tuple[str, float], ...] = ()
+    embed_ms: float = 0.0
+    rerank_ms: float = 0.0
+    total_ms: float = 0.0
 
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
@@ -201,26 +212,41 @@ def rank(
     returns after the deadline, or finds it already spent, ends as ``budget-expired``. An empty
     selection is a healthy outcome with no rows; only a failed endpoint or an unbuildable shortlist
     names another arm.
+
+    A completed pass also hands back every shortlisted candidate with the score the selector compared
+    and the three stage timings, so the caller can report why a name was not selected. An arm carries
+    no candidate, so a failed pass can never report a partial shortlist.
     """
+    started = monotonic()
     deadline = _deadline(cfg, deadline)
     query_vector, failure = _query_vector(cfg, query, embed or default_embed, deadline)
+    embed_ms = _elapsed_ms(started)
     if failure is not None:
         return failure
     if _budget_left(deadline) is None:
         return _failed(BUDGET_EXPIRED, _budget_message(cfg))
     shortlisted = shortlist(index, query_vector, cfg.shortlist_size)
     if not shortlisted:
-        return Ranked()
+        return Ranked(embed_ms=embed_ms, total_ms=_elapsed_ms(started))
     documents = [
         cfg.document_prefix + name + " - " + description for name, description in shortlisted
     ]
+    rerank_started = monotonic()
     scores, failure = _rerank_scores(cfg, query, documents, rerank or default_rerank, deadline)
+    rerank_ms = _elapsed_ms(rerank_started)
     if failure is not None:
         return failure
     if _budget_left(deadline) is None:
         return _failed(BUDGET_EXPIRED, _budget_message(cfg))
-    chosen = select(scores, [name for name, _description in shortlisted], cfg)
-    return Ranked(rows=tuple(chosen))
+    names = [name for name, _description in shortlisted]
+    chosen = select(scores, names, cfg)
+    return Ranked(
+        rows=tuple(chosen),
+        candidates=tuple((name, float(score)) for score, name in zip(scores, names)),
+        embed_ms=embed_ms,
+        rerank_ms=rerank_ms,
+        total_ms=_elapsed_ms(started),
+    )
 
 
 def _budget_message(cfg: Config) -> str:
@@ -288,6 +314,11 @@ def _rerank_scores(
 
 def _failed(reason: str, detail: str) -> Ranked:
     return Ranked(reason=reason, detail=detail)
+
+
+def _elapsed_ms(started: float) -> float:
+    """Return the milliseconds between *started* and now, from the clock the budget uses."""
+    return (monotonic() - started) * 1000.0
 
 
 def _deadline(cfg: Config, deadline: Optional[float]) -> float:

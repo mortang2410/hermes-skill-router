@@ -297,8 +297,20 @@ and `http://127.0.0.1:8010` for rerank.
 On every routed request the plugin sends the text of the request's last user message to the
 embeddings endpoint. On a cold index build it sends the name and description of every routed skill
 there too. It sends the shortlisted skill names and descriptions to the rerank endpoint. Nothing else
-leaves the process: the display record stores names only, request text is never logged, and no
-request text is written to the index cache.
+is sent to either endpoint. Request text is never written to the display record, is never written to
+the index cache and never appears in a warning. The one exception is the decision line described
+below: the plugin's own log carries the query text and the scores of each routing pass.
+
+### The decision line
+
+The plugin writes one info line beginning `skill router: query=` for every turn whose ranking pass
+completes. The line carries the query text as a JSON string, every shortlisted candidate as
+`name:score` including the candidates the cutoff rejected, the cutoff, the suggested names with their
+probabilities, or `-` when no candidate cleared the cutoff, and the embed, rerank and total stage
+times in milliseconds. The scores are the values the selector compared with the cutoff, so a name
+that is missing from the block can be explained without replaying the request. A turn whose rerank
+stage failed, timed out or ran out of its budget writes no decision line: its one warning names the
+reason and, like every warning, carries no user text.
 
 ## Endpoint protocols
 
@@ -604,9 +616,10 @@ The plugin is stdlib-only Python; `urllib` is its only HTTP client. The embeddin
 
 A correct dump carries no `<available_skills>` block and no `## Skills` heading, its last message
 starts with `Skills routed for this request`, and `request.body` still carries `model` and `tools`.
-When the block is missing, read the plugin log for the one warning that names the failure reason, and
-compare it with the reason list under [Failure behaviour](#failure-behaviour). Enable the plugin in
-the profile first: with it disabled, every request keeps its catalog.
+When the block is missing, read the plugin log: a failed pass leaves one warning that names the
+reason, which you can compare with the reason list under [Failure behaviour](#failure-behaviour), and
+a completed pass leaves the decision line under [Data disclosure](#data-disclosure). Enable the
+plugin in the profile first: with it disabled, every request keeps its catalog.
 
 ### The first turn is slow
 
