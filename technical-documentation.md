@@ -11,10 +11,17 @@ The rewrite runs six steps for one Chat Completions request:
 1. Strip the skills section and partition its rows with `eagerSkills` and `deferredSkills`.
 2. Build or load the index over the routed rows only. The index is the routed rows' names and
    descriptions, embedded through the embeddings endpoint.
-3. Embed the text of the request's last user message, then keep the `shortlistSize` routed rows
-   nearest to it by cosine similarity.
-4. Send those candidates to the rerank endpoint, one document per candidate, in the rerank document
-   format `documentPrefix + name + " - " + description`.
+3. Build the query from the newest typed user message and the typed user messages before it, then
+   embed it and keep the `shortlistSize` routed rows nearest to it by cosine similarity. The query is
+   `<newest message> Context: <older message> <older message>`, with the older messages joined oldest
+   first; only typed user messages count, so a system message, an assistant message and an earlier
+   injected block never join it. The preceding context is capped at `RECENT_CONTEXT_CHARS = 10000`
+   characters, counted over whole messages from the newest backwards and stopping at the first
+   message that would cross the cap, so a message is never cut. The newest message is not part of the
+   cap and is embedded in full, and with no typed message before it the query is exactly the newest
+   message.
+4. Send those candidates to the rerank endpoint with the same query string, one document per
+   candidate, in the rerank document format `documentPrefix + name + " - " + description`.
 5. Resolve every reranked candidate's read path through the host lookup the `skill_view` resolver
    uses, recover the names the request's own earlier blocks already suggested, then keep the
    candidates that are not suppressed, score at or above `cutoff` and carry a path, sort them by

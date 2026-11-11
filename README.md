@@ -22,9 +22,10 @@ Hermes dumps the whole skill catalog into the model context. This plugin hides t
 surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that gets
 listed at the start of each compaction window.
 
-Two endpoints rank them. The embeddings endpoint compares your message with the skill rows and keeps
-the nearest ones. The rerank endpoint scores that shortlist against the same message, and the plugin
-suggests what scores at or above `cutoff`.
+Two endpoints rank them. The embeddings endpoint compares your newest message, together with the
+typed messages before it (up to 10,000 characters), with the skill rows and keeps the nearest ones.
+The rerank endpoint scores that shortlist against the same query, and the plugin suggests what
+scores at or above `cutoff`.
 
 If a service is down or too slow, the plugin falls back to the ordinary skill catalog, so a bad
 endpoint costs latency, not a broken turn.

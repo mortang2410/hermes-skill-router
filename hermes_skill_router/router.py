@@ -7,8 +7,9 @@ the spec's order of work and nothing else:
    ``cfg.eager_skills`` and ``cfg.deferred_skills`` (:mod:`hermes_skill_router.catalog`).
 2. Build or load the index over the *routed* rows only (:mod:`hermes_skill_router.library`), so a
    kept row is never suggested, only listed.
-3. Embed the last user message's text and take the top ``cfg.shortlist_size`` routed rows by cosine
-   over the index vectors (:mod:`hermes_skill_router.embed`).
+3. Embed the newest typed message with the capped context that precedes it, and take the top
+   ``cfg.shortlist_size`` routed rows by cosine over the index vectors
+   (:mod:`hermes_skill_router.embed`).
 4. Rerank ``cfg.document_prefix + name + " - " + description`` for those rows
    (:mod:`hermes_skill_router.rerank`).
 5. Resolve every reranked candidate's read path through the host lookup (:mod:`hermes_skill_router.tools`)
@@ -87,6 +88,10 @@ CHAT_COMPLETIONS = "chat_completions"
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
 INJECTED_HEADER = HEADER.split("\n", 1)[0]
+
+#: The most preceding-context characters that join the newest typed message, counted over whole
+#: messages from the newest backwards. The newest message itself is never part of this cap.
+RECENT_CONTEXT_CHARS = 10000
 
 #: Plugin id and bare event name: the wire name is ``plugin.hermes-skill-router.suggestions.updated``.
 PLUGIN_ID = "hermes-skill-router"
@@ -191,7 +196,7 @@ def _compose(
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition)
     inert = _recorder(cfg, INERT, (), session_id, turn_id, notify)
-    query = _last_user_text(messages)
+    query = _query_text(messages)
     if not query:
         _log_once("no user text")
         inert()
@@ -260,14 +265,43 @@ def _compose(
     return {"request": rewritten}
 
 
-def _last_user_text(messages: Any) -> str:
-    """Return the text of the last ``user`` message, or ``""`` when there is none or it is empty."""
-    if not isinstance(messages, list):
+def _query_text(messages: Any) -> str:
+    """Return the newest typed message plus the capped context that precedes it, or ``""``.
+
+    Only ``user`` messages that carry text count, so a system message, an assistant message and an
+    earlier injected block never join the query. The preceding messages are kept whole, taken from
+    the newest backwards while the running total stays within :data:`RECENT_CONTEXT_CHARS`, then
+    joined oldest first after the newest message with `` Context: `` between them. The scan
+    stops at the first message that would cross the cap rather than cutting or skipping it. With no
+    preceding typed message the query is exactly the newest message.
+    """
+    texts = _typed_user_texts(messages)
+    if not texts:
         return ""
-    for message in reversed(messages):
+    context: List[str] = []
+    used = 0
+    for text in reversed(texts[:-1]):
+        if used + len(text) > RECENT_CONTEXT_CHARS:
+            break
+        context.append(text)
+        used += len(text)
+    context.reverse()
+    if not context:
+        return texts[-1]
+    return texts[-1] + " Context: " + " ".join(context)
+
+
+def _typed_user_texts(messages: Any) -> List[str]:
+    """Return the text of every typed ``user`` message that carries text, oldest first."""
+    if not isinstance(messages, list):
+        return []
+    texts: List[str] = []
+    for message in messages:
         if isinstance(message, Mapping) and message.get("role") == "user":
-            return _content_text(message.get("content"))
-    return ""
+            text = _content_text(message.get("content"))
+            if text:
+                texts.append(text)
+    return texts
 
 
 def _content_text(content: Any) -> str:

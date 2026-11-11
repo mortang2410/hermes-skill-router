@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
-from hermes_skill_router.config import Config, load  # noqa: E402
+from hermes_skill_router.config import DEFAULTS, Config, load  # noqa: E402
 from hermes_skill_router.inject import HEADER, ONE_SHOT_HEADER, PINNED  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
@@ -814,11 +814,11 @@ def test_an_unsupported_api_mode_logs_once_per_process(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
-# The last user message is the query; a content list contributes its text parts.
+# The newest typed message heads the query; the capped preceding context follows, oldest first.
 # ---------------------------------------------------------------------------
 
 
-def test_the_last_user_message_supplies_the_query(tmp_path):
+def test_the_newest_typed_message_heads_the_query_and_the_earlier_one_follows(tmp_path):
     payload = _payload(
         extra=(
             {"role": "assistant", "content": "earlier answer"},
@@ -830,8 +830,127 @@ def test_the_last_user_message_supplies_the_query(tmp_path):
 
     rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
 
-    assert embedder.calls[-1] == ["second request"]
-    assert reranker.calls[0][0] == "second request"
+    query = f"second request Context: {QUERY}"
+    assert embedder.calls[-1] == [query], "the embedder does not receive the composed query"
+    assert reranker.calls[0][0] == query, "the reranker does not receive the composed query"
+
+
+def test_the_preceding_typed_messages_join_oldest_first(tmp_path):
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "user", "content": "first older"},
+            {"role": "assistant", "content": "an answer"},
+            {"role": "user", "content": "second older"},
+            {"role": "user", "content": "newest request"},
+        ],
+    }
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+
+    rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
+
+    query = "newest request Context: first older second older"
+    assert embedder.calls[-1] == [query]
+    assert reranker.calls[0][0] == query
+
+
+def test_only_typed_user_messages_join_the_context(tmp_path):
+    block = HEADER + "\n\nSuggestions:\n- beta: Beta skill\n  path: /skills/beta/SKILL.md"
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "system", "content": block},
+            {"role": "assistant", "content": "an assistant message"},
+            {"role": "user", "content": "typed earlier"},
+            {"role": "system", "content": "a later system message"},
+            {"role": "user", "content": "newest request"},
+        ],
+    }
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+
+    rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
+
+    query = "newest request Context: typed earlier"
+    assert embedder.calls[-1] == [query]
+    assert reranker.calls[0][0] == query
+
+
+def test_the_preceding_context_keeps_only_whole_messages_under_the_cap(tmp_path):
+    cap = router_module.RECENT_CONTEXT_CHARS
+    oldest = "a" * 3000
+    crossing = "b" * (cap - 1000)
+    newest_context = "c" * 2000
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "user", "content": oldest},
+            {"role": "user", "content": crossing},
+            {"role": "user", "content": newest_context},
+            {"role": "user", "content": "request"},
+        ],
+    }
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+
+    rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
+
+    query = "request Context: " + newest_context
+    assert embedder.calls[-1] == [query], (
+        "the scan did not keep whole messages from the newest backwards and stop at the crossing"
+    )
+    assert reranker.calls[0][0] == query
+    assert len(query) < len(oldest) + len(crossing) + len(newest_context)
+
+
+def test_an_oversize_newest_message_is_passed_in_full(tmp_path):
+    cap = router_module.RECENT_CONTEXT_CHARS
+    newest = "q" * (cap + 500)
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "user", "content": "small context"},
+            {"role": "user", "content": newest},
+        ],
+    }
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+
+    rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
+
+    query = newest + " Context: small context"
+    assert embedder.calls[-1] == [query], "the newest message was cut by the context cap"
+    assert reranker.calls[0][0] == query
+
+
+def test_without_a_preceding_typed_message_the_query_is_exactly_the_newest_message(tmp_path):
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "assistant", "content": "an answer with no typed message before it"},
+            {"role": "user", "content": "the newest request"},
+        ],
+    }
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+
+    rewrite(payload, cfg=make_config(tmp_path), embed=embedder, rerank=reranker)
+
+    assert embedder.calls[-1] == ["the newest request"]
+    assert reranker.calls[0][0] == "the newest request"
+
+
+def test_the_recent_context_cap_is_a_module_constant_and_not_a_setting():
+    assert router_module.RECENT_CONTEXT_CHARS == 10_000
+    assert not any("context" in key.lower() for key in DEFAULTS), (
+        "the recent context cap was added as a settings key"
+    )
 
 
 def test_a_content_list_supplies_its_text_parts(tmp_path):
