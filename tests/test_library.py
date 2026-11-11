@@ -26,6 +26,7 @@ from hermes_skill_router.catalog import CatalogRows, strip_catalog  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
 from hermes_skill_router.library import (  # noqa: E402
     CACHE_VERSION,
+    cached_row_count,
     document_text,
     fingerprint,
     load_or_build,
@@ -706,6 +707,243 @@ def test_the_cache_survives_a_second_process(tmp_path):
         "dim": built.dim,
         "fingerprint": built.fingerprint,
     }
+
+
+# ---------------------------------------------------------------------------
+# The partial-view guard: a catalog under half the saved list is never built.
+# ---------------------------------------------------------------------------
+
+
+def refusal_warnings(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "less than half" in record.getMessage()
+    ]
+
+
+def test_a_catalog_under_half_the_saved_rows_is_refused_without_embedding(monkeypatch, tmp_path, caplog):
+    cfg = make_config(tmp_path)
+    saved = load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    cache_file = tmp_path / "index.json"
+    before = cache_file.read_bytes()
+    assert cached_row_count(cfg) == 6
+
+    monkeypatch.setattr(library_module, "_MEMO", {})  # a restarted process
+    arrived = rows_of(2, prefix="saved")
+    embedder = CountingEmbedder()
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        refused = load_or_build(cfg, arrived, embedder)
+
+    assert embedder.calls == 0, "the refused catalog was embedded"
+    assert cache_file.read_bytes() == before, "the refused catalog rewrote the saved index"
+    assert refused.names == saved.names
+    assert refused.descriptions == saved.descriptions
+    assert refused.vectors == saved.vectors
+    assert refused.dim == saved.dim
+    assert refused.fingerprint == saved.fingerprint
+    assert cached_row_count(cfg) == 6
+
+    warnings = refusal_warnings(caplog)
+    assert len(warnings) == 1
+    assert "2 skills" in warnings[0]
+    assert "6-entry" in warnings[0]
+    assert str(cache_file) in warnings[0]
+    assert "Remove" in warnings[0] and "force a rebuild" in warnings[0]
+
+
+def test_removing_the_saved_index_forces_the_next_build(monkeypatch, tmp_path):
+    cfg = make_config(tmp_path)
+    saved = load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    refused = load_or_build(cfg, rows_of(2, prefix="saved"), CountingEmbedder())
+    assert refused.fingerprint == saved.fingerprint
+
+    cache_file = tmp_path / "index.json"
+    cache_file.unlink()
+    embedder = CountingEmbedder()
+    rebuilt = load_or_build(cfg, rows_of(2, prefix="saved"), embedder)
+
+    assert embedder.calls == 1, "removing the cache did not force the rebuild"
+    assert rebuilt.names == ["saved-0000", "saved-0001"]
+    assert rebuilt.fingerprint == fingerprint(rows_of(2, prefix="saved"), cfg)
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["names"] == rebuilt.names
+
+
+def test_each_refused_catalog_logs_its_own_warning(monkeypatch, tmp_path, caplog):
+    cfg = make_config(tmp_path)
+    load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        first = load_or_build(cfg, rows_of(2, prefix="saved"), CountingEmbedder())
+        second = load_or_build(cfg, rows_of(2, prefix="saved"), CountingEmbedder())
+
+    assert first.names == second.names
+    assert len(refusal_warnings(caplog)) == 2, "a refused catalog was warned about only once"
+
+
+@pytest.mark.parametrize(
+    ("count", "prefix", "embed_calls"),
+    [(3, "saved", 1), (5, "saved", 1), (6, "saved", 0), (7, "grown", 1)],
+    ids=["exactly-half", "handful-lost", "unchanged", "grown"],
+)
+def test_a_catalog_at_or_above_half_the_saved_size_is_adopted(
+    monkeypatch, tmp_path, caplog, count, prefix, embed_calls
+):
+    cfg = make_config(tmp_path)
+    load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    arrived = rows_of(count, prefix=prefix)
+    embedder = CountingEmbedder()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        index = load_or_build(cfg, arrived, embedder)
+
+    assert embedder.calls == embed_calls, "a catalog at or above the boundary was not adopted"
+    assert index.names == list(arrived.names)
+    assert index.fingerprint == fingerprint(arrived, cfg)
+    cache = json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))
+    assert cache["names"] == list(arrived.names)
+    assert refusal_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing", "corrupt", "version", "dim", "missing-vector", "extra-name", "fingerprint-type"],
+)
+def test_an_untrusted_cache_is_not_a_saved_list_and_logs_no_refusal(
+    monkeypatch, tmp_path, caplog, tamper
+):
+    cfg = make_config(tmp_path)
+    load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    cache_file = tmp_path / "index.json"
+    if tamper == "missing":
+        cache_file.unlink()
+    elif tamper == "corrupt":
+        cache_file.write_text("{not json", encoding="utf-8")
+    else:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        if tamper == "version":
+            data["version"] = CACHE_VERSION + 1
+        elif tamper == "dim":
+            data["dim"] = data["dim"] + 1
+        elif tamper == "missing-vector":
+            data["vectors"].pop()
+        elif tamper == "extra-name":
+            data["names"].append("ghost")
+        elif tamper == "fingerprint-type":
+            data["fingerprint"] = 17
+        cache_file.write_text(json.dumps(data), encoding="utf-8")
+
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    arrived = rows_of(2, prefix="saved")
+    embedder = CountingEmbedder()
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        rebuilt = load_or_build(cfg, arrived, embedder)
+
+    assert embedder.calls == 1, "an untrusted cache was treated as a saved list"
+    assert rebuilt.names == list(arrived.names)
+    assert rebuilt.fingerprint == fingerprint(arrived, cfg)
+    assert refusal_warnings(caplog) == []
+
+
+def test_an_empty_catalog_is_refused_only_by_a_direct_library_call(monkeypatch, tmp_path, caplog):
+    cfg = make_config(tmp_path)
+    saved = load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    embedder = CountingEmbedder()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        refused = load_or_build(cfg, CatalogRows(), embedder)
+
+    assert embedder.calls == 0
+    assert refused.names == saved.names
+    warnings = refusal_warnings(caplog)
+    assert len(warnings) == 1
+    assert "0 skills" in warnings[0] and "6-entry" in warnings[0]
+
+
+def test_cached_row_count_reports_the_saved_list_and_zero_without_one(tmp_path):
+    cfg = make_config(tmp_path)
+    assert cached_row_count(cfg) == 0
+
+    load_or_build(cfg, rows_of(4, prefix="saved"), CountingEmbedder())
+
+    assert cached_row_count(cfg) == 4
+
+
+GUARD_PROCESS = """
+import json
+import logging
+import sys
+
+from hermes_skill_router.catalog import CatalogRows
+from hermes_skill_router.config import load
+from hermes_skill_router.library import load_or_build
+
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def embed(cfg, texts):
+    raise SystemExit("the guard embedded a refused catalog")
+
+
+capture = Capture()
+logging.getLogger("hermes_skill_router.library").addHandler(capture)
+cfg = load({"cachePath": sys.argv[1]})
+rows = CatalogRows(tuple(json.loads(sys.argv[2])), tuple(json.loads(sys.argv[3])))
+index = load_or_build(cfg, rows, embed)
+print(json.dumps({
+    "names": index.names,
+    "descriptions": index.descriptions,
+    "dim": index.dim,
+    "fingerprint": index.fingerprint,
+    "warnings": capture.messages,
+}))
+"""
+
+
+def test_the_guard_survives_a_restart_and_warns_in_the_fresh_process(tmp_path):
+    cfg = make_config(tmp_path)
+    saved = load_or_build(cfg, rows_of(6, prefix="saved"), CountingEmbedder())
+    cache_file = tmp_path / "index.json"
+    before = cache_file.read_bytes()
+    arrived = rows_of(2, prefix="saved")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            GUARD_PROCESS,
+            str(cache_file),
+            json.dumps(list(arrived.names)),
+            json.dumps(list(arrived.descriptions)),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    answer = json.loads(result.stdout)
+    assert answer["names"] == saved.names
+    assert answer["descriptions"] == saved.descriptions
+    assert answer["dim"] == saved.dim
+    assert answer["fingerprint"] == saved.fingerprint
+    assert len(answer["warnings"]) == 1, answer["warnings"]
+    warning = answer["warnings"][0]
+    assert "2 skills" in warning and "6-entry" in warning and str(cache_file) in warning
+    assert "Remove" in warning and "force a rebuild" in warning
+    assert cache_file.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

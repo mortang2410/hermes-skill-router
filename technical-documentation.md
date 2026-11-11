@@ -46,6 +46,13 @@ a routed skill, the model, the endpoint, or the description clip rebuilds it. A 
 alone leaves it intact, and the cache is reused across sessions and across turns. The catalog is
 frozen per Hermes session, so a session start normally reuses the cache.
 
+A catalog that arrives with fewer than half the rows of the saved index is a different case: the
+plugin treats it as a truncated view rather than an edit. The build is refused before it embeds
+anything, the saved index and its vectors stay in place, and the turn routes from them. One warning
+per refused catalog names the arrived count, the saved count and the cache path, and it names the
+recovery: remove the cache file to force a rebuild. The trade is deliberate: a real catalog shrink of
+more than half keeps routing against the saved list until that file is removed.
+
 ## The request rewrite and the prompt block
 
 The plugin removes the whole `## Skills` section from the first system message: the heading, the
@@ -309,7 +316,7 @@ partition is computed per request from the catalog rows.
 | `maxSuggestions` | `10` | 0..50 | Cap on suggested rows, applied once in the selector. Zero means unlimited. |
 | `maxDisplayNames` | `12` | 1..50 | Names the desktop pane and the TUI widget list. The count stays visible when collapsed. |
 | `maxDescriptionChars` | `400` | 3..4000 | Description characters kept per row, in the block and the embedding text. Part of the index fingerprint. |
-| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory. |
+| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. |
 | `showSuggestions` | `true` | boolean | Let the display read the last suggestion names. False stops the record and removes an existing one. |
 | `suggestionsPath` | `~/.cache/hermes-skill-router/suggestions.json` | path, empty disables the record | Display record both surfaces read. Names only, never request text. |
 | `healthCheckMs` | `60000` | 0..3600000 | Minimum gap between probes of an endpoint that failed. Zero probes every request. |
@@ -556,6 +563,20 @@ budget logs one line naming that budget, `routing budget <n> ms exhausted`, and 
 pass. After a failure the endpoint is not probed again until `healthCheckMs` has passed, so a stopped
 service costs one attempt per window instead of one timeout per request. A cache write failure is
 logged once and the in-memory index is still used.
+
+A catalog under half the saved size is not one of those failures. When the routed rows number fewer
+than half the rows in the saved index at `cachePath`, the build is refused: nothing is embedded, the
+cache file is left untouched, and the plugin routes from the saved index instead. Suggestions and
+their read paths come from the saved rows, including a name the arrived catalog does not carry,
+because the saved index stores no paths and the host lookup resolves them again. The refusal logs one
+warning per refused catalog, naming the arrived count, the saved count and the cache path, and it
+says to remove the cache file to force a rebuild. The trade is deliberate: a real catalog shrink of
+more than half keeps routing against the saved list until someone removes the file. A catalog whose
+routed rows number at least half the saved rows is adopted as before, including growth, a handful of
+lost rows and an unchanged catalog. A missing, corrupt, wrong-version or wrong-shaped cache is not a
+saved list, so the build proceeds and no refusal warning is logged. A turn whose routed catalog is
+empty returns the request unchanged before the index is touched, so the guard's zero case is reached
+only by a direct library call.
 
 `skill_view` and `skills_list` are never touched. The model can open any name the block lists, and
 the background review can still list and open every skill.

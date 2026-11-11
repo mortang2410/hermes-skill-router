@@ -627,6 +627,87 @@ def test_every_rendered_suggestion_carries_its_absolute_read_path(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The partial-view guard: a refused catalog routes from the saved list.
+# ---------------------------------------------------------------------------
+
+
+def seed_saved_index(cfg, index=None):
+    """Write a saved index the way a previous process' cache write would have."""
+    library_module._write_cache(cfg, index or make_index())
+    return Path(cfg.cache_path)
+
+
+def test_a_refused_catalog_suggests_from_the_saved_list_with_a_resolved_path(tmp_path, caplog):
+    cfg = make_config(tmp_path, cachePath=str(tmp_path / "index.json"))
+    cache_file = seed_saved_index(cfg)
+    before = cache_file.read_bytes()
+    embedder = FakeEmbedder()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        result = rewrite(
+            _payload(rows=(("alpha", "Alpha skill"),)),
+            cfg=cfg,
+            embed=embedder,
+            rerank=FakeReranker(),
+        )
+
+    assert result is not None
+    lines = block_of(result).split("\n")
+    assert "- gamma: Gamma skill" in lines, "a saved row outside the arrived catalog was not suggested"
+    assert "  path: /skills/gamma/SKILL.md" in lines
+    assert "- beta: Beta skill" in lines
+    assert embedder.calls == [[QUERY]], "the refused catalog was embedded"
+    assert cache_file.read_bytes() == before, "the refused catalog rewrote the saved index"
+    assert "gamma" in record_for(cfg)["names"]
+    assert any("less than half" in message for message in caplog.messages)
+
+
+def test_a_saved_row_whose_path_does_not_resolve_is_not_emitted(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path, cachePath=str(tmp_path / "index.json"))
+    seed_saved_index(cfg)
+    monkeypatch.setattr(
+        router_module,
+        "skill_path",
+        lambda name: None if name == "gamma" else f"/skills/{name}/SKILL.md",
+    )
+
+    result = rewrite(
+        _payload(rows=(("alpha", "Alpha skill"),)),
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+
+    assert result is not None
+    assert "gamma" not in block_of(result)
+    assert "- beta: Beta skill" in block_of(result).split("\n")
+
+
+def test_a_turn_with_no_routed_rows_stays_unchanged_against_a_larger_saved_cache(
+    tmp_path, caplog
+):
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        eagerSkills=[name for name, _description in ROWS],
+    )
+    cache_file = seed_saved_index(cfg)
+    before = cache_file.read_bytes()
+    payload = _payload()
+    snapshot = copy.deepcopy(payload)
+    embedder = FakeEmbedder()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.library"):
+        result = rewrite(payload, cfg=cfg, embed=embedder, rerank=FakeReranker())
+
+    assert result is None
+    assert payload == snapshot
+    assert embedder.calls == []
+    assert cache_file.read_bytes() == before
+    assert not any("less than half" in message for message in caplog.messages)
+
+
+# ---------------------------------------------------------------------------
 # The record: selected names only, capped and namespaced by turn.
 # ---------------------------------------------------------------------------
 

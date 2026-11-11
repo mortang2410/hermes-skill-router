@@ -17,6 +17,12 @@ even though it cannot change one vector. A change to a kept row cannot change it
 row is part of the hash. The cache is trusted only when its ``version``, ``fingerprint`` and ``dim``
 match; vectors from another model or another endpoint would rank the wrong skills.
 
+A saved index that disagrees with the arriving catalog is a normal edit and is rebuilt, but a
+catalog holding fewer than half the rows of the saved index is not treated as an edit: a truncated
+catalog read would replace a full index with a handful of rows, so the build refuses that catalog,
+keeps the file, and routes from the saved index. The refusal logs one warning per refused catalog
+naming both counts and the cache path, and removing the file forces the rebuild (R6).
+
 A warm start must not touch the network, so a built index is memoised per fingerprint behind a
 lock: two concurrent requests on a cold cache embed the library once, and the second one waits for
 the first rather than repeating its work. A cold build sends the rows in batches of
@@ -94,26 +100,38 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
 
     Returns ``None`` when there is nothing to index or any embeddings chunk failed, in which case
     the request stays as it arrived. A cache write failure is logged once and the in-memory index
-    is still returned.
+    is still returned. A catalog holding fewer than half the rows of the saved index is refused
+    before anything is embedded or written: the saved index is returned unchanged and one warning
+    names both counts and the cache path (R6).
     """
     unique = _unique(rows)
-    if not unique:
-        return None
     key = _fingerprint(unique, cfg)
     with _MEMO_LOCK:
+        saved = _read_saved(cfg)
+        if saved is not None and len(unique) * 2 < len(saved.names):
+            _warn_refusal(cfg, len(unique), len(saved.names))
+            return saved
+        if not unique:
+            return None
         memo = _MEMO.get(key)
         if memo is not None:
             return memo
-        cached = _read_cache(cfg, key, len(unique))
-        if cached is not None:
-            _MEMO[key] = cached
-            return cached
+        if saved is not None and saved.fingerprint == key and len(saved.names) == len(unique):
+            _MEMO[key] = saved
+            return saved
         index = _build(unique, _embed_rows(cfg, unique, embedder), key)
         if index is None:
             return None
         _write_cache(cfg, index)
         _MEMO[key] = index
         return index
+
+
+def cached_row_count(cfg: Config) -> int:
+    """Return the row count of the saved index, or ``0`` when there is no usable saved index."""
+    with _MEMO_LOCK:
+        saved = _read_saved(cfg)
+    return len(saved.names) if saved is not None else 0
 
 
 def shortlist(index: Index, query_vector: Sequence[float], limit: int) -> List[Tuple[str, str]]:
@@ -243,8 +261,14 @@ def _cache_path(cfg: Config) -> Optional[str]:
     return os.path.expanduser(raw)
 
 
-def _read_cache(cfg: Config, key: str, count: int) -> Optional[Index]:
-    """Return the cached index when it matches *key* and its own shape, otherwise ``None``."""
+def _read_saved(cfg: Config) -> Optional[Index]:
+    """Return the saved index when the cache file is usable, otherwise ``None``.
+
+    A missing, unreadable, wrong-version or wrong-shaped file is not a saved list, so the caller
+    proceeds with the build exactly as it did before the guard existed. A usable file is returned
+    under its own stored fingerprint, because a refused catalog keeps routing on the saved
+    identity rather than on the one the arrived rows would produce.
+    """
     path = _cache_path(cfg)
     if path is None:
         return None
@@ -261,7 +285,10 @@ def _read_cache(cfg: Config, key: str, count: int) -> Optional[Index]:
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("version") != CACHE_VERSION or data.get("fingerprint") != key:
+    if data.get("version") != CACHE_VERSION:
+        return None
+    saved_fingerprint = data.get("fingerprint")
+    if not isinstance(saved_fingerprint, str) or not saved_fingerprint:
         return None
     dim = data.get("dim")
     if isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0:
@@ -273,7 +300,7 @@ def _read_cache(cfg: Config, key: str, count: int) -> Optional[Index]:
         return None
     if not isinstance(vectors, list):
         return None
-    if not len(names) == len(descriptions) == len(vectors) == count:
+    if not len(names) == len(descriptions) == len(vectors):
         return None
     if not all(isinstance(name, str) for name in names):
         return None
@@ -293,7 +320,24 @@ def _read_cache(cfg: Config, key: str, count: int) -> Optional[Index]:
         descriptions=list(descriptions),
         vectors=parsed,
         dim=dim,
-        fingerprint=key,
+        fingerprint=saved_fingerprint,
+    )
+
+
+def _warn_refusal(cfg: Config, arrived: int, saved: int) -> None:
+    """Log one warning per refused catalog, naming both counts and the file to remove.
+
+    Deliberately not deduplicated: each refused catalog is reported, so a catalog that is still
+    truncated on the next turn is still visible to an operator.
+    """
+    path = _cache_path(cfg)
+    logger.warning(
+        "skill index: the catalog read returned %d skills, less than half of the %d-entry "
+        "saved index, so it is a partial view; the saved index is reused rather than replaced. "
+        "Remove %s to force a rebuild if the catalog really did shrink this far",
+        arrived,
+        saved,
+        path,
     )
 
 
