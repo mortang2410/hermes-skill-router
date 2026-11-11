@@ -116,6 +116,8 @@ still returning cosine.
    It serves `POST /v1/embeddings` and `GET /health` on `127.0.0.1:8012`. No reranker is bundled, so
    point `rerankBaseUrl` at any service that answers the rerank protocol in the technical
    documentation. Both base URLs must be bare origins.
+   [default-models.md](default-models.md) covers the two default models, how to download them, and
+   three ways to serve the embedder and the reranker.
 
 5. Check both health routes, then run one turn and read its dump:
 
@@ -197,4 +199,7 @@ Every other key, with its bound and its effect, is in the
 - [technical-documentation.md](technical-documentation.md) covers routing end to end, the request
   rewrite, the suggestion record schema, both display protocols, every setting, both endpoint
   protocols, failure behaviour, the measured effect and the tests.
+- [default-models.md](default-models.md) covers the default embedder and reranker models, how to
+  download them, how to serve each one, how to check the endpoints answer, and what the plugin does
+  when an endpoint is down.
 - [LICENSE](LICENSE) is the MIT license.
