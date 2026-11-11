@@ -15,8 +15,10 @@ The rewrite runs six steps for one Chat Completions request:
    nearest to it by cosine similarity.
 4. Send those candidates to the rerank endpoint, one document per candidate, in the rerank document
    format `documentPrefix + name + " - " + description`.
-5. Keep the candidates whose rerank score is at or above `cutoff`, sort them by score, and cap them
-   at `maxSuggestions`.
+5. Resolve every reranked candidate's read path through the host lookup the `skill_view` resolver
+   uses, recover the names the request's own earlier blocks already suggested, then keep the
+   candidates that are not suppressed, score at or above `cutoff` and carry a path, sort them by
+   score, and cap them at `maxSuggestions`. A cap of `0` means unlimited.
 6. Render the block with those suggestions and the kept rows, and append it as one system message.
 
 The model can also search the catalog the prompt showed. The plugin registers one tool,
@@ -25,10 +27,11 @@ shortlist, rerank, cutoff and cap, and returns `{"skills": [{"name", "descriptio
 prompt's shortlist is already in front of the model, so the tool description tells it not to call the
 tool for those rows. A search runs inside `routingTimeoutMs` and finds the index the turn already
 built; it writes the same display record with origin `search`, so both surfaces show it. The tool
-never searches the skill library for candidates: it asks the host lookup for the `SKILL.md` path of
-each row it already selected, at most `maxSuggestions` lookups per call. A session with no parsed
-catalog answers `no-catalog`, and with `showSuggestions` off the record stays hidden exactly as for a
-turn.
+never searches the skill library for candidates: it resolves every reranked candidate's `SKILL.md`
+path through the host lookup before the cut, at most `shortlistSize` lookups per call, and drops a
+name the lookup refuses before the cap counts rows, so the next admissible row takes its slot. A
+session with no parsed catalog answers `no-catalog`, and with `showSuggestions` off the record stays
+hidden exactly as for a turn.
 
 The persisted index at `cachePath` is keyed by a fingerprint of every routed row's text and full
 description, `embedModelId`, the document format version, and `embedBaseUrl + embedPath`. A change to
@@ -90,26 +93,47 @@ The one-shot header keeps that restriction: do not load general process skills f
 know, and do not create or edit skills, because a one-shot run has no later session to reuse them.
 The normal header invites a load for any partially relevant skill. Both headers carry the skill-use
 guidance the removed prose provided, including the call to `skills_list` when none of the suggestions
-fits.
+fits, and both name the loader tools `skill_view` and `skills_list`.
 
-Below the header the block carries the selected suggestions, best first. The opening block of a
-compaction window adds the kept rows under an `Also listed:` marker, and a later turn in that window
-carries the suggestions only:
+Below the header the block carries the selected suggestions, best first. Every suggestion carries its
+name, its description and the absolute read path the host lookup resolved. The opening block of a
+compaction window adds the pinned rows in their own section, and a later turn in that window carries
+the suggestions only:
 
 ```
+Suggestions:
 - <suggested name>: <description>
+  path: <absolute path to the skill's SKILL.md>
 - <suggested name with no description>
+  path: <absolute path to the skill's SKILL.md>
+
+Pinned skills:
+- <pinned name>: <description>
+  path: <absolute path to the skill's SKILL.md>
 
 Also listed:
 - <kept name>: <description>
 ```
 
-Each row is one line. Descriptions are collapsed to one line and clipped to `maxDescriptionChars`. A
-row that has no description is listed as `- name`, which is how demoted `[names only]` rows and a
-suggested name the index no longer carries appear. A name that is both kept and suggested appears
-only once, as a suggestion, in the opening block that lists it. `maxSuggestions` caps suggested rows
-alone, so a value of `0` suggests nothing while the opening block still lists every kept row. A later
-turn in the same window carries suggestions only.
+Every suggestion and every pinned row carries the file `skill_view` opens. A suggestion whose path
+does not resolve is not emitted, and the selector has already dropped it before the cap counted rows,
+so the next admissible candidate takes the slot. A pinned row whose path does not resolve is omitted
+with one warning per process. Kept rows that are neither pinned nor suggested keep their earlier shape
+under `Also listed:`: `- name: description`, or `- name` for a demoted `[names only]` row, and they
+carry no path. Descriptions are collapsed to one line and clipped to `maxDescriptionChars`; a
+suggestion the index no longer describes is listed as `- name` and still carries its path.
+
+The cap is applied once, in the selector. `maxSuggestions` defaults to `10` and accepts `0` to `50`,
+and `0` means unlimited: the renderer lists every row it is handed. The same selector drops a name
+that the request's own earlier blocks already suggested, so a later turn in the same compaction
+window never repeats it. A request whose messages carry no earlier block is the window's opening block
+and lists the pinned rows; a request carrying an earlier block omits them; a request whose earlier
+block a compaction removed starts a new window and lists them again. A name that is both kept and
+suggested appears only once, as a suggestion.
+
+The first line of the block is a marker, not the removed `## Skills` heading, so a request dump shows
+whether the plugin ran. The rewrite reads a prior block back with the renderer's own recogniser, which
+returns the names in the suggestions section only, never a pinned or also-listed name.
 
 The strip and the injection are atomic. The plugin removes the section only when it can replace it
 with a non-empty block, so a request with no suggestion and no kept row keeps its original section
@@ -241,9 +265,10 @@ request.
 partition is computed per request from the catalog rows.
 
 - `eagerSkills` names skills that are listed once, in the opening block of a compaction window,
-  under `Also listed:`, and that are never routed. A later turn in the window carries the suggestions
-  only, and the next window opens with them again. Example: `eagerSkills: [writing-for-agents]` keeps
-  that skill in that opening block and out of the index, the rerank call and the display record.
+  under `Pinned skills:`, each with its name, description and read path, and that are never routed. A
+  later turn in the window carries the suggestions only, and the next window opens with them again.
+  Example: `eagerSkills: [writing-for-agents]` keeps that skill in that opening block and out of the
+  index, the rerank call and the display record.
 - `deferredSkills` names the routable pool. An empty list, the default, means every skill that is not
   eager is routable. A non-empty list restricts routing to the named skills and leaves every other
   skill listed. Example: `deferredSkills: [github-pr-workflow, code-review]` suggests only those two
@@ -259,7 +284,7 @@ partition is computed per request from the catalog rows.
 | Key | Default | Bound | Effect |
 | --- | --- | --- | --- |
 | `enabled` | `true` | boolean | Master switch. False leaves every request untouched. |
-| `eagerSkills` | empty | list of skill names | Skills listed once in each compaction window's opening block under `Also listed:`, and never routed. A name in both lists is eager. |
+| `eagerSkills` | empty | list of skill names | Skills listed once in each compaction window's opening block under `Pinned skills:`, with name, description and read path, and never routed. A name in both lists is eager. |
 | `embedBaseUrl` | `http://127.0.0.1:8012` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Embeddings endpoint root. A rejected value falls back to the default with one warning. |
 | `embedPath` | `/v1/embeddings` | path starting with `/` | Path appended to `embedBaseUrl`. |
 | `embedModelId` | `bge-m3` | non-empty string | `model` field sent to the embeddings endpoint. Part of the index fingerprint, so a change rebuilds the cache. |
@@ -274,7 +299,7 @@ partition is computed per request from the catalog rows.
 | `routingTimeoutMs` | `30000` | 1000..60000 | Whole routing pass budget, from the query embed through the rerank reply. It starts after the index is loaded or built, so the cold build is never cut, and each per-request timeout is capped at the time left. On expiry the request keeps the bare catalog and gets no suggestions. |
 | `shortlistSize` | `50` | 1..383 | Candidates carried from embeddings into rerank. |
 | `cutoff` | `0.01` | 0..1 | Rerank `relevance_score` a candidate needs, compared inclusively. |
-| `maxSuggestions` | `8` | 0..50 | Hard cap on suggested rows. Zero selects none while kept rows are still listed. |
+| `maxSuggestions` | `10` | 0..50 | Cap on suggested rows, applied once in the selector. Zero means unlimited. |
 | `maxDisplayNames` | `12` | 1..50 | Names the desktop pane and the TUI widget list. The count stays visible when collapsed. |
 | `maxDescriptionChars` | `400` | 3..4000 | Description characters kept per row, in the block and the embedding text. Part of the index fingerprint. |
 | `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory. |

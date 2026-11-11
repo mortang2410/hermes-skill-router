@@ -11,21 +11,34 @@ the spec's order of work and nothing else:
    over the index vectors (:mod:`hermes_skill_router.embed`).
 4. Rerank ``cfg.document_prefix + name + " - " + description`` for those rows
    (:mod:`hermes_skill_router.rerank`).
-5. Select with ``cfg.cutoff`` and ``cfg.max_suggestions`` (:mod:`hermes_skill_router.select`).
-6. Render the block with the selected rows, the kept rows and the index
+5. Resolve every reranked candidate's read path through the host lookup (:mod:`hermes_skill_router.tools`)
+   and recover the names the request's own earlier blocks already suggested, plus whether this is a
+   compaction window's opening block.
+6. Select with the suppressed set, the path map, ``cfg.cutoff`` and ``cfg.max_suggestions``
+   (:mod:`hermes_skill_router.select`), so a suppressed or pathless candidate never spends a cap slot.
+7. Render the block with the selected rows, the kept rows, the path map and the opening flag
    (:mod:`hermes_skill_router.inject`), and append it as one new ``system`` message at the end.
 
 The strip is atomic with the injection: a request only loses its skills section when a non-empty
-block replaces it. Any failure — an unreachable or timed-out endpoint, an unbuildable index, no
-user text, an empty block — returns ``None``, and ``_apply_request_chain`` then keeps the payload
+block replaces it. Any failure, such as an unreachable or timed-out endpoint, an unbuildable index,
+no user text or an empty block, returns ``None``, and ``_apply_request_chain`` then keeps the payload
 that arrived, catalog included (R5, D8). The rewrite never raises and never mutates its input.
 
-Steps 3 to 5 are :func:`hermes_skill_router.search.rank`, the same pass the model's search tool
-runs, so a turn and a search for the same query and catalog can never disagree. The pass runs inside
-one routing budget, ``cfg.routing_timeout_ms``, which starts after the index is in hand and never
-covers the cold build, which embeds the whole catalog in batches and already fails through its own
-path. Each per-request timeout is capped by the milliseconds left, so the pass cannot outlive the
-budget, and a pass that reaches the end of it is abandoned with one log line naming the budget.
+Steps 3 and 4 are :func:`hermes_skill_router.search.rank`, the same pass the model's search tool
+runs, so a turn and a search for the same query and catalog can never disagree. The pass hands back
+every reranked candidate uncapped and applies neither the cutoff nor the cap; those are applied once,
+in the selector, after every candidate's read path has been resolved. The pass runs inside one routing
+budget, ``cfg.routing_timeout_ms``, which starts after the index is in hand and never covers the cold
+build, which embeds the whole catalog in batches and already fails through its own path. Each
+per-request timeout is capped by the milliseconds left, so the pass cannot outlive the budget, and a
+pass that reaches the end of it is abandoned with one log line naming the budget.
+
+Suppression and the opening flag both come from the payload's own messages, never from module state.
+A message whose content opens with the block's shared first line is a block this plugin injected
+earlier in the compaction window: its suggested names are suppressed, and its presence means this is
+not the window's opening block. A compaction that removes the block leaves neither, so the names are
+suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
+the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
 
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
 request clears the previous one first, so a search never ranks rows from an earlier prompt (D10).
@@ -53,16 +66,18 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .catalog import strip_catalog
 from .config import Config
 from .display import INERT, ROUTED, record
 from .embed import embed_texts as default_embed
-from .inject import HEADER, render
+from .inject import HEADER, render, suggested_names
 from .library import Index, load_or_build
 from .rerank import rerank as default_rerank
 from .search import Ranked, forget_session, rank, remember_partition
+from .select import Suggestion, select
+from .tools import skill_path
 
 logger = logging.getLogger(__name__)
 
@@ -203,9 +218,32 @@ def _compose(
         _log_once(ranked.detail)
         inert()
         return None
-    _log_decision(cfg, query, ranked)
+    # The payload's own prior blocks decide both what this turn must not repeat and whether the
+    # pinned rows belong here. Nothing is remembered between calls.
+    previous = _prior_blocks(messages)
+    suppressed = {name for block in previous for name in suggested_names(block)}
+    eager = set(cfg.eager_skills or ())
+    wanted = [name for name, _score in ranked.candidates]
+    wanted.extend(name for name in partition.kept.names if name in eager)
+    paths = _resolve_paths(wanted)
+    selected = select(
+        [score for _name, score in ranked.candidates],
+        [name for name, _score in ranked.candidates],
+        cfg,
+        paths,
+        suppressed,
+    )
+    _log_decision(cfg, query, ranked, selected)
     # The partition's variant chooses the header, so the block matches the prose this request lost.
-    block = render(ranked.rows, partition.kept, index, cfg, partition.one_shot)
+    block = render(
+        selected,
+        partition.kept,
+        index,
+        cfg,
+        partition.one_shot,
+        opening=not previous,
+        paths=paths,
+    )
     if not block:
         # No selected suggestion and no kept row: stripping without a replacement would lose the
         # catalog for nothing, so the whole request is returned untouched.
@@ -218,7 +256,7 @@ def _compose(
             {"role": "system", "content": block},
         ],
     }
-    _recorder(cfg, ROUTED, [name for name, _score in ranked.rows], session_id, turn_id, notify)()
+    _recorder(cfg, ROUTED, [name for name, _score in selected], session_id, turn_id, notify)()
     return {"request": rewritten}
 
 
@@ -253,6 +291,44 @@ def _already_injected(messages: Any) -> bool:
     last = messages[-1]
     content = last.get("content") if isinstance(last, Mapping) else None
     return isinstance(content, str) and content.startswith(INJECTED_HEADER)
+
+
+def _prior_blocks(messages: Any) -> List[str]:
+    """Return the text of every message that opens with the block's shared first line.
+
+    Only a message that opens with that line counts, so user text that merely mentions a skill name,
+    or quotes the marker later in a line, never seeds the suppressed set. The returned blocks are the
+    payload's own record of what earlier turns in this compaction window showed.
+    """
+    blocks: List[str] = []
+    if not isinstance(messages, list):
+        return blocks
+    for message in messages:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.startswith(INJECTED_HEADER):
+            blocks.append(content)
+    return blocks
+
+
+def _resolve_paths(names: Sequence[str]) -> Dict[str, str]:
+    """Resolve every candidate's and pinned name's read path before the selector cuts.
+
+    The host lookup is the resolver ``skill_view`` uses, so the path a row carries is the file the
+    model can open. A name the lookup refuses, or a lookup that raises, costs that row its slot and
+    never the whole block. Repeated names are looked up once.
+    """
+    paths: Dict[str, str] = {}
+    for name in names:
+        if name in paths:
+            continue
+        try:
+            path = skill_path(name)
+        except Exception:  # the host lookup never raises, but the block must not depend on it
+            logger.debug("skill router: the path lookup for %r raised", name, exc_info=True)
+            path = None
+        if path:
+            paths[name] = str(path)
+    return paths
 
 
 def _recorder(
@@ -300,16 +376,19 @@ def _broadcast(turn_id: str) -> None:
     broadcast_plugin_event(PLUGIN_ID, EVENT, {"turn_id": turn_id})
 
 
-def _log_decision(cfg: Config, query: str, ranked: Ranked) -> None:
+def _log_decision(
+    cfg: Config, query: str, ranked: Ranked, selected: Sequence[Suggestion]
+) -> None:
     """Write the one decision line for a completed pass.
 
     The line carries the query as a JSON string, every shortlisted candidate with the score the
     selector compared, the cutoff, the suggestions and the three stage timings. It is the only place
-    the plugin logs the user's text; a warning never carries it. Candidates the cutoff rejected stay
-    in the line with their scores, so a name missing from the block still has an answer.
+    the plugin logs the user's text; a warning never carries it. Candidates the cutoff, the suppressed
+    set or an unresolved path rejected stay in the line with their scores, so a name missing from the
+    block still has an answer.
     """
     candidates = ",".join(f"{name}:{score!r}" for name, score in ranked.candidates) or "-"
-    suggestions = ",".join(f"{name}:{score!r}" for name, score in ranked.rows) or "-"
+    suggestions = ",".join(f"{name}:{score!r}" for name, score in selected) or "-"
     logger.info(
         "skill router: query=%s candidates=%s cutoff=%r suggestions=%s "
         "embed_ms=%.1f rerank_ms=%.1f total_ms=%.1f",

@@ -77,7 +77,8 @@ _SPECS: Tuple[_Spec, ...] = (
     _Spec("routingTimeoutMs", "routing_timeout_ms", "int", 30000, 1000, 60000),
     _Spec("shortlistSize", "shortlist_size", "int", 50, 1, 383),
     _Spec("cutoff", "cutoff", "float", 0.01, 0.0, 1.0),
-    _Spec("maxSuggestions", "max_suggestions", "int", 8, 0, 50),
+    # Zero means unlimited at every reader, never "select nothing".
+    _Spec("maxSuggestions", "max_suggestions", "int", 10, 0, 50),
     _Spec("maxDisplayNames", "max_display_names", "int", 12, 1, 50),
     _Spec("maxDescriptionChars", "max_description_chars", "int", 400, 3, 4000),
     _Spec("cachePath", "cache_path", "file_path", "~/.cache/hermes-skill-router/index.json"),

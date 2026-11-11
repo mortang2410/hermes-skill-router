@@ -148,6 +148,15 @@ def budget_warnings(caplog):
     ]
 
 
+@pytest.fixture(autouse=True)
+def _host_paths(monkeypatch):
+    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
+    resolver = lambda name: f"/skills/{name}/SKILL.md"
+    for module_name, module in list(sys.modules.items()):
+        if module_name.endswith("router") and hasattr(module, "skill_path"):
+            monkeypatch.setattr(module, "skill_path", resolver)
+
+
 def test_a_stub_endpoint_that_answers_past_the_budget_falls_back_with_one_budget_line(
     tmp_path, caplog, budget_reset
 ):

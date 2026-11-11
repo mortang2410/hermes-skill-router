@@ -135,6 +135,15 @@ class RecordingContext:
         self.tools.append(kwargs)
 
 
+@pytest.fixture(autouse=True)
+def _host_paths(monkeypatch):
+    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
+    resolver = lambda name: f"/skills/{name}/SKILL.md"
+    for module_name, module in list(sys.modules.items()):
+        if module_name.endswith("router") and hasattr(module, "skill_path"):
+            monkeypatch.setattr(module, "skill_path", resolver)
+
+
 def test_register_tools_declares_one_required_query_parameter():
     ctx = RecordingContext(settings(Path("/tmp")))
 
@@ -262,7 +271,7 @@ def test_show_suggestions_false_returns_rows_and_hides_the_record(tmp_path, monk
     record(visible, status=display.ROUTED, origin=display.TURN, names=["old"])
     monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
     monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
-    monkeypatch.setattr(tools_module, "skill_path", lambda name: None)
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
 
     answer = json.loads(handle({"query": QUERY}, settings=hidden, session_id="session-1"))
 
@@ -279,7 +288,7 @@ def test_a_refused_removal_still_returns_rows_and_the_pane_stays_idle(
     record(visible, status=display.ROUTED, origin=display.TURN, names=["old"])
     monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
     monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
-    monkeypatch.setattr(tools_module, "skill_path", lambda name: None)
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
     monkeypatch.setattr(
         display.os,
         "unlink",
@@ -305,7 +314,7 @@ def test_a_double_failure_keeps_the_old_file_and_the_pane_stays_idle(
     record(visible, status=display.ROUTED, origin=display.TURN, names=["old"])
     monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
     monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
-    monkeypatch.setattr(tools_module, "skill_path", lambda name: None)
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
     monkeypatch.setattr(
         display.os, "unlink", lambda *a, **k: (_ for _ in ()).throw(OSError("busy"))
     )
@@ -335,7 +344,7 @@ def test_a_failed_record_write_leaves_the_previous_record_and_no_sibling(
     before = (tmp_path / "suggestions.json").read_text()
     monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
     monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
-    monkeypatch.setattr(tools_module, "skill_path", lambda name: None)
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
     monkeypatch.setattr(display.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
 
     answer = json.loads(

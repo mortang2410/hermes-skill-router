@@ -1,53 +1,64 @@
 """The injected skills block (module M8, contract C8).
 
-The block replaces the catalog section the plugin removes, so it carries two things: the skills the
-router selected for this turn, best first, and the kept rows that must stay visible (eager skills
-and rows a non-empty deferred list leaves listed). A selected row carries only its name and score;
-the description is looked up in the index by name, so the row itself can never smuggle text into the
-prompt and no description is carried twice. A name that appears in both lists is rendered once, as
-a suggestion.
+The block replaces the catalog section the plugin removes, so it carries the skills the router
+selected for this turn, best first, and the kept rows that must stay visible: the pinned eager skills
+and the rows a non-empty deferred list leaves listed. The block is also its own recogniser: the rewrite
+scans a request's messages for a block by the shared first line and recovers the names it suggested
+with :func:`suggested_names`, so a later turn in the same compaction window does not repeat them and a
+compaction that removes the block makes them suggestable again.
 
-Each row is one line: ``- name: description`` with the description collapsed to a single line and
-clipped to ``cfg.max_description_chars``, or ``- name`` when there is no description at all (a
-demoted ``[names only]`` row, or a suggested name the index no longer carries). Kept rows follow
-under an ``Also listed:`` marker, so stripping the catalog never drops a name the model can still
-open with ``skill_view``.
+Every suggestion row carries three fields: its name, its description and the absolute read path the
+host lookup resolved, so the model can open the file the resolver ``skill_view`` uses:
 
-The header is fixed text, not a summary: it says these are the skills that may help, tells the model
-to open one with ``skill_view`` and to call ``skills_list`` when none fits, and carries the
-instructions the removed ``## Skills`` prose gave about loading a relevant skill rather than
-guessing. Its first line is a marker line rather than the removed ``## Skills`` heading, so a
-stripped request carries no heading by that name and the block is recognisable in a request dump.
-The first line is shared by both headers, so the rewrite recognises its own block by that prefix
-whichever variant it injected.
+    Suggestions:
+    - name: description
+      path: /absolute/path/to/SKILL.md
 
-There are two fixed headers, and the ``one_shot`` argument picks one (the rewrite passes
-``Partition.one_shot``). The normal prompt invites the model to
-load a skill that is "even partially relevant"; the single-query prompt instead forbids loading
-general process skills for work already known and forbids creating or editing skills, because a
-one-shot run has no later session to reuse them. Injecting the normal invitation after stripping the
-one-shot prose would tell the model to do exactly what the removed text forbade, so
-:data:`ONE_SHOT_HEADER` keeps that restriction and drops the invitation. Each header is one fixed
-string, exported so the rewrite and the tests can pin it. Nothing else is added: no per-skill hints,
-examples or file paths (D3), names and descriptions only, and ``max_suggestions`` caps suggested
-rows alone, so a cap of zero still lists every kept row.
+A suggestion whose path is missing or not absolute is not emitted: it is a non-success for that row,
+and the selector only hands over rows it could resolve. Pinned rows form their own section, present
+only in the opening block of a compaction window, and carry the same three fields from the kept half of
+the catalog. A pinned row whose path does not resolve is omitted with one warning per process, so the
+block never carries a row the model cannot open. Kept rows that are neither pinned nor suggested keep
+their earlier shape under an ``Also listed:`` marker: ``- name: description``, or ``- name`` for a
+demoted ``[names only]`` row, with no path, because the search tool needs no path for a row the prompt
+already listed.
 
-Skill-maintenance guidance ("fix it with ``skill_manage``", "offer to save the result as a skill")
-is deliberately absent from both headers. The one-shot header goes further and states the rule the
-removed prose carried: do not create or edit skills.
+The description is looked up in the index by name, so a selected row can never smuggle text into the
+prompt and no description is carried twice. A name that appears in two places is rendered once, as a
+suggestion first, then as a pinned row, then as an also-listed row.
 
-The function is pure. Rendering returns ``""`` only when it has no row to show at all, which keeps
-the strip and the injection atomic: a request with no block keeps its catalog byte for byte.
+The header is fixed text, not a summary: it says these are the skills that may help, names the loader
+tools ``skill_view`` and ``skills_list``, and carries the instructions the removed ``## Skills`` prose
+gave about loading a relevant skill rather than guessing. There are two fixed headers, and the
+``one_shot`` argument picks one (the rewrite passes ``Partition.one_shot``). Both share their first
+line, because the rewrite recognises its own prior block by that line. A stripped request carries no
+heading by the name ``## Skills``, and the block never reintroduces it.
+
+Skill-maintenance guidance ("fix it with ``skill_manage``", "offer to save the result as a skill") is
+deliberately absent from both headers. The one-shot header goes further and states the rule the removed
+prose carried: do not create or edit skills.
+
+This module applies no cap. The selector is the only place the cap is applied, so a block handed
+twelve rows renders twelve rows even when ``maxSuggestions`` is 0. The function is pure. Rendering
+returns ``""`` only when it has no row to show at all, which keeps the strip and the injection atomic:
+a request with no block keeps its catalog byte for byte.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Dict, List, Optional, Sequence
 
 from .catalog import CatalogRows
 from .config import Config
 from .library import Index
 from .select import Suggestion
+
+logger = logging.getLogger(__name__)
+
+#: The tools that load a skill. Both stay registered on the host, and both headers name them.
+LOADER_TOOLS = ("skill_view", "skills_list")
 
 #: Fixed header of a normal-turn block. The rewrite recognises its own block by the shared first line.
 #: That first line is deliberately not the removed ``## Skills`` heading: the stripped request must
@@ -77,8 +88,20 @@ ONE_SHOT_HEADER = (
     "when none of these fits, to see every skill available."
 )
 
-#: Marker that separates the suggestions from the rows that stay listed.
+#: Section marker that opens the selected suggestions.
+SUGGESTIONS = "Suggestions:"
+
+#: Section marker that opens the pinned rows, present only in a window's opening block.
+PINNED = "Pinned skills:"
+
+#: Marker that separates the rows that stay listed from the suggestions and pinned rows.
 ALSO_LISTED = "Also listed:"
+
+#: Prefix of the read-path line under a suggestion or pinned row.
+PATH_PREFIX = "  path: "
+
+#: Names whose pinned row was omitted for a missing path, so one warning is logged per process.
+_PINNED_WARNED: set[str] = set()
 
 
 def render(
@@ -87,44 +110,88 @@ def render(
     index: Optional[Index],
     cfg: Config,
     one_shot: bool = False,
+    opening: bool = False,
+    paths: Optional[Dict[str, str]] = None,
 ) -> str:
     """Return the block for *rows*, *kept* and *cfg*, or ``""`` when it would carry no row.
 
     *rows* are the selected suggestions from :func:`hermes_skill_router.select.select`, already
-    capped; the cap is applied again here so ``cfg.max_suggestions`` bounds suggested rows for any
-    caller. *kept* is the kept half of the catalog partition. *one_shot* is
-    ``Partition.one_shot``: it chooses which of the two fixed headers opens the block, so the block
-    matches the prose the strip removed. *index* supplies the descriptions of suggested rows and
-    may be ``None``, in which case they are listed by name only.
+    capped, best first. *kept* is the kept half of the catalog partition. *one_shot* is
+    ``Partition.one_shot``: it chooses which of the two fixed headers opens the block. *opening*
+    says the request's messages carry no earlier block, so the pinned rows are listed; a later turn
+    in the same compaction window omits them. *paths* maps a name to the absolute read path the host
+    lookup resolved, for both suggestions and pinned rows. *index* supplies the descriptions of
+    suggested rows and may be ``None``, in which case they are listed by name only.
+
+    A suggestion row with no absolute path is not rendered. A pinned row with no absolute path is
+    omitted with one warning per process. The cap is not applied here: the selector applied it.
     """
+    resolved = paths or {}
     descriptions = _descriptions(index)
     limit = cfg.max_description_chars
-    cap = max(0, cfg.max_suggestions)
+    eager = set(cfg.eager_skills or ())
     seen: set[str] = set()
     suggested: List[str] = []
+    pinned: List[str] = []
     listed: List[str] = []
     for name, _score in rows:
-        if len(suggested) >= cap:
-            # The cap counts rendered suggested rows, so a duplicate name never spends a slot.
-            break
         if name in seen:
             continue
+        path = _absolute_path(resolved.get(name))
+        if path is None:
+            # The selector resolved only names with a path, so this is a caller that skipped the
+            # rule; the row is a non-success and never reaches the block.
+            continue
         seen.add(name)
-        suggested.append(_line(name, descriptions.get(name, ""), limit))
+        suggested.append(_row(name, descriptions.get(name, ""), limit, path))
     for name, description in zip(kept.names, kept.descriptions):
         if name in seen:
-            # A suggested name is already on a line above; the block never names a skill twice.
+            # A suggestion or an earlier kept row already names this skill.
             continue
-        seen.add(name)
-        listed.append(_line(name, description, limit))
-    if not suggested and not listed:
+        if name in eager:
+            if not opening:
+                continue
+            path = _absolute_path(resolved.get(name))
+            if path is None:
+                _warn_pinned(name)
+                continue
+            seen.add(name)
+            pinned.append(_row(name, description, limit, path))
+        else:
+            seen.add(name)
+            listed.append(_plain_row(name, description, limit))
+    if not suggested and not pinned and not listed:
         return ""
     parts = [ONE_SHOT_HEADER if one_shot else HEADER]
     if suggested:
-        parts.append("\n".join(suggested))
+        parts.append(SUGGESTIONS + "\n" + "\n".join(suggested))
+    if pinned:
+        parts.append(PINNED + "\n" + "\n".join(pinned))
     if listed:
         parts.append(ALSO_LISTED + "\n" + "\n".join(listed))
     return "\n\n".join(parts)
+
+
+def suggested_names(block_text: str) -> List[str]:
+    """Return the names *block_text* lists as suggestions, in order, and never a pinned name.
+
+    The renderer owns the answer in both directions: this is the reader the rewrite uses to recover
+    the names an earlier block already suggested, so the representation of a row is written and read
+    here. Only the suggestions section counts; the pinned and also-listed rows name skills the block
+    did not suggest, and a name in those sections is never returned.
+    """
+    names: List[str] = []
+    section = ""
+    for line in block_text.splitlines():
+        if line in (SUGGESTIONS, PINNED, ALSO_LISTED):
+            section = line
+            continue
+        if section != SUGGESTIONS or not line.startswith("- "):
+            continue
+        name = line[2:].split(": ", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def _descriptions(index: Optional[Index]) -> Dict[str, str]:
@@ -137,8 +204,20 @@ def _descriptions(index: Optional[Index]) -> Dict[str, str]:
     return descriptions
 
 
-def _line(name: str, description: str, limit: int) -> str:
-    """Return one rendered row: ``- name: description``, or ``- name`` without a description."""
+def _absolute_path(path: Optional[str]) -> Optional[str]:
+    """Return *path* when it is an absolute string path, else ``None``: no pathless row is emitted."""
+    if isinstance(path, str) and os.path.isabs(path):
+        return path
+    return None
+
+
+def _row(name: str, description: str, limit: int, path: str) -> str:
+    """Return one suggestion or pinned row: its name, description and read path."""
+    return _plain_row(name, description, limit) + "\n" + PATH_PREFIX + path
+
+
+def _plain_row(name: str, description: str, limit: int) -> str:
+    """Return one name line: ``- name: description``, or ``- name`` without a description."""
     text = _one_line(description)[:limit].rstrip()
     if not text:
         return f"- {name}"
@@ -148,3 +227,14 @@ def _line(name: str, description: str, limit: int) -> str:
 def _one_line(description: str) -> str:
     """Collapse every whitespace run, newlines included, to one space and trim the ends."""
     return " ".join(description.split())
+
+
+def _warn_pinned(name: str) -> None:
+    """Log one omitted pinned row once per process, never including request text."""
+    if name in _PINNED_WARNED:
+        return
+    _PINNED_WARNED.add(name)
+    logger.warning(
+        "skill router: pinned skill %r has no resolvable read path; omitting it from the block",
+        name,
+    )

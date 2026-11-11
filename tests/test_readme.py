@@ -135,6 +135,31 @@ def test_the_documentation_quotes_both_headers_and_their_shared_first_line() -> 
     assert shared in docs, "technical-documentation.md does not show the first line both headers share"
 
 
+def test_the_documentation_documents_the_cap_default_paths_and_opening_rule() -> None:
+    prose = _prose()
+    assert "`maxSuggestions` defaults to `10` and accepts `0` to `50`, and `0` means unlimited" in prose, (
+        "the documentation does not state the cap default and the 0 rule"
+    )
+    assert "Every suggestion carries its name, its description and the absolute read path" in prose, (
+        "the documentation does not state the fields each suggestion carries"
+    )
+    assert "both name the loader tools `skill_view` and `skills_list`" in prose, (
+        "the documentation does not carry the loader-tool line"
+    )
+    assert "A request whose messages carry no earlier block is the window's opening block" in prose, (
+        "the documentation does not state the opening-block rule"
+    )
+    assert "a request carrying an earlier block omits them" in prose, (
+        "the documentation does not state the later-turn rule for each compaction window"
+    )
+    assert "a request whose earlier block a compaction removed starts a new window" in prose, (
+        "the documentation does not state that a compaction opens a new window"
+    )
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "`0` means no cap" in readme, "README.md does not state the 0 rule"
+    assert "`maxSuggestions` | `10`" in readme, "README.md does not carry the cap default"
+
+
 def test_the_documentation_documents_the_display_caption() -> None:
     prose = _prose()
     assert prose.count("carries the count") >= 2, (

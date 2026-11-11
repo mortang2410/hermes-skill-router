@@ -253,6 +253,15 @@ def _stand_in(callback, request, **context):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _host_paths(monkeypatch):
+    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
+    resolver = lambda name: f"/skills/{name}/SKILL.md"
+    for module_name, module in list(sys.modules.items()):
+        if module_name.endswith("router") and hasattr(module, "skill_path"):
+            monkeypatch.setattr(module, "skill_path", resolver)
+
+
 def test_the_callback_returns_only_the_request_key(plugin_module, endpoints, tmp_path):
     record_path = tmp_path / "suggestions.json"
     callback = _callback_for(plugin_module, settings_for(endpoints, record_path))

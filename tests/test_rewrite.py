@@ -24,10 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.config import Config, load  # noqa: E402
-from hermes_skill_router.inject import HEADER, ONE_SHOT_HEADER  # noqa: E402
+from hermes_skill_router.inject import HEADER, ONE_SHOT_HEADER, PINNED  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
@@ -162,9 +163,16 @@ class FakeReranker:
 
 @pytest.fixture(autouse=True)
 def _fresh_process_state(monkeypatch):
-    """A fresh logger set and index memo per test, so one test's failure never silences another."""
+    """A fresh logger set and index memo per test, so one test's failure never silences another.
+
+    The host path lookup is replaced with a resolver that answers one absolute path per name, the way
+    the real ``skill_view`` resolver does on a host that carries every skill. A test that needs a
+    refused or raising lookup patches ``router_module.skill_path`` itself.
+    """
     monkeypatch.setattr(router_module, "_LOGGED", set())
     monkeypatch.setattr(library_module, "_MEMO", {})
+    monkeypatch.setattr(inject_module, "_PINNED_WARNED", set())
+    monkeypatch.setattr(router_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
 
 
 def record_for(cfg):
@@ -274,13 +282,14 @@ def test_model_tools_and_an_unrelated_top_level_key_survive(tmp_path):
     assert rewritten["unrelated_key"] == {"kept": True}
 
 
-def test_the_selected_suggestion_is_rendered_with_its_description_from_the_index(tmp_path):
+def test_the_selected_suggestion_is_rendered_with_its_description_and_read_path(tmp_path):
     result = rewrite(
         _payload(), cfg=make_config(tmp_path), embed=FakeEmbedder(), rerank=FakeReranker()
     )
 
     lines = block_of(result).split("\n")
     assert "- beta: Beta skill" in lines
+    assert "  path: /skills/beta/SKILL.md" in lines
     # A probability must never reach the block.
     assert "0.9" not in block_of(result)
 
@@ -390,15 +399,16 @@ def test_the_rerank_document_is_the_configured_prefix_plus_name_dash_description
 # ---------------------------------------------------------------------------
 
 
-def test_an_eager_row_is_listed_under_also_listed_and_never_recorded(tmp_path):
+def test_an_eager_row_is_pinned_in_the_opening_block_and_never_recorded(tmp_path):
     cfg = make_config(tmp_path, eagerSkills=["alpha"])
     reranker = FakeReranker(scores=(0.9, 0.9, 0.9, 0.9))
 
     result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=reranker)
 
     block = block_of(result)
-    assert "Also listed:" in block
+    assert PINNED in block.split("\n")
     assert "- alpha: Alpha skill" in block.split("\n")
+    assert "  path: /skills/alpha/SKILL.md" in block.split("\n")
     record = record_for(cfg)
     assert record["status"] == "routed"
     assert "alpha" not in record["names"]
@@ -444,7 +454,7 @@ def test_a_demoted_names_only_row_is_listed_but_never_indexed_or_recorded(tmp_pa
     assert record["status"] == "routed"
 
 
-def test_max_suggestions_zero_still_lists_the_kept_row(tmp_path):
+def test_max_suggestions_zero_lists_every_suggestion_and_the_pinned_row(tmp_path):
     cfg = make_config(tmp_path, maxSuggestions=0, eagerSkills=["alpha"])
 
     result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
@@ -452,11 +462,168 @@ def test_max_suggestions_zero_still_lists_the_kept_row(tmp_path):
     assert result is not None
     assert "## Skills" not in result["request"]["messages"][0]["content"]
     block = block_of(result)
+    for name in ("beta", "delta", "gamma"):
+        assert any(line.startswith(f"- {name}: ") for line in block.split("\n"))
+    assert PINNED in block.split("\n")
     assert "- alpha: Alpha skill" in block.split("\n")
-    assert not any(line.startswith("- ") and line != "- alpha: Alpha skill" for line in block.split("\n"))
     record = record_for(cfg)
     assert record["status"] == "routed"
-    assert record["names"] == []
+    assert record["names"] == ["beta", "delta", "gamma"]
+
+
+# ---------------------------------------------------------------------------
+# Suppression and the opening block: both come from the payload's own messages.
+# ---------------------------------------------------------------------------
+
+
+def _second_turn(payload, block):
+    """A later request in the same window: the earlier block, an answer, then a new user message."""
+    return {
+        **payload,
+        "messages": [
+            *payload["messages"],
+            {"role": "system", "content": block},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next request"},
+        ],
+    }
+
+
+def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path):
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    first = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    assert first is not None
+    second = _second_turn(payload, block_of(first))
+    before = copy.deepcopy(second)
+
+    result = rewrite(second, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert result is None, "every candidate the earlier block listed was suggested again"
+    assert second == before, "a suppression-emptied selection must leave the payload unchanged"
+    assert record_for(cfg)["status"] == "inert"
+
+
+def test_a_request_without_the_block_can_suggest_the_names_again(tmp_path):
+    cfg = make_config(tmp_path)
+    payload = _payload()
+
+    first = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    second = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert first is not None
+    assert second == first, "module state, not the messages, decided the suppressed set"
+
+
+def test_user_text_that_merely_quotes_the_block_does_not_suppress_its_names(tmp_path):
+    cfg = make_config(tmp_path)
+    quoted = (
+        "please quote this:\n"
+        + HEADER
+        + "\n\nSuggestions:\n- beta: Beta skill\n  path: /skills/beta/SKILL.md"
+    )
+    payload = {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": _content()},
+            {"role": "user", "content": quoted},
+        ],
+    }
+
+    result = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert result is not None
+    assert "- beta: Beta skill" in block_of(result).split("\n"), (
+        "user text that opens with something else seeded the suppressed set"
+    )
+
+
+def test_pinned_rows_return_after_a_compaction_removes_the_block(tmp_path):
+    cfg = make_config(tmp_path, eagerSkills=["alpha"])
+    payload = _payload()
+
+    opening = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    assert opening is not None
+    assert PINNED in block_of(opening).split("\n")
+
+    prior = HEADER + "\n\nSuggestions:\n- beta: Beta skill\n  path: /skills/beta/SKILL.md"
+    later = rewrite(
+        _second_turn(payload, prior), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert later is not None
+    assert PINNED not in block_of(later).split("\n"), "a later turn in the window listed pinned rows"
+    assert "- alpha: Alpha skill" not in block_of(later).split("\n")
+
+    # The compaction removed the earlier block, so the next window opens with the pinned rows again.
+    reopened = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    assert reopened is not None
+    assert PINNED in block_of(reopened).split("\n")
+    assert "- alpha: Alpha skill" in block_of(reopened).split("\n")
+
+
+# ---------------------------------------------------------------------------
+# Read paths: the caller resolves every candidate, and an unresolved row never spends a slot.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pathless_top_row_hands_its_slot_to_the_next_admissible_row(tmp_path, monkeypatch):
+    cfg = make_config(tmp_path, maxSuggestions=2)
+    monkeypatch.setattr(
+        router_module,
+        "skill_path",
+        lambda name: None if name == "beta" else f"/skills/{name}/SKILL.md",
+    )
+
+    result = rewrite(
+        _payload(),
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.9, 0.8, 0.7, 0.6)),
+    )
+
+    assert result is not None
+    rows = [line for line in block_of(result).split("\n") if line.startswith("- ")]
+    assert rows == ["- delta: Delta skill", "- alpha: Alpha skill"], (
+        "a candidate whose path did not resolve consumed a cap slot"
+    )
+    assert "beta" not in block_of(result)
+    assert record_for(cfg)["names"] == ["delta", "alpha"]
+
+
+def test_a_raising_lookup_costs_that_row_and_not_the_block(tmp_path, monkeypatch):
+    def resolve(name):
+        if name == "beta":
+            raise RuntimeError("the host lookup exploded")
+        return f"/skills/{name}/SKILL.md"
+
+    monkeypatch.setattr(router_module, "skill_path", resolve)
+
+    result = rewrite(
+        _payload(),
+        cfg=make_config(tmp_path),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.9, 0.2, 0.05, 0.01)),
+    )
+
+    assert result is not None
+    rows = [line for line in block_of(result).split("\n") if line.startswith("- ")]
+    assert rows == ["- delta: Delta skill", "- alpha: Alpha skill", "- gamma: Gamma skill"]
+
+
+def test_every_rendered_suggestion_carries_its_absolute_read_path(tmp_path):
+    result = rewrite(
+        _payload(),
+        cfg=make_config(tmp_path),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.9, 0.2, 0.05, 0.01)),
+    )
+
+    lines = block_of(result).split("\n")
+    rendered = [line for line in lines if line.startswith("- ")]
+    paths = [line for line in lines if line.startswith("  path: ")]
+    assert len(rendered) == len(paths) == 4
+    for name in ("beta", "delta", "alpha", "gamma"):
+        assert f"  path: /skills/{name}/SKILL.md" in paths
 
 
 # ---------------------------------------------------------------------------
@@ -781,9 +948,10 @@ DECISION_PREFIX = "skill router: query="
 
 # The hash of ``json.dumps(result, ensure_ascii=False, sort_keys=True)`` for the payload
 # ``_payload()`` rewritten with ``FakeEmbedder()``, ``FakeReranker()``, session ``s-1`` and turn
-# ``t-1``. It was captured from the build before the decision line existed, at
-# 87d3e72d8b3d35da4edf7890dc39b458203e6b62, so a change to the returned payload fails the test.
-GOLDEN_PAYLOAD_SHA256 = "8d3c9771a11f88ada7e6f5389edd76a2ac1d1fac9aed4de7f4033c4501588975"
+# ``t-1``, with the test's resolver answering ``/skills/<name>/SKILL.md``. It was captured from the
+# ticket 02 build, which gave every suggestion its read path and its section marker, so a change to
+# the returned payload fails the test.
+GOLDEN_PAYLOAD_SHA256 = "700fbbb243841d2a0d6eb7e1172e5ce3a7e1774e74997c4108d678416f46a14a"
 
 # The display record the same call wrote, minus its unstable ``at`` timestamp.
 GOLDEN_RECORD = {
@@ -962,7 +1130,7 @@ def test_a_spent_budget_writes_no_decision_line(tmp_path, caplog):
     assert any("routing budget 1000 ms exhausted" in message for message in caplog.messages)
 
 
-def test_the_returned_payload_is_byte_identical_to_the_pre_change_build(tmp_path):
+def test_the_returned_payload_is_byte_identical_to_the_frozen_build(tmp_path):
     result = rewrite(
         _payload(),
         cfg=make_config(tmp_path),

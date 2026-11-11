@@ -87,6 +87,15 @@ def _fresh_process_state(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _host_paths(monkeypatch):
+    """The host lookup resolves every name, so a rewritten turn's rows carry read paths."""
+    resolver = lambda name: f"/skills/{name}/SKILL.md"
+    for module_name, module in list(sys.modules.items()):
+        if module_name.endswith("router") and hasattr(module, "skill_path"):
+            monkeypatch.setattr(module, "skill_path", resolver)
+
+
 def test_a_routed_record_carries_the_schema_the_timestamp_and_the_names(tmp_path):
     cfg = make_config(tmp_path)
 

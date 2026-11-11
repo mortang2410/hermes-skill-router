@@ -92,10 +92,10 @@ config_schema:
     description: "Rerank relevance_score a candidate needs, compared inclusively (0..1)."
   maxSuggestions:
     type: int
-    default: 8
+    default: 10
     minimum: 0
     maximum: 50
-    description: "Hard cap on suggested rows; 0 selects none while kept rows are still listed (0..50)."
+    description: "Cap on suggested rows, applied once in the selector; 0 means unlimited (0..50)."
   maxDisplayNames:
     type: int
     default: 12

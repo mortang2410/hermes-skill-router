@@ -43,7 +43,7 @@ SPEC_DEFAULTS = {
     "routingTimeoutMs": 30000,
     "shortlistSize": 50,
     "cutoff": 0.01,
-    "maxSuggestions": 8,
+    "maxSuggestions": 10,
     "maxDisplayNames": 12,
     "maxDescriptionChars": 400,
     "cachePath": "~/.cache/hermes-skill-router/index.json",
@@ -170,7 +170,7 @@ def test_load_none_returns_every_default():
     assert cfg.routing_timeout_ms == 30000
     assert cfg.shortlist_size == 50
     assert cfg.cutoff == 0.01
-    assert cfg.max_suggestions == 8
+    assert cfg.max_suggestions == 10
     assert cfg.max_description_chars == 400
     assert cfg.max_display_names == 12
     assert cfg.health_check_ms == 60000

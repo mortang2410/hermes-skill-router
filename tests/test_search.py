@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -21,6 +23,7 @@ from hermes_skill_router.catalog import CatalogRows, Partition  # noqa: E402
 from hermes_skill_router.config import load  # noqa: E402
 from hermes_skill_router.display import read  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
+from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 from hermes_skill_router.search import (  # noqa: E402
     BUDGET_EXPIRED,
@@ -32,9 +35,14 @@ from hermes_skill_router.search import (  # noqa: E402
     remember_partition,
     select_rows,
 )
-from hermes_skill_router.select import select  # noqa: E402
 
 QUERY = "draft a git commit message for a bug fix"
+
+
+@pytest.fixture(autouse=True)
+def _host_paths(monkeypatch):
+    """A host lookup that resolves every name, so a turn's block carries read paths."""
+    monkeypatch.setattr(router_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
 QUERY_VECTOR = [0.0, 1.0, 0.0]
 
 ROWS = (("alpha", "Alpha skill"), ("beta", "Beta skill"), ("gamma", "Gamma skill"))
@@ -188,13 +196,14 @@ def test_select_rows_repeats_the_turn_selection(tmp_path):
         index=index,
         embed=FakeEmbedder(),
         rerank=FakeReranker(),
+        resolve=lambda name: f"/skills/{name}/SKILL.md",
     )
 
     assert [row.name for row in outcome.rows] == turn_names == ["alpha", "beta", "gamma"]
 
 
-def test_select_rows_resolves_the_path_of_selected_rows_only(tmp_path):
-    cfg = make_config(tmp_path)
+def test_select_rows_resolves_every_candidate_before_the_cut(tmp_path):
+    cfg = make_config(tmp_path, cutoff=0.5)
     looked_up = []
 
     def resolve(name):
@@ -203,22 +212,27 @@ def test_select_rows_resolves_the_path_of_selected_rows_only(tmp_path):
 
     outcome = select_rows(
         cfg,
-        [search_module.SearchRow("alpha", "Alpha skill"), search_module.SearchRow("delta", "")],
+        [
+            search_module.SearchRow("alpha", "Alpha skill"),
+            search_module.SearchRow("delta", ""),
+            search_module.SearchRow("gamma", "Gamma skill"),
+        ],
         QUERY,
-        index=make_index(rows=(("alpha", "Alpha skill"), ("delta", ""))),
+        index=make_index(rows=(("alpha", "Alpha skill"), ("delta", ""), ("gamma", "Gamma skill"))),
         embed=FakeEmbedder(),
-        rerank=FakeReranker(scores=(0.5, 0.4)),
+        rerank=FakeReranker(scores=(0.5, 0.4, 0.1)),
         resolve=resolve,
     )
 
     assert [(row.name, row.path) for row in outcome.rows] == [
         ("alpha", "/skills/alpha/SKILL.md"),
-        ("delta", "/skills/delta/SKILL.md"),
     ]
-    assert looked_up == ["alpha", "delta"]
+    assert looked_up == ["alpha", "delta", "gamma"], (
+        "a candidate the cutoff later rejects still has its path resolved before the cut"
+    )
 
 
-def test_a_refused_lookup_keeps_the_row_without_a_path(tmp_path):
+def test_a_refused_lookup_drops_the_row(tmp_path):
     cfg = make_config(tmp_path)
 
     outcome = select_rows(
@@ -231,7 +245,8 @@ def test_a_refused_lookup_keeps_the_row_without_a_path(tmp_path):
         resolve=lambda name: None,
     )
 
-    assert [(row.name, row.path) for row in outcome.rows] == [("alpha", None)]
+    assert outcome.reason == ""
+    assert outcome.rows == ()
 
 
 def test_a_failed_build_names_the_no_index_arm(tmp_path):
@@ -344,6 +359,7 @@ def test_nothing_above_the_cutoff_is_a_healthy_empty_answer(tmp_path):
         index=make_index(rows=(("alpha", "Alpha skill"),)),
         embed=FakeEmbedder(),
         rerank=FakeReranker(scores=(0.0,)),
+        resolve=lambda name: f"/skills/{name}/SKILL.md",
     )
 
     assert outcome.reason == ""
@@ -421,8 +437,8 @@ GOLDEN_ENVELOPE = (
 )
 
 
-def test_the_pass_hands_back_every_score_it_compared(tmp_path):
-    cfg = make_config(tmp_path, cutoff=0.5)
+def test_the_pass_hands_back_every_score_uncapped_and_without_the_cutoff(tmp_path):
+    cfg = make_config(tmp_path, cutoff=0.5, maxSuggestions=1)
 
     ranked = search_module.rank(
         cfg,
@@ -436,8 +452,7 @@ def test_the_pass_hands_back_every_score_it_compared(tmp_path):
     assert ranked.candidates == (("beta", 0.2), ("alpha", 0.9), ("gamma", 0.1)), (
         "the pass does not hand back every shortlisted candidate with the score the selector saw"
     )
-    assert ranked.rows == (("alpha", 0.9),)
-    assert list(ranked.rows) == select([0.2, 0.9, 0.1], ["beta", "alpha", "gamma"], cfg)
+    assert len(ranked.candidates) == 3, "the pass applies neither the cutoff nor the cap"
 
 
 def test_the_pass_times_each_stage(tmp_path):
@@ -470,7 +485,6 @@ def test_a_failed_pass_hands_back_no_candidate_scores(tmp_path):
 
     assert ranked.reason == RERANK_FAILED
     assert ranked.candidates == ()
-    assert ranked.rows == ()
 
 
 def test_the_search_tool_envelope_is_byte_identical_to_the_pre_change_build(tmp_path, monkeypatch):
@@ -487,3 +501,55 @@ def test_the_search_tool_envelope_is_byte_identical_to_the_pre_change_build(tmp_
     )
 
     assert answer == GOLDEN_ENVELOPE
+
+
+def test_a_pathless_top_row_hands_the_last_slot_to_the_next_admissible_row(tmp_path):
+    cfg = make_config(tmp_path, cutoff=0.01, maxSuggestions=2)
+    rows = (
+        search_module.SearchRow("alpha", "Alpha skill"),
+        search_module.SearchRow("beta", "Beta skill"),
+        search_module.SearchRow("gamma", "Gamma skill"),
+    )
+
+    outcome = select_rows(
+        cfg,
+        rows,
+        QUERY,
+        index=make_index(),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.9, 0.8, 0.7)),
+        resolve=lambda name: None if name == "beta" else f"/skills/{name}/SKILL.md",
+    )
+
+    # The shortlist is beta (the top score), alpha, gamma; beta has no path, so it never consumes a
+    # slot and the two admissible rows fill the cap.
+    assert [(row.name, row.path) for row in outcome.rows] == [
+        ("alpha", "/skills/alpha/SKILL.md"),
+        ("gamma", "/skills/gamma/SKILL.md"),
+    ]
+
+
+def test_a_raising_lookup_costs_only_that_candidate(tmp_path):
+    cfg = make_config(tmp_path, maxSuggestions=2)
+
+    def resolve(name):
+        if name == "beta":
+            raise RuntimeError("the host lookup exploded")
+        return f"/skills/{name}/SKILL.md"
+
+    outcome = select_rows(
+        cfg,
+        (
+            search_module.SearchRow("alpha", "Alpha skill"),
+            search_module.SearchRow("beta", "Beta skill"),
+            search_module.SearchRow("gamma", "Gamma skill"),
+        ),
+        QUERY,
+        index=make_index(),
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(scores=(0.9, 0.8, 0.7)),
+        resolve=resolve,
+    )
+
+    assert outcome.reason == ""
+    assert [row.name for row in outcome.rows] == ["alpha", "gamma"]

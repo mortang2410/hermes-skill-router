@@ -80,7 +80,7 @@ endpoint costs latency, not a broken turn.
 
    The newest dump under `~/.hermes/sessions/` carries no `## Skills` heading, and its last message
    starts with `Skills routed for this request`. When no block appears, the plugin log carries one
-   warning naming the reason.
+   warning naming the reason, or, for a completed pass that selected nothing, the decision line.
 
 ## Recommended setup
 
@@ -90,28 +90,35 @@ The defaults are what we run, so you only have to set the two base URLs:
   `embedModelId: bge-m3`.
 - Rerank: `tasksource-decider-nano` through a Cohere-compatible rerank service on 8010, with
   `rerankProvider: cohere`.
-- Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 8`, and the 6000, 20000 and
+- Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 10`, and the 6000, 20000 and
   30000 ms timeouts. Keep them unless your endpoints need different budgets.
 
 ## Use
 
 A routed turn ends with one extra system message. The sample below is the opening block of a
-compaction window: suggestion rows come first, then the pinned rows under an `Also listed:` marker:
+compaction window: suggestion rows come first, then the pinned rows:
 
 ```
+Suggestions:
 - <suggested name>: <description>
+  path: <absolute path to the skill's SKILL.md>
 - <suggested name with no description>
+  path: <absolute path>
 
-Also listed:
-- <kept name>: <description>
+Pinned skills:
+- <eager name>: <description>
+  path: <absolute path>
 ```
 
-Rows above `Also listed:` are that turn's suggestions, best first, capped at `maxSuggestions`. In the
-opening block, rows below the marker stay visible and are never suggested. A later turn in the same
-window carries only the suggestion rows, and the next window opens with the pinned rows again. The
-model can open any of them with `skill_view`, and `skills_list` still lists the whole catalog. When
-the shortlist misses, it can search by hand: `skill_router_search` takes any `query` in the model's
-own words and returns ranked names, descriptions and skill paths.
+Every suggestion and pinned row carries its name, its description and the path the host's skill lookup
+resolved, which is the file `skill_view` opens. Suggestions are best first, capped at
+`maxSuggestions`, where `0` means no cap. Pinned rows appear only in the block that opens a compaction
+window; a later turn in the same window carries the suggestions only, and a turn whose messages no
+longer carry an earlier block opens the next window with the pinned rows again. Rows that
+`deferredSkills` leaves listed stay under an `Also listed:` marker on every turn and are never
+suggested. The model can open any row with `skill_view`, and `skills_list` still lists the whole
+catalog. When the shortlist misses, it can search by hand: `skill_router_search` takes any `query` in
+the model's own words and returns ranked names, descriptions and skill paths.
 
 The last decision also appears on screen, and neither place costs a token. The desktop app gets a
 `Skills routed` pane on the right rail, collapsed by default, with the names and one caption line. In
@@ -131,8 +138,8 @@ the ones most setups touch:
 | `embedModelId` | `bge-m3` | Model name sent to the embeddings endpoint. |
 | `rerankBaseUrl` | `http://127.0.0.1:8010` | Rerank endpoint root. |
 | `rerankModel` | `tasksource-decider-nano` | Model name sent to the rerank endpoint. |
-| `eagerSkills` | empty | Skills listed once in each compaction window's opening block, under `Also listed:`, and never suggested. |
-| `maxSuggestions` | `8` | Cap on suggested rows. |
+| `eagerSkills` | empty | Skills listed once in each compaction window's opening block, under `Pinned skills:`, with their read paths, and never suggested. |
+| `maxSuggestions` | `10` | Cap on suggested rows, from 0 to 50. `0` means unlimited. |
 
 Every other key, with its bound and its effect, is in the
 [configuration reference](technical-documentation.md#configuration).

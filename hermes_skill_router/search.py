@@ -2,9 +2,11 @@
 
 The middleware parses the skill catalog out of one Chat Completions request and partitions it. This
 module keeps the partition each session showed, so the model's search tool can rank exactly the rows
-the current prompt listed, and it runs the same embed, shortlist, rerank, cutoff and suggestion-cap
-pass the middleware runs for a turn. Nothing here scans the skill library: a session with no parsed
-partition has no rows, and no search falls back to the filesystem.
+the current prompt listed, and it runs the same embed, shortlist and rerank pass the middleware runs
+for a turn. The pass hands back every reranked candidate uncapped; the cutoff, the cap and the
+suppressed set are applied once, by the selector, after the caller has resolved every candidate's
+read path. Nothing here scans the skill library: a session with no parsed partition has no rows, and
+no search falls back to the filesystem.
 
 The partition record is written at the start of a turn, which is also when the previous record is
 dropped: a request that carries no catalog, a non-Chat-Completions request, and a request the
@@ -13,18 +15,20 @@ partition with no routed rows is different: the partition exists and the prompt 
 search, which the tool reports as the healthy empty answer.
 
 The pass in :func:`rank` is the middleware's own: it takes the query vector inside the routing
-budget, shortlists the routed rows by cosine, reranks those documents and applies the configured
-cutoff and cap. It also hands every candidate's score and the stage timings back with the selection,
-so the turn can write its decision line from the values the selector compared. The rewrite renders
-its block from the same result, so a turn and a search for the same query and catalog can never
+budget, shortlists the routed rows by cosine, reranks those documents and hands back every reranked
+candidate with its probability. It also hands every candidate's score and the stage timings back, so
+the turn can write its decision line from the values the selector compared. The rewrite renders its
+block from that same result, so a turn and a search for the same query and catalog can never
 disagree. A failure names its arm (``embed-failed``, ``rerank-failed``, ``budget-expired``) instead of
 a partial list; the handler maps that to the degraded envelope and the middleware to an unchanged
 request.
 
-The path of each returned row comes from the host's own skill lookup, the resolver ``skill_view``
-uses, and only for the rows the search selected: that lookup walks the skill directories, so calling
-it for every routed row would make one search scan the whole library for rows it never returns. A
-name the lookup refuses, or cannot resolve uniquely, keeps its row and omits the path.
+The path of each candidate comes from the host's own skill lookup, the resolver ``skill_view`` uses,
+and :func:`select_rows` resolves every reranked candidate before the cut: that lookup walks the skill
+directories, so calling it for every routed row would make one search scan the whole library, while
+every shortlisted candidate has already earned its place in the comparison. A name the lookup refuses,
+or cannot resolve uniquely, is dropped before the cap counts rows, so the next admissible row takes
+its place and every surviving row carries a path.
 """
 
 from __future__ import annotations
@@ -84,14 +88,15 @@ class SearchOutcome:
 
 @dataclass(frozen=True)
 class Ranked:
-    """The selection pass' answer: name and probability pairs best first, or a failure arm.
+    """The ranking pass' answer: every reranked candidate with its probability, or a failure arm.
 
-    ``candidates`` carries every shortlisted name with the rerank probability the selector compared,
-    in shortlist order, so a caller can report a candidate the cutoff rejected. The three timings
-    are milliseconds: the embed stage, the rerank stage and the whole pass.
+    ``candidates`` carries every shortlisted name with the rerank probability the selector compares,
+    in shortlist order, uncapped and without applying the cutoff, so the caller resolves each
+    candidate's read path and then selects. An arm carries no candidate, so a failed pass can never
+    report a partial shortlist. The three timings are milliseconds: the embed stage, the rerank stage
+    and the whole pass.
     """
 
-    rows: Tuple[Tuple[str, float], ...] = ()
     reason: str = ""
     detail: str = ""
     candidates: Tuple[Tuple[str, float], ...] = ()
@@ -156,8 +161,12 @@ def select_rows(
     is the caller's index when it already holds one, otherwise the shared loader builds or loads it
     from these rows. *deadline* is the routing pass' absolute ``monotonic`` deadline; when it is
     ``None`` the budget starts after the index is in hand, so a cold build is never cut, exactly as
-    a turn's budget starts. *resolve* names one selected row's ``SKILL.md`` path; without it the rows
-    carry no path.
+    a turn's budget starts. *resolve* names one reranked candidate's ``SKILL.md`` path.
+
+    Every candidate the pass reranked gets its path resolved before the cutoff, the cap or the
+    suppressed set is applied: a refused or raising lookup costs that candidate its slot, and the
+    next admissible row takes it, so every returned row carries a path. Without *resolve* every
+    candidate is unresolved and the answer carries no row.
 
     The ranking is :func:`rank`, the middleware's own pass, so the same query and catalog give the
     same names and order a turn would inject. Never raises: an index, embed or rerank failure
@@ -186,13 +195,36 @@ def select_rows(
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank, deadline=deadline)
     if ranked.reason:
         return SearchOutcome(reason=ranked.reason, detail=ranked.detail)
+    scores = [probability for _name, probability in ranked.candidates]
+    names = [name for name, _probability in ranked.candidates]
+    paths = _resolved_paths(names, resolve)
+    chosen = select(scores, names, cfg, paths)
     descriptions = dict(zip(index.names, index.descriptions))
     return SearchOutcome(
         rows=tuple(
-            SearchRow(name, descriptions[name], resolve(name) if resolve is not None else None)
-            for name, _probability in ranked.rows
+            SearchRow(name, descriptions[name], paths[name])
+            for name, _probability in chosen
         )
     )
+
+
+def _resolved_paths(
+    names: Sequence[str],
+    resolve: Optional[PathResolver],
+) -> Dict[str, str]:
+    """Resolve every candidate's read path; a refused or raising lookup stays unresolved."""
+    paths: Dict[str, str] = {}
+    if resolve is None:
+        return paths
+    for name in names:
+        try:
+            path = resolve(name)
+        except Exception:  # the host lookup never raises, but the pass must not depend on it
+            logger.debug("skill search: the path lookup for %r raised", name, exc_info=True)
+            path = None
+        if path:
+            paths[name] = str(path)
+    return paths
 
 
 def rank(
@@ -204,18 +236,19 @@ def rank(
     rerank: Optional[Reranker] = None,
     deadline: Optional[float] = None,
 ) -> Ranked:
-    """Run one routing pass over *index* for *query*: embed, shortlist, rerank, cutoff and cap.
+    """Run one routing pass over *index* for *query*: embed, shortlist and rerank.
 
     The budget starts here when *deadline* is ``None``; the caller passes an index already in hand,
     so the cold build is never inside it. That one deadline covers both stages, and each per-request
     timeout is capped by the milliseconds left, so the pass cannot outlive the budget: a stage that
-    returns after the deadline, or finds it already spent, ends as ``budget-expired``. An empty
-    selection is a healthy outcome with no rows; only a failed endpoint or an unbuildable shortlist
-    names another arm.
+    returns after the deadline, or finds it already spent, ends as ``budget-expired``. A shortlist
+    with no candidate is a healthy outcome with no rows; only a failed endpoint or an unbuildable
+    shortlist names another arm.
 
-    A completed pass also hands back every shortlisted candidate with the score the selector compared
-    and the three stage timings, so the caller can report why a name was not selected. An arm carries
-    no candidate, so a failed pass can never report a partial shortlist.
+    A completed pass hands back every reranked candidate with the score the selector will compare,
+    in shortlist order, uncapped and without applying the cutoff, plus the three stage timings, so the
+    caller can resolve each candidate's path, select and report why a name was not suggested. An arm
+    carries no candidate, so a failed pass can never report a partial shortlist.
     """
     started = monotonic()
     deadline = _deadline(cfg, deadline)
@@ -239,9 +272,7 @@ def rank(
     if _budget_left(deadline) is None:
         return _failed(BUDGET_EXPIRED, _budget_message(cfg))
     names = [name for name, _description in shortlisted]
-    chosen = select(scores, names, cfg)
     return Ranked(
-        rows=tuple(chosen),
         candidates=tuple((name, float(score)) for score, name in zip(scores, names)),
         embed_ms=embed_ms,
         rerank_ms=rerank_ms,
