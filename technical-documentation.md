@@ -260,7 +260,7 @@ partition is computed per request from the catalog rows.
 | `embedBaseUrl` | `http://127.0.0.1:8012` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Embeddings endpoint root. A rejected value falls back to the default with one warning. |
 | `embedPath` | `/v1/embeddings` | path starting with `/` | Path appended to `embedBaseUrl`. |
 | `embedModelId` | `bge-m3` | non-empty string | `model` field sent to the embeddings endpoint. Part of the index fingerprint, so a change rebuilds the cache. |
-| `embedTimeoutMs` | `6000` | 100..60000 | Per-request embeddings timeout. Each index-build chunk of at most 16 texts gets its own budget; 16-row chunks measured 1.2 to 2.0 s in the live run. |
+| `embedTimeoutMs` | `6000` | 100..60000 | Per-request embeddings timeout. Each index-build chunk of at most 16 texts gets its own budget. |
 | `rerankBaseUrl` | `http://127.0.0.1:8010` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Rerank endpoint root. A rejected value falls back to the default with one warning. |
 | `rerankPath` | `/v1/rerank` | path starting with `/` | Path appended to `rerankBaseUrl`. |
 | `rerankModel` | `tasksource-decider-nano` | non-empty string | `model` field sent to the rerank endpoint. |
