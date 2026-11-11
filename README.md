@@ -4,12 +4,19 @@ A Hermes Agent plugin that takes the always-on skill catalog out of every Chat C
 and appends a short list of the skills that fit the turn. The model keeps `skills_list` and
 `skill_view`, so it can still list or open any skill.
 
-This fits people who keep one super-agent profile that does everything but do not want the context
-polluted by so many skills that the model cannot tell which one to pick. It also pairs well with a
-memory provider like [Hindsight](https://github.com/vectorize-io/hindsight), which takes care of
-memory routing.
-
 The skill list is embedded once and cached, so a warm turn routes in about a second.
+
+The intent of this plugin is to provide a fundamental feature in everyday agentic use. In
+particular, it is for people who keep one super-agent profile that does everything but do not want
+the context polluted by so many skills that the model struggles to pick the right one. Even for
+specialist profiles, the number of specific skills can grow quickly. A skill router for a
+super-agent also pairs well with a memory provider like
+[Hindsight](https://github.com/vectorize-io/hindsight), which takes care of memory routing and turns
+raw history into organized memory that can be distilled into more skills when needed.
+
+This plugin is not a replacement for periodic maintenance of your skill library, such as folding
+related skills into references for a top-level skill. But it is easier for the model to pick a skill
+when it is fresh in context and relevant.
 
 Every setting, both endpoint protocols, the display record and the measurements are in
 [technical-documentation.md](technical-documentation.md).
