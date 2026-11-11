@@ -7,16 +7,14 @@ and appends a short list of the skills that fit the turn. The model keeps `skill
 Every setting, both endpoint protocols, the display record and the measurements are in
 [technical-documentation.md](technical-documentation.md).
 
-![Hermes Skill Router artwork](docs/assets/performance.png)
-
-Plugin artwork: a task panel, four checks, the router, and a row of skill cards with Performance
-highlighted.
+![](docs/assets/performance.png)
 
 ## How it works
 
 Hermes builds a `## Skills` section into the system prompt on every turn. The plugin removes that
 section and appends one extra system message with the skills that match your last user message, best
-first, plus the skills you pinned under `Also listed:`.
+first. It lists the skills you pinned under `Also listed:` once, in the opening block of each
+compaction window, and every later turn in that window carries the suggestions only.
 
 Two endpoints rank them. The embeddings endpoint compares your message with the routed skill rows
 and keeps the nearest ones. The rerank endpoint scores that shortlist against the same message, and
@@ -81,8 +79,8 @@ unchanged with its catalog. A stopped endpoint then costs latency, not a broken 
 
 ## Use
 
-A routed turn ends with one extra system message. Suggestion rows come first, then the kept rows
-under an `Also listed:` marker:
+A routed turn ends with one extra system message. The sample below is the opening block of a
+compaction window: suggestion rows come first, then the pinned rows under an `Also listed:` marker:
 
 ```
 - <suggested name>: <description>
@@ -92,10 +90,11 @@ Also listed:
 - <kept name>: <description>
 ```
 
-Rows above `Also listed:` are this turn's suggestions, best first, capped at `maxSuggestions`. Rows
-below it stay visible and are never suggested. The model can open any of them with `skill_view`, and
-`skills_list` still lists the whole catalog. When the shortlist misses, the model can call
-`skill_router_search` with wording of its own.
+Rows above `Also listed:` are that turn's suggestions, best first, capped at `maxSuggestions`. In the
+opening block, rows below the marker stay visible and are never suggested. A later turn in the same
+window carries only the suggestion rows, and the next window opens with the pinned rows again. The
+model can open any of them with `skill_view`, and `skills_list` still lists the whole catalog. When
+the shortlist misses, the model can call `skill_router_search` with wording of its own.
 
 The last decision also appears on screen, and neither place costs a token. The desktop app gets a
 `Skills routed` pane on the right rail, collapsed by default, with the names and one caption line. In
@@ -115,7 +114,7 @@ the ones most setups touch:
 | `embedModelId` | `bge-m3` | Model name sent to the embeddings endpoint. |
 | `rerankBaseUrl` | `http://127.0.0.1:8010` | Rerank endpoint root. |
 | `rerankModel` | `tasksource-decider-nano` | Model name sent to the rerank endpoint. |
-| `eagerSkills` | empty | Skills always listed and never suggested. |
+| `eagerSkills` | empty | Skills listed once in each compaction window's opening block, under `Also listed:`, and never suggested. |
 | `maxSuggestions` | `8` | Cap on suggested rows. |
 
 Every other key, with its bound and its effect, is in the

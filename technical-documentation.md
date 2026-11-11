@@ -50,7 +50,7 @@ The catalog carries two row shapes:
 
 Every row is partitioned once per request into kept rows and routed rows:
 
-- Kept rows stay listed in the injected block and are never suggested: every name in `eagerSkills`;
+- Kept rows stay listed in the block that carries them and are never suggested: every name in `eagerSkills`,
   every row a non-empty `deferredSkills` list does not name; and every name on a demoted
   `[names only]` line, even when `deferredSkills` names it. A demoted name is always listed by name
   only and never routed, because the renderer never emitted its description.
@@ -92,8 +92,9 @@ The normal header invites a load for any partially relevant skill. Both headers 
 guidance the removed prose provided, including the call to `skills_list` when none of the suggestions
 fits.
 
-Below the header the block carries the selected suggestions, best first, then the kept rows under an
-`Also listed:` marker:
+Below the header the block carries the selected suggestions, best first. The opening block of a
+compaction window adds the kept rows under an `Also listed:` marker, and a later turn in that window
+carries the suggestions only:
 
 ```
 - <suggested name>: <description>
@@ -106,8 +107,9 @@ Also listed:
 Each row is one line. Descriptions are collapsed to one line and clipped to `maxDescriptionChars`. A
 row that has no description is listed as `- name`, which is how demoted `[names only]` rows and a
 suggested name the index no longer carries appear. A name that is both kept and suggested appears
-only once, as a suggestion. `maxSuggestions` caps suggested rows alone, so a value of `0` suggests
-nothing while every kept row is still listed.
+only once, as a suggestion, in the opening block that lists it. `maxSuggestions` caps suggested rows
+alone, so a value of `0` suggests nothing while the opening block still lists every kept row. A later
+turn in the same window carries suggestions only.
 
 The strip and the injection are atomic. The plugin removes the section only when it can replace it
 with a non-empty block, so a request with no suggestion and no kept row keeps its original section
@@ -238,9 +240,10 @@ request.
 `eagerSkills` and `deferredSkills` mirror DSH's eager and deferred split, applied to skills. The
 partition is computed per request from the catalog rows.
 
-- `eagerSkills` names skills that stay listed on every request and are never routed. Example:
-  `eagerSkills: [writing-for-agents]` keeps that skill in the block under `Also listed:` and out of
-  the index, the rerank call and the display record.
+- `eagerSkills` names skills that are listed once, in the opening block of a compaction window,
+  under `Also listed:`, and that are never routed. A later turn in the window carries the suggestions
+  only, and the next window opens with them again. Example: `eagerSkills: [writing-for-agents]` keeps
+  that skill in that opening block and out of the index, the rerank call and the display record.
 - `deferredSkills` names the routable pool. An empty list, the default, means every skill that is not
   eager is routable. A non-empty list restricts routing to the named skills and leaves every other
   skill listed. Example: `deferredSkills: [github-pr-workflow, code-review]` suggests only those two
@@ -256,7 +259,7 @@ partition is computed per request from the catalog rows.
 | Key | Default | Bound | Effect |
 | --- | --- | --- | --- |
 | `enabled` | `true` | boolean | Master switch. False leaves every request untouched. |
-| `eagerSkills` | empty | list of skill names | Skills always listed and never routed. A name in both lists is eager. |
+| `eagerSkills` | empty | list of skill names | Skills listed once in each compaction window's opening block under `Also listed:`, and never routed. A name in both lists is eager. |
 | `embedBaseUrl` | `http://127.0.0.1:8012` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Embeddings endpoint root. A rejected value falls back to the default with one warning. |
 | `embedPath` | `/v1/embeddings` | path starting with `/` | Path appended to `embedBaseUrl`. |
 | `embedModelId` | `bge-m3` | non-empty string | `model` field sent to the embeddings endpoint. Part of the index fingerprint, so a change rebuilds the cache. |
