@@ -42,6 +42,40 @@ If a service is down or too slow, the plugin falls back to the ordinary skill ca
 compaction window, so a bad endpoint costs latency, not a broken turn, and the catalog never
 reaches the model twice in the same window.
 
+### Historical learning (associations)
+
+The router learns which skills you loaded for similar prompts. It counts each load once per
+session and turn, decays the count with a 14-day half-life, and surfaces skills with support
+of three or more for the current prompt's terms. A missing database means the channel is off
+with one warning and the other two channels still route.
+
+To seed it from your history, run once:
+
+```bash
+python3 -m hermes_skill_router.associations --catalog ~/.cache/hermes-skill-router/index.json
+```
+
+That reads `~/.hermes/state.db` read-only and writes
+`~/.cache/hermes-skill-router/associations.db`. Add `--max-sessions N` for a bounded scan.
+The command is idempotent, so re-running it adds nothing. On this machine it learned 420
+skills and 741 loads from 321 sessions. From then on, new loads are tracked live.
+
+### Pre-reranking
+
+Three channels propose a fused shortlist (size 50), then the reranker scores it:
+
+- Cosine: the newest message plus up to 10,000 characters of preceding context, embedded
+  and compared by vector similarity.
+- BM25: the same query text scored by exact words (`k1 1.2`, `b 0.75`) over the catalog
+  text the embedder sees.
+- Associations: skills with decayed usage for the prompt's terms, as above.
+
+Reciprocal rank fusion (constant 20, weights 1.0, 0.5, 1.0) merges the three orders, a
+recency bump moves a skill up at most 5 positions, then the cut to 50 happens. Only then
+does the reranker run. `fusionMode: cosine` skips the term index, the store, and the bump
+and returns the cosine order alone; `shadow` computes the fused order and logs it while
+still returning cosine.
+
 ## Install
 
 1. Install the plugin.
