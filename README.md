@@ -57,8 +57,8 @@ python3 -m hermes_skill_router.associations --catalog ~/.cache/hermes-skill-rout
 
 That reads `~/.hermes/state.db` read-only and writes
 `~/.cache/hermes-skill-router/associations.db`. Add `--max-sessions N` for a bounded scan.
-The command is idempotent, so re-running it adds nothing. On this machine it learned 420
-skills and 741 loads from 321 sessions. From then on, new loads are tracked live.
+The command is idempotent, so re-running it adds nothing. From then on, new loads are tracked
+live.
 
 ### Pre-reranking
 

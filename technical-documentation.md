@@ -555,10 +555,10 @@ suggestion block, the same inert fallback every other failure uses, and one warn
 
 The 30000 ms default rests on two facts. The two per-request timeouts allow a 26 second pass at
 worst, 6000 plus 20000, so 30000 sits above that ceiling and a working but slow path is never cut. It
-also has headroom over the measurements recorded on this machine against its live endpoints: a steady-state single-text embed
+also has headroom over measured live endpoints: a steady-state single-text embed
 took 236 to 306 ms, a 50-document rerank took 2158 to 2255 ms, and the first embed after an endpoint
 restart took 2700 ms, so a cold but healthy pass cost about 5 seconds, 2700 plus 2255. Those are the
-slow case rather than a constant: an earlier live run on the same host measured a full warm rewrite
+slow case rather than a constant: a live run measured a full warm rewrite
 at 0.75 to 0.79 seconds, and a probe on 2026-11-10 measured a one-text embed at 84 ms and a
 50-document rerank at 287 ms. On a host whose endpoints are slower than the recorded figures, raise
 the budget above your own measured cold pass before lowering anything else.
@@ -707,7 +707,7 @@ same vectors and scores, so it suggests the same skills for the same query.
 
 ## Measured effect
 
-Measured on the author's machine against the live endpoints on `127.0.0.1:8012` and
+Measured against live endpoints on `127.0.0.1:8012` and
 `127.0.0.1:8010`, during `hermes -z` turns recorded with `HERMES_DUMP_REQUESTS=1`, which writes the
 request to `~/.hermes/sessions/request_dump_*.json` under `request.body`.
 
@@ -736,7 +736,7 @@ until the fingerprint changes.
 
 ## Verification status
 
-Verified live on this machine on 2026-11-10, with Hermes Agent v0.22.2+1671, Python 3.12.11 and
+Verified live on 2026-11-10, with Hermes Agent v0.22.2+1671, Python 3.12.11 and
 pytest 9.1.1:
 
 - Both endpoints answered their health routes, and the embeddings unit was linked from the checkout
@@ -783,7 +783,7 @@ plugin in the profile first: with it disabled, every request keeps its catalog.
 
 ### The first turn is slow
 
-The first turn after a cold cache builds the index once, about 38 seconds on this host in 27 chunked
+The first turn after a cold cache builds the index once, about 38 seconds in 27 chunked
 calls. Each 16-row chunk measured 1.2 to 2.0 seconds in the live run, and 2.4 seconds at the peak of
 a repeat, so the default `embedTimeoutMs` of 6000 covers it; raise that value on a slower host. A
 failed build keeps the catalog, and the endpoint is not probed again until `healthCheckMs` has
