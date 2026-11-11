@@ -128,9 +128,9 @@ def answer(target: Any = None) -> Dict[str, Any]:
     *target* is a :class:`hermes_skill_router.config.Config`, a record path, or ``None`` for the
     path the active profile configures. The record is passed through as
     :func:`hermes_skill_router.display.read` returned it — schema, timestamp, session and turn id,
-    status, origin and names, and no other key — so the schema the writer wrote is the schema the
-    pane receives, the origin that says a model search produced the names is projected unchanged,
-    and no request text can ride along.
+    status, origin and names, and no other key — so the pane receives the schema ``read`` normalized
+    to (a schema 1 record reads as schema 2 with origin ``turn``), the origin that says a model
+    search produced the names is projected unchanged, and no request text can ride along.
     """
     display, _ = _display_module()
     record = display.read(configured() if target is None else target)

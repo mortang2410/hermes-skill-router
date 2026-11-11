@@ -103,6 +103,7 @@ def record(
     *status* is ``"routed"`` for a rewritten payload and ``"inert"`` for a request returned
     unchanged. *origin* is ``"turn"`` for the automatic pass and ``"search"`` for a model search,
     and defaults to ``"turn"`` so the existing turn call sites that pass no origin keep working.
+    A search record carries no turn id, so *turn_id* is stored as ``""`` whatever a caller passes.
     *names* are the selected suggestion names; anything past ``cfg.max_display_names`` is dropped,
     duplicates keep their first place, and blanks are ignored. With ``cfg.show_suggestions`` false
     an existing record is removed and nothing is written, for either origin.
@@ -127,7 +128,8 @@ def record(
         "schema": SCHEMA,
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "session_id": _text(session_id),
-        "turn_id": _text(turn_id),
+        # A lookup belongs to no turn, so a search record never carries a turn id.
+        "turn_id": "" if origin == SEARCH else _text(turn_id),
         "status": status,
         "origin": origin,
         # An inert decision suggested nothing, so names are dropped even if a caller passes some.

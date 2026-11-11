@@ -110,7 +110,7 @@ def test_a_routed_record_carries_the_schema_the_timestamp_and_the_names(tmp_path
     assert stored["at"].endswith("Z") and "T" in stored["at"]
 
 
-def test_the_origin_defaults_to_turn_when_the_caller_passes_none(tmp_path):
+def test_the_origin_defaults_to_turn_when_the_caller_omits_it(tmp_path):
     """The existing turn call sites pass no origin, so the default is what keeps them working."""
     cfg = make_config(tmp_path)
 
@@ -132,6 +132,16 @@ def test_a_search_record_carries_origin_search_and_no_turn_id(tmp_path):
     assert stored["names"] == ["alpha"]
     assert stored["turn_id"] == ""
     assert stored["session_id"] == "session-1"
+
+
+def test_a_search_record_drops_a_supplied_turn_id(tmp_path):
+    cfg = make_config(tmp_path)
+
+    written = record(cfg, status=ROUTED, origin=SEARCH, names=["alpha"], turn_id="turn-1")
+
+    assert written is not None
+    assert written["turn_id"] == ""
+    assert read_file(cfg.suggestions_path)["turn_id"] == ""
 
 
 def test_an_empty_search_selection_is_written_because_the_search_did_answer(tmp_path):

@@ -166,6 +166,30 @@ def test_the_route_answers_the_record_it_reads(tmp_path, plugin_api):
     }
 
 
+def test_the_route_normalizes_a_schema_1_record(tmp_path, plugin_api):
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "at": "2026-11-09T06:00:00Z",
+                "session_id": "session-0",
+                "turn_id": "turn-0",
+                "status": "routed",
+                "names": ["legacy"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    answer = plugin_api.answer(path)
+
+    assert list(answer) == list(FIELDS)
+    assert answer["schema"] == 2
+    assert answer["origin"] == "turn"
+    assert answer["names"] == ["legacy"]
+
+
 def test_the_route_answers_idle_when_the_record_is_missing(tmp_path, plugin_api):
     assert plugin_api.answer(tmp_path / "nothing-here.json") == {"status": "idle", "names": []}
 

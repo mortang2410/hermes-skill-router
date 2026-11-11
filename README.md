@@ -565,10 +565,11 @@ run `/skills-routed` to dock the widget and run it again to collapse it. The com
 argument, `/skills-routed <path>`, and defaults to
 `~/.cache/hermes-skill-router/suggestions.json`. The widget reads that file every 500 ms. For a
 routed record it carries the count in the `Suggestions` heading, lists the names one per line, and
-paints the same muted caption line, `turn <turn_id> · <local HH:MM>`, from the record's own
-identifiers. The caption is shown only for a routed record. A missing, corrupt or `inert` record
-shows one idle line instead. It uses theme tones only and never reads plugin config, which is why
-the path is an argument.
+paints one muted caption line from the record's own `origin`, `turn_id` and `at`:
+`turn <turn_id> · <local HH:MM>` for a turn record, and `model search · <local HH:MM>` for a record
+a model search wrote, which has no turn id. The caption is shown only for a routed record. A
+missing, corrupt or `inert` record shows one idle line instead. It uses theme tones only and never
+reads plugin config, which is why the path is an argument.
 
 The display has two independent enable steps:
 
