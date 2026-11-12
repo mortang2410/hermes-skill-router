@@ -73,6 +73,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import unicodedata
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .catalog import strip_catalog
@@ -456,14 +457,19 @@ _SUMMARY_METADATA_KEY = "_compressed_summary"
 #: short pasted marker cannot expire a dump record. A real compaction summary is thousands of bytes.
 _SUMMARY_MIN_CHARS = 2000
 
-#: Invisible characters that pad text without adding substance: zero width space, zero width
-#: non-joiner, zero width joiner, word joiner and the byte order mark.
-_INVISIBLE_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff")
+#: Unicode categories that carry no visible substance and so count as padding rather than text:
+#: separators and spaces, controls, format characters, combining marks, surrogates, and unassigned
+#: code points. Letters, digits, punctuation and symbols do count.
+_PADDING_CATEGORIES = frozenset({"Mn", "Me", "Cc", "Cf", "Cs", "Cn"})
 
 
 def _substantive_length(text: str) -> int:
-    """Count the characters of `text` that carry substance rather than padding."""
-    return sum(1 for char in text if not char.isspace() and char not in _INVISIBLE_CHARS)
+    """Count the characters of `text` that carry visible substance rather than padding."""
+    return sum(
+        1
+        for char in text
+        if not char.isspace() and unicodedata.category(char) not in _PADDING_CATEGORIES
+    )
 
 
 def _is_compaction_summary(message: Mapping, content: str) -> bool:

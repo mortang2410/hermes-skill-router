@@ -1834,6 +1834,25 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
             + suffix
         ),
     }
+    def padded_with(filler):
+        base = full_prefix["content"]
+        return {
+            "role": "user",
+            "content": base[: base.rindex(suffix)]
+            + filler
+            + suffix,
+        }
+
+    filler_width = 2000 - len("".join(full_prefix["content"].split()))
+    for filler in (
+        "\u200b" * filler_width,
+        "\u034f" * filler_width,
+        "\u00ad" * filler_width,
+    ):
+        result = leading(padded_with(filler))
+        assert result is not None, "a padded short marker expired the dump record"
+        assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
     leading_invisible = _window_history(2)
     leading_invisible["messages"].insert(1, dict(padded_invisible))
     invisible_result = rewrite(
