@@ -69,8 +69,16 @@ Contracts C22 (the registration surface, as it is asserted), C23 (the manifest d
 
 - `:177-187` defaults the same stale directory. Replace it with the resolver imported from the
   registration module, so exactly one module asks the launcher. Do not write a second resolver.
+- Ticket 01 landed before you start: `register(ctx)` now calls
+  `ctx.register_hook("post_compaction", on_post_compaction)`. This module's fake `RecordingContext`
+  (`:81-96`) has no such method, so its ten tests fail today with `AttributeError`. Add a `hooks` list
+  and a `register_hook(hook_name, callback)` method to that fake, matching the host's own method
+  (`hermes_cli/plugins_context.py:741`, which forwards to `PluginManager.track_hook`). Keep the
+  dispatcher assertions unchanged.
 - The contract it pins against the host stays as it is: the var-keyword callback requirement and the
   dispatcher call shape.
+- After your change the whole suite must be green, including
+  `test_hermes_plugins_validate_accepts_the_manifest`, which the manifest change fixes.
 
 ## How to verify
 
