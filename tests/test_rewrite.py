@@ -1764,6 +1764,20 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         failing(2, full_prefix) is not None
     ), "a short pasted reference-only marker expired the dump record"
 
+    leading_short = _window_history(2)
+    leading_short["messages"].insert(1, dict(full_prefix))
+    assert (
+        rewrite(
+            leading_short,
+            cfg=cfg,
+            index=index,
+            embed=FakeEmbedder(result=None),
+            rerank=FakeReranker(),
+            session_id=session,
+        )
+        is not None
+    ), "a leading short pasted reference-only marker expired the dump record"
+
     leading = _window_history(2)
     leading["messages"].insert(1, dict(forged))
     assert (
