@@ -676,8 +676,8 @@ boundary, because Hermes may replace the request-local messages for one call wit
 durable history, and the record must not expire there. Within a window the same summary keeps the
 record, so the catalog is dumped once. Two compactions whose summary text is byte-identical cannot be
 told apart by this record, because the host accepts the summarizer's text without comparing it with
-the previous summary, so the text may repeat and the record then keeps the catalog dumped. Only the
-first three user or assistant messages are candidates; tool messages never qualify, so a tool result
+the previous summary, so the text may repeat and the record then keeps the catalog dumped. The first
+three non-system messages are checked, and only user or assistant roles qualify, so a tool result
 that quotes the markers cannot open a window. A leading user message that pastes a complete, long
 summary is indistinguishable from one the host wrote, which is an accepted input condition; a short
 message that quotes the opening marker or the closing suffix, and a short marker padded with
