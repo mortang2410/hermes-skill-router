@@ -1,13 +1,13 @@
 manifest_version: 2
 api_version: 1
 name: hermes-skill-router
-version: "0.1.0"
+version: "0.2.0"
 description: >-
   Removes the always-on skill catalog from each Chat Completions request and
   injects a short reranked shortlist of skill names and descriptions instead.
-requires_hermes: ">=0.22.2"
+requires_hermes: ">=0.22.3"
 provides_tools: [skill_router_search]
-provides_hooks: []
+provides_hooks: [post_compaction]
 # Catalog capability, required by `hermes plugins validate` for the middleware register() adds.
 # This build's manifest parser does not know the key and logs one unknown-field warning per load.
 provides_middleware: ["llm_request"]

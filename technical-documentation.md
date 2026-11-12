@@ -203,8 +203,8 @@ fits, and both name the loader tools `skill_view` and `skills_list`.
 
 Below the header the block carries the selected suggestions, best first. Every suggestion carries its
 name, its description and the absolute read path the host lookup resolved. A request whose messages
-carry no earlier router block opens a compaction window, and its block adds the pinned rows in their
-own section; a request carrying an earlier block carries the suggestions only:
+carry no earlier router block forms the window's opening block, and its block adds the pinned rows in
+their own section; a request carrying an earlier block carries the suggestions only:
 
 ```
 Suggestions:
@@ -231,11 +231,12 @@ suggestion the index no longer describes is listed as `- name` and still carries
 
 The cap is applied once, in the selector. `maxSuggestions` defaults to `10` and accepts `0` to `50`,
 and `0` means unlimited: the renderer lists every row it is handed. The same selector drops a name
-that the request's own earlier blocks already suggested, so a later turn in the same compaction
-window never repeats it. A request whose messages carry no earlier block is the window's opening block
-and lists the pinned rows; a request carrying an earlier block omits them; a request whose earlier
-block a compaction removed starts a new window and lists them again. A name that is both kept and
-suggested appears only once, as a suggestion.
+that the request's own earlier blocks already suggested, so a later turn in the same window never
+repeats it. A request whose messages carry no earlier block is the window's opening block and lists
+the pinned rows; a request carrying an earlier block omits them. A committed compaction event opens
+a new window, and a request whose earlier block that compaction removed is the opening block of that
+window and lists the pinned rows again. A name that is both kept and suggested appears only once, as
+a suggestion.
 
 The first line of the block is a marker, not the removed `## Skills` heading, so a request dump shows
 whether the plugin ran. The rewrite reads a prior block back with the renderer's own recogniser, which
@@ -642,6 +643,12 @@ the only requirement is that every response for one index uses one consistent wi
 
 ## Failure behaviour
 
+One gate runs before the plugin does: Hermes compares the manifest's `requires_hermes` with its own
+version before it imports the plugin. A host below the declared floor imports nothing and registers
+nothing, so it runs no middleware, no tool and no hook, and the host logs one warning naming both
+versions. Such a host never opens a window, because the callback that expires the record is never
+registered. Every failure below is a failure inside a host that passed that gate.
+
 The plugin fails open and inert. Any of these conditions leaves the request exactly as it arrived, so
 the catalog comes back and the model keeps working when it is the first failure in the compaction
 window:
@@ -668,33 +675,23 @@ instead of dumping the catalog a second time. It also suggests nothing after a d
 dump showed every skill and nothing is suggestible for the rest of that window. A payload check for
 the marker is system-role only and reads list-shaped content, so a user message that quotes the
 marker text cannot silence routing. The marker names no skill and does not read as a routed block.
-A compaction replaces the history with a summary, and that summary is the window boundary the next
-request still carries: the record holds the summary's digest, so a later request carrying a
-different summary, whether it appeared, was replaced or was merged into a later one, is a new
-window and the catalog may be dumped once again. A request that is merely shorter is not a
-boundary, because Hermes may replace the request-local messages for one call without compacting
-durable history, and the record must not expire there. Within a window the same summary keeps the
-record, so the catalog is dumped once. Two compactions whose summary text is byte-identical cannot be
-told apart by this record, because the host accepts the summarizer's text without comparing it with
-the previous summary, so the text may repeat and the record then keeps the catalog dumped. The first
-three non-system messages are checked, and only user or assistant roles qualify, so a tool result
-that quotes the markers cannot open a window. A leading user message that pastes a complete, long
-summary is indistinguishable from one the host wrote, which is an accepted input condition; a short
-message that quotes the opening marker or the closing suffix, and a short marker padded with
-whitespace or with characters that have no visible substance (a combining mark, a format character,
-a control, an unassigned code point, or a default-ignorable filler), are not mistaken for a summary;
-a tool message consumes one of the three positions without ever qualifying. A host summary always
-carries the host's fixed header, and a text that quotes the header's signature and the closing
-suffix needs only 1,000 visible characters, while a text that merely copies the opening tag needs
-2,000. The header alone is over 1,600 visible characters, so the lower floor never rejects a real
-summary, and a paste that reproduces the signature is a page-long paste, which is the documented
-input condition. When the first failure arrives in a window the request is
-left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
-one marker message, never a partial strip. `None` is still returned when there is no earlier block,
-no marker and no recorded dump for the session, so a strip without a replacement never loses the
-catalog for nothing. A completed pass whose selection is empty because everything was already
-suggested or fell below the cutoff is healthy, not a failure: it returns nothing and sets no dump
-record.
+A committed compaction event opens a new window. The host fires the `post_compaction` event after a
+compaction commits, and the plugin registers the callback under that name; the callback expires the
+session's dump record, so the next failed pass may send the whole catalog once more. Every compaction
+kind opens a window, because the host fires the event after the commit whatever the kind and the
+plugin reads no kind list. A compaction that moves the transcript to a new session id names both ids,
+so a fork expires the record of the session it left and the record of the session it entered. The
+callback is idempotent: a repeated id discards an absent mark, and a missing, empty or non-string id is
+nothing to do, so a compaction never aborts a turn. No message text is inspected for a summary, so the
+record is a per-session mark opened only by the event: a request that is merely shorter is not a
+boundary, a leading message that pastes a host summary cannot open or keep a window, and two
+compactions whose summary text is byte-identical open two windows. When the first failure arrives in
+a window the request is left unchanged, and on a later failure in the same window the rewrite is a
+clean catalog strip plus one marker message, never a partial strip. `None` is still returned when
+there is no earlier block, no marker and no recorded dump for the session, so a strip without a
+replacement never loses the catalog for nothing. A completed pass whose selection is empty because
+everything was already suggested or fell below the cutoff is healthy, not a failure: it returns
+nothing and sets no dump record.
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build failed`,
@@ -779,9 +776,12 @@ until the fingerprint changes.
 
 ## Verification status
 
-The live checks below were run at commit `7c38fb1`, with Hermes Agent v0.22.2+1671, Python 3.12.11
-and pytest 9.1.1. Their counts are measurements from that tree, whose catalog carried 424 rows; a
-rerun against a later catalog reports its own counts.
+The live checks below were run at commit `7c38fb1`, with Python 3.12.11 and pytest 9.1.1. Their counts
+are measurements from that tree, whose catalog carried 424 rows; a rerun against a later catalog
+reports its own counts. That tree predates the event-driven window: it ran on Hermes Agent
+v0.22.2+1671, while the host that supplies the `post_compaction` event today is Hermes Agent v0.23.1.
+The window boundary above is pinned by `tests/test_readme.py` on the current tree rather than by a
+live compaction.
 
 - Both endpoints answered their health routes, and the embeddings unit was linked from the checkout
   into `~/.config/systemd/user/` and running.

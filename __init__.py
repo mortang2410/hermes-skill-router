@@ -14,10 +14,12 @@ callback declares the two ids it uses and ``**kwargs``. It never raises: an id t
 empty or not a string is nothing to do, so a compaction can never abort a turn.
 
 The middleware callback is declared ``def on_llm_request(request, **kwargs)`` on purpose: the
-dispatcher calls every callback as ``cb(**kwargs)`` with no signature filtering, passing
-``request`` plus ``task_id``, ``turn_id``, ``api_request_id``, ``session_id``, ``platform``,
-``model``, ``provider``, ``base_url``, ``api_mode`` and ``api_call_count``. A narrower signature
-raises ``TypeError``, which the dispatcher catches and skips, so routing would silently never run.
+dispatcher calls every callback as ``cb(**kwargs)`` after filtering the keyword set to the names the
+callback declares (``PluginDispatchMixin._hook_callback_kwargs``, which the dispatcher uses for
+middleware too), passing ``request`` plus ``task_id``, ``turn_id``, ``api_request_id``, ``session_id``,
+``platform``, ``model``, ``provider``, ``base_url``, ``api_mode`` and ``api_call_count``. A narrower
+signature is still called, but only with the keywords it declares, so the ids below would never reach
+the rewrite and the display record would stay empty for every turn.
 ``session_id``, ``turn_id`` and ``api_mode`` from that keyword set are forwarded to the rewrite:
 the ids land in the display record, and the mode gates the rewrite (D8). A missing id stays an
 empty string, and a missing mode falls back to ``chat_completions``.

@@ -4,7 +4,9 @@ A Hermes Agent plugin that takes the always-on skill catalog out of every Chat C
 and appends a short list of the skills that fit the turn. The model keeps `skills_list` and
 `skill_view`, so it can still list or open any skill.
 
-The skill list is embedded once and cached, so a warm turn routes in about a second.
+The skill list is embedded once and cached, so a warm turn does no catalog embedding: it pays for
+the query embed and the rerank. The default 50-row shortlist reranked in a median 0.71 seconds on
+8 CPU threads in our measurement.
 
 The intent of this plugin is to provide a fundamental feature in everyday agentic use. In
 particular, it is for people who keep one super-agent profile that does everything but do not want
@@ -15,8 +17,15 @@ super-agent also pairs well with a memory provider like
 raw history into organized memory that can be distilled into more skills when needed.
 
 This plugin is not a replacement for periodic maintenance of your skill library, such as folding
-related skills into references for a top-level skill. But it is easier for the model to pick a skill
-when it is fresh in context and relevant.
+related skills into references for a top-level skill. That upkeep is worth doing in plain Hermes
+too: clearer skills help the model find the right one without any router. With this plugin it pays
+more, because the router scores the name and the description when it picks a suggestion. Write the
+description in the words you would use to ask for the task, and put the distinctive words first:
+a description that opens with generic words ranks behind one that opens with your own. The embedding
+and the term index read the name plus the description clipped at `maxDescriptionChars` (default 400);
+the reranker reads the name plus the full description, so text past the cap still counts in the final
+ranking. The name is scored in both stages as well, so a vague name costs recall whatever the
+description says.
 
 Every setting, both endpoint protocols, the display record and the measurements are in
 [technical-documentation.md](technical-documentation.md).
@@ -37,6 +46,13 @@ fuses those three orders with reciprocal rank fusion, gives candidates a small c
 when their skill path resolves, and cuts the result to the shortlist. The rerank endpoint then
 scores that shortlist against the same query, and the plugin suggests what scores at or above
 `cutoff`.
+
+The rerank stage runs on `tasksource/tasksource-decider-nano`, a 150M-parameter cross-encoder with
+298 MB of weights that runs on the CPU and needs no GPU. On our machine, with 8 CPU threads, the
+default 50-row shortlist reranked in a median 0.71 seconds over ten calls, with the two slowest calls
+at 4.5 and 5.2 seconds while other jobs competed for the CPU; a 10-row shortlist took 0.15 seconds.
+That is the rerank share of a routed turn's cost, and it buys a relevance score per candidate that
+the plugin compares with `cutoff` and sorts by, instead of trusting the fusion order alone.
 
 If a service is down or too slow, the plugin falls back to the ordinary skill catalog once per
 compaction window, so a bad endpoint costs latency, not a broken turn, and the catalog never
@@ -166,12 +182,12 @@ Pinned skills:
 
 Every suggestion and pinned row carries its name, its description and the path the host's skill lookup
 resolved, which is the file `skill_view` opens. Suggestions are best first, capped at
-`maxSuggestions`, where `0` means no cap. Pinned rows appear in the block of a request whose messages
-carry no earlier router block, which is what opens a compaction window; a request whose messages carry
-an earlier block carries the suggestions only, and a request whose earlier block a compaction removed
-lists the pinned rows again. Rows that `deferredSkills` leaves listed stay under an `Also listed:`
-marker on every turn and are never suggested. The model can open any row with `skill_view`, and
-`skills_list` still lists the whole catalog. When the shortlist misses, it can search by hand:
+`maxSuggestions`, where `0` means no cap. Pinned rows appear in the opening block, the block of a
+request whose messages carry no earlier router block; a request whose messages carry an earlier block
+carries the suggestions only, and a request whose earlier block a compaction removed is the opening
+block again and lists the pinned rows. Rows that `deferredSkills` leaves listed stay under an `Also
+listed:` marker on every turn and are never suggested. The model can open any row with `skill_view`,
+and `skills_list` still lists the whole catalog. When the shortlist misses, it can search by hand:
 `skill_router_search` takes any `query` in the model's own words and returns ranked names,
 descriptions and skill paths.
 

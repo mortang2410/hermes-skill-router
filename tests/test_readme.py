@@ -6,8 +6,9 @@ that pin reference material read ``technical-documentation.md``: the table betwe
 rules and the base URL rejection. They compare the table with ``DEFAULTS`` from the plugin config
 module. A key added to the module without a row fails, a row for a key that does not exist fails, and
 a changed default fails. A row whose bound or effect cell is empty fails too, so the table cannot
-drift into a bare key list. The README keeps the MIT notice, the link to the reference, and the
-promise that neither file uses an em dash.
+drift into a bare key list. The prose pins carry the window boundary, the below-floor host statement
+and the description-authoring rule, so a later edit cannot soften them. The README keeps the MIT
+notice, the link to the reference, and the promise that neither file uses an em dash.
 """
 
 from __future__ import annotations
@@ -154,12 +155,79 @@ def test_the_documentation_documents_the_cap_default_paths_and_opening_rule() ->
     assert "a request carrying an earlier block omits them" in prose, (
         "the documentation does not state the later-turn rule for each compaction window"
     )
-    assert "a request whose earlier block a compaction removed starts a new window" in prose, (
-        "the documentation does not state that a compaction opens a new window"
+    assert "a request whose earlier block that compaction removed is the opening block of that window" in prose, (
+        "the documentation does not state that a removed earlier block makes the next request the "
+        "opening block"
     )
     readme = " ".join(README.read_text(encoding="utf-8").split())
     assert "`0` means no cap" in readme, "README.md does not state the 0 rule"
     assert "`maxSuggestions` | `10`" in readme, "README.md does not carry the cap default"
+
+
+def test_the_documentation_names_the_compaction_event_as_the_window_boundary() -> None:
+    prose = _prose()
+    assert "A committed compaction event opens a new window" in prose, (
+        "the documentation does not name the committed compaction event as the window boundary"
+    )
+    assert "The host fires the `post_compaction` event after a compaction commits" in prose, (
+        "the documentation does not name the post_compaction event the plugin registers"
+    )
+    assert "Every compaction kind opens a window" in prose, (
+        "the documentation does not state that every compaction kind opens a window"
+    )
+    assert (
+        "a fork expires the record of the session it left and the record of the session it entered"
+        in prose
+    ), "the documentation does not state that a fork expires both session ids"
+
+
+def test_the_documentation_states_a_below_floor_host_registers_nothing() -> None:
+    prose = _prose()
+    assert (
+        "Hermes compares the manifest's `requires_hermes` with its own version before it imports the "
+        "plugin" in prose
+    ), "the documentation does not state that the host compares the version floor before the import"
+    assert "A host below the declared floor imports nothing and registers nothing" in prose, (
+        "the documentation does not state what a host below the floor does"
+    )
+    assert "logs one warning naming both versions" in prose, (
+        "the documentation does not state that the host logs one warning naming both versions"
+    )
+
+
+def test_the_readme_states_how_to_write_a_description_the_router_can_pick() -> None:
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "That upkeep is worth doing in plain Hermes too" in readme, (
+        "the README does not say that a tidy skill library helps without the router"
+    )
+    assert "With this plugin it pays more" in readme, (
+        "the README does not say that the same upkeep helps more with the router"
+    )
+    assert "the router scores the name and the description when it picks a suggestion" in readme, (
+        "the README does not name the two fields the router scores"
+    )
+    assert (
+        "The embedding and the term index read the name plus the description clipped at "
+        "`maxDescriptionChars` (default 400)" in readme
+    ), "the README does not state which text the embedding and the term index read"
+    assert "the reranker reads the name plus the full description" in readme, (
+        "the README does not state that the reranker reads the full description"
+    )
+    assert "put the distinctive words first" in readme, (
+        "the README does not state that the distinctive words belong first in a description"
+    )
+
+
+def test_the_readme_names_the_rerank_cost_it_measured() -> None:
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "`tasksource/tasksource-decider-nano`" in readme, (
+        "the README does not name the rerank model"
+    )
+    assert "298 MB of weights" in readme, "the README does not name the reranker's weight size"
+    assert "8 CPU threads" in readme, "the README does not name the CPU thread count"
+    assert "50-row shortlist" in readme and "10-row shortlist" in readme, (
+        "the README does not give the measured time at the default shortlist size and at a short one"
+    )
 
 
 def test_the_documentation_documents_the_display_caption() -> None:

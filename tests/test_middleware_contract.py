@@ -17,7 +17,6 @@ import copy
 import importlib.util
 import inspect
 import json
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +28,10 @@ for entry in (ROOT, ROOT / "tests"):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
+from tests.test_plugin_registration import (  # noqa: E402
+    _host_modules,
+    resolve_host_tree,
+)
 from fake_endpoint import FakeEndpoint  # noqa: E402
 from hermes_skill_router import embed as embed_module  # noqa: E402
 from hermes_skill_router import rerank as rerank_module  # noqa: E402
@@ -85,12 +88,16 @@ class RecordingContext:
         self.settings = dict(settings)
         self.middleware = []
         self.tools = []
+        self.hooks = []
 
     def register_middleware(self, kind, callback):
         self.middleware.append((kind, callback))
 
     def register_tool(self, name, **kwargs):
         self.tools.append((name, kwargs))
+
+    def register_hook(self, hook_name, callback, *, hold_stream=False):
+        self.hooks.append((hook_name, callback))
 
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
@@ -174,27 +181,20 @@ def record_for(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _hermes_install():
-    override = os.environ.get("HERMES_AGENT_ROOT")
-    return Path(override) if override else Path.home() / ".hermes" / "hermes-agent"
-
-
 @pytest.fixture
 def hermes(monkeypatch, tmp_path):
-    """The installed Hermes middleware/dispatch modules, or a skip when there is no install."""
-    install = _hermes_install()
-    if not (install / "hermes_cli" / "middleware.py").is_file():
-        pytest.skip(f"no Hermes install at {install}")
+    """The running host's middleware/dispatch modules, or a skip when they cannot be imported."""
+    install = resolve_host_tree()
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-    if str(install) not in sys.path:
-        sys.path.insert(0, str(install))
-    try:
-        import hermes_cli.middleware as middleware
-        import hermes_cli.plugins as plugins
-        import hermes_cli.plugins_dispatch as dispatch
-    except Exception as exc:  # pragma: no cover - depends on the local install
-        pytest.skip(f"Hermes install at {install} is not importable: {exc}")
-    return SimpleNamespace(middleware=middleware, plugins=plugins, dispatch=dispatch)
+    with _host_modules(install):
+        try:
+            import hermes_cli.middleware as middleware
+            import hermes_cli.plugins as plugins
+            import hermes_cli.plugins_dispatch as dispatch
+        except Exception as exc:  # pragma: no cover - depends on the local install
+            pytest.skip(f"Hermes install at {install} is not importable: {exc}")
+        yield SimpleNamespace(middleware=middleware, plugins=plugins, dispatch=dispatch)
 
 
 class _Dispatcher:
@@ -203,7 +203,13 @@ class _Dispatcher:
     def __init__(self, dispatch_module):
         self._middleware = {}
         self.failures = []
-        self.invoke_middleware = dispatch_module.PluginDispatchMixin.invoke_middleware.__get__(self)
+        mixin = dispatch_module.PluginDispatchMixin
+        self.invoke_middleware = mixin.invoke_middleware.__get__(self)
+        # The running dispatcher slices keywords to a callback's declared names; an older host
+        # passed every keyword, so keep that behaviour when the helper is absent.
+        self._hook_callback_kwargs = getattr(
+            mixin, "_hook_callback_kwargs", lambda callback, payload: dict(payload)
+        )
 
     def _report_hook_failure(self, hook_name, cb, kwargs, exc, *, surface="Hook"):
         self.failures.append((hook_name, cb, exc))
@@ -256,8 +262,12 @@ def _stand_in(callback, request, **context):
 @pytest.fixture(autouse=True)
 def _host_paths(monkeypatch):
     """The host lookup resolves every name, and no dump record leaks between tests."""
+    from hermes_skill_router import router as router_module
     from hermes_skill_router import search as search_module
 
+    # The broadcast is best effort and imports the host's gateway stack, which this process cannot
+    # load; the display record is the seam these tests assert.
+    monkeypatch.setattr(router_module, "_broadcast", lambda turn_id: None)
     search_module.clear_dumps()
     resolver = lambda name: f"/skills/{name}/SKILL.md"
     for module_name, module in list(sys.modules.items()):
