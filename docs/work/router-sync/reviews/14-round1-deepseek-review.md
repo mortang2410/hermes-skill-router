@@ -76,8 +76,9 @@ seven asked checks that passed, including the three mutation probes and the cata
 
 ## Dispositions
 
-Product code: fix round in flight under a code fixer, one test per accepted fix required to fail
-before it and pass after.
+Product code: fixed in `8e59c2b`, reviewed in round 2, and fixed again in `61a9e1c` after round
+2's findings; each accepted fix carries a test that fails when the fix is reverted. Round 2 and
+round 3 are recorded in `15-round2-deepseek-review.md`.
 
 Documents: seventeen of seventeen CONFIRMED and fixed, none refuted. Report
 `/home/wilder/Trash/hermes-review/docs/fix-report.md`. `python3 -m pytest -q` printed
