@@ -452,16 +452,23 @@ _SUMMARY_SUFFIX = "not the summary above ---"
 _SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
+#: The shortest text that counts as a host summary when the private metadata tag is absent, so a
+#: short pasted marker cannot expire a dump record. A real compaction summary is thousands of bytes.
+_SUMMARY_MIN_CHARS = 2000
+
+
 def _is_compaction_summary(message: Mapping, content: str) -> bool:
     """Return whether one message is the host's compaction summary, by the host's own marks.
 
     The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
-    message cannot carry. When that tag is absent, the text must close with the host's suffix and
-    either open with the host's reference-only prefix or carry its merge delimiter, so a user
-    message that merely quotes the opening marker or a closing suffix is not mistaken for one.
+    message cannot carry. When that tag is absent, the text must close with the host's suffix, open
+    with the host's reference-only prefix or carry its merge delimiter, and be long enough to be a
+    real summary rather than a pasted marker.
     """
     if bool(message.get(_SUMMARY_METADATA_KEY)):
         return True
+    if len(content) < _SUMMARY_MIN_CHARS:
+        return False
     if not content.rstrip().endswith(_SUMMARY_SUFFIX):
         return False
     head = content[:96]

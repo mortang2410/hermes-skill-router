@@ -1625,7 +1625,8 @@ def _window_history(earlier, summary=None):
 SUMMARY = (
     "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the summary below.\n"
     "## Conversation Summary\n- earlier work happened\n"
-    "respond to the message below, not the summary above ---"
+    + "".join(f"- detail {turn}\n" for turn in range(250))
+    + "respond to the message below, not the summary above ---"
 )
 
 
@@ -1751,6 +1752,17 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
     stripped = failing(2, tool)
     assert stripped is not None, "a tool message quoting the marker expired the dump record"
     assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    full_prefix = {
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTION REFERENCE ONLY] a short pasted marker\n"
+            "respond to the message below, not the summary above ---"
+        ),
+    }
+    assert (
+        failing(2, full_prefix) is not None
+    ), "a short pasted reference-only marker expired the dump record"
 
     leading = _window_history(2)
     leading["messages"].insert(1, dict(forged))
