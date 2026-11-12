@@ -107,56 +107,48 @@ class Ranked:
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
 _PARTITIONS: Dict[str, Partition] = {}
-#: The compaction windows in which the whole catalog already went out, per session, carrying a
-#: token for the compaction summary the window opened with. Hermes rebuilds every request from
-#: message history and never copies the middleware's ``api_kwargs`` messages back into history, so
-#: a marker appended to that payload never reaches the next turn. This record is that fact instead,
-#: and the compaction summary is the only durable window boundary the request still carries: a
-#: later request whose last summary token differs was compacted since the dump, so the record
-#: expires there and the catalog may be dumped once more. A shorter request list alone is not a
-#: boundary, because Hermes may replace the request-local messages for one call without compacting
-#: durable history, and that must not expire the record.
-_DUMPED: Dict[str, str] = {}
+#: The sessions whose current compaction window already sent the whole catalog. A session is in the
+#: set until the host commits a compaction, which the plugin's ``post_compaction`` callback expires;
+#: no message text decides the boundary. Hermes rebuilds every request from message history and
+#: never copies the middleware's ``api_kwargs`` messages back into history, so a marker appended to
+#: that payload never reaches the next turn. This record is that fact instead: while the session is
+#: in the set, a later failed pass strips the catalog and leaves the dropped marker rather than
+#: sending the whole catalog twice. A shorter request list alone is not a boundary, because Hermes
+#: may replace the request-local messages for one call without compacting durable history.
+_DUMPED: set[str] = set()
 _PARTITIONS_LOCK = threading.Lock()
 
 
-def remember_dump(session_id: str, summary_token: str = "") -> None:
-    """Record that the whole catalog went out in *session_id*'s window.
+def remember_dump(session_id: str) -> None:
+    """Record that the whole catalog went out in *session_id*'s current compaction window."""
+    with _PARTITIONS_LOCK:
+        _DUMPED.add(session_id)
 
-    *summary_token* identifies the compaction summary the request carried, or ``""`` when it
-    carried none. That token is the window's identity: a later request carrying a different
-    summary is a different window, and a request carrying the same one, or none on either side,
-    stays in the window the dump happened in.
+
+def dumped(session_id: str) -> bool:
+    """Return whether the whole catalog already went out in this session's current window.
+
+    A pure read: only :func:`remember_dump` marks and only :func:`expire_dump` clears, so a probe
+    or a second turn cannot open a window by reading the record.
     """
     with _PARTITIONS_LOCK:
-        _DUMPED[session_id] = summary_token
+        return session_id in _DUMPED
+
+
+def expire_dump(session_id: str) -> None:
+    """Open a new window for *session_id*; removing an absent mark is a no-op.
+
+    The plugin's ``post_compaction`` callback calls this when the host commits a compaction, so the
+    next failed pass may send the whole catalog once more.
+    """
+    with _PARTITIONS_LOCK:
+        _DUMPED.discard(session_id)
 
 
 def clear_dumps() -> None:
     """Expire every session's dump record. Tests call this; production never needs it."""
     with _PARTITIONS_LOCK:
         _DUMPED.clear()
-
-
-def dumped(session_id: str, summary_token: Optional[str] = None) -> bool:
-    """Return whether the whole catalog already went out in this session's current window.
-
-    With *summary_token*, the request's own compaction summary decides the window: a non-empty
-    token that differs from the recorded one means the history was compacted since the dump, so the
-    record expires and this call reports ``False``. A missing token, on the request or in the
-    record, is not evidence of a new window and keeps the record. Without the argument the record
-    is only read, which is what a probe or a test that inspects the record needs.
-    """
-    with _PARTITIONS_LOCK:
-        recorded = _DUMPED.get(session_id)
-        if recorded is None:
-            return False
-        if summary_token is None:
-            return True
-        if summary_token != recorded:
-            _DUMPED.pop(session_id, None)
-            return False
-        return True
 
 
 def remember_partition(session_id: str, partition: Partition) -> None:

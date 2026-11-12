@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import logging
 import sys
@@ -160,6 +161,53 @@ class FakeReranker:
         if self.result is None:
             return None
         return self.scores[: len(documents)]
+
+
+class RecordingContext:
+    """Fake plugin context: records the surface ``register`` adds and answers no settings."""
+
+    def __init__(self):
+        self.tools = []
+        self.hooks = []
+        self.middleware = []
+
+    def register_tool(self, name, *args, **kwargs):
+        self.tools.append(name)
+
+    def register_hook(self, hook_name, callback):
+        self.hooks.append((hook_name, callback))
+
+    def register_middleware(self, kind, callback):
+        self.middleware.append((kind, callback))
+
+    def get_config(self, key, default=None):
+        return default
+
+
+def _load_plugin_module():
+    """Load the repository's plugin entry point as a bare module, as a test collector does.
+
+    Without a package, the entry point takes its own ``else`` branch and imports the top-level
+    ``hermes_skill_router`` modules, so the hook callback it registers expires the same record this
+    module's ``rewrite`` reads.
+    """
+    name = "hermes_skill_router_plugin_under_test"
+    spec = importlib.util.spec_from_file_location(name, ROOT / "__init__.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # A path named ``__init__.py`` makes the spec a package importer, so clear the package name the
+    # entry point checks before executing it: this is the bare-module import its ``else`` branch
+    # documents, and it shares the top-level ``hermes_skill_router`` modules with this test.
+    module.__package__ = ""
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def plugin_module():
+    """A freshly loaded plugin entry point, so each test registers into its own fake context."""
+    return _load_plugin_module()
 
 
 @pytest.fixture(autouse=True)
@@ -1660,20 +1708,22 @@ def test_a_dump_record_ignores_a_shrinking_request_list(tmp_path):
     assert "## Skills" not in short["request"]["messages"][0]["content"]
 
 
-def test_a_dump_record_expires_when_a_compaction_summary_appears(tmp_path):
-    """The compaction summary is the window boundary the request still carries.
+def test_a_dump_record_expires_when_the_compaction_event_arrives(tmp_path):
+    """The host's committed compaction is the window boundary, not the summary text.
 
-    The record carries the summary token seen at dump time. The same summary keeps the record; a
-    different one, whether it appears, is replaced or is merged into a later summary, expires it,
-    so the next failure dumps again and the one after strips again.
+    The record decides: the first failure in a window dumps the catalog, a later failure strips it
+    and leaves the marker, and the expire the ``post_compaction`` callback performs opens the next
+    window. The complete host summary sits in the request history the whole time and changes
+    nothing. Two windows open with byte-identical summary text, which a text digest could not tell
+    apart.
     """
     cfg = make_config(tmp_path)
     index = make_index()
     session = "session-window"
 
-    def failing(earlier, summary=None):
+    def failing(earlier):
         return rewrite(
-            _window_history(earlier, summary),
+            _window_history(earlier, SUMMARY),
             cfg=cfg,
             index=index,
             embed=FakeEmbedder(result=None),
@@ -1689,47 +1739,31 @@ def test_a_dump_record_expires_when_a_compaction_summary_appears(tmp_path):
     assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
     assert "## Skills" not in second["request"]["messages"][0]["content"]
 
-    assert failing(1, SUMMARY) is None, "an appearing summary must open a new window"
+    search_module.expire_dump(session)
+    assert failing(1) is None, "the committed compaction did not open a new window"
     assert search_module.dumped(session)
-    assert failing(2, SUMMARY) is not None, "the same summary expired the record"
+    assert failing(2) is not None, "a second failure in the new window dumped the catalog again"
 
-    merged = SUMMARY.replace("earlier work happened", "earlier work happened, then more")
-    assert failing(3, merged) is None, "a merged summary must open a new window"
+    search_module.expire_dump(session)
+    assert failing(3) is None, "a second byte-identical summary text did not open a second window"
     assert search_module.dumped(session)
-    assert failing(4, merged) is not None, "the merged summary expired the record"
-
-    after = merged.replace("then more", "then more and more")
-    good = rewrite(
-        _window_history(6, after),
-        cfg=cfg,
-        index=index,
-        embed=FakeEmbedder(),
-        rerank=FakeReranker(),
-        session_id=session,
-    )
-    assert good is not None, "the record silenced a healthy pass in a new window"
-    assert "## Skills" not in good["request"]["messages"][0]["content"]
-    assert block_of(good).startswith(HEADER.split("\n", 1)[0])
-    assert "- beta: Beta skill" in block_of(good)
-    assert not search_module.dumped(session), "the new window's record did not expire"
+    assert failing(4) is not None, "the second new window dumped the catalog again"
 
 
-def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
-    """Only a summary the host wrote is a window boundary.
+def test_a_complete_pasted_summary_changes_nothing(tmp_path):
+    """A pasted host summary is message text, not a window boundary.
 
-    A user or tool message that merely quotes the opening marker, or both markers without the host's
-    closing suffix, must not expire the record: the catalog stays dumped for the rest of the window.
+    The request carries the host's own header, body and closing suffix on every pass, and the
+    record alone decides both ways: the first failure dumps the catalog, a further failure with the
+    same paste strips it, and a rewrite of the pasted text opens nothing.
     """
     cfg = make_config(tmp_path)
     index = make_index()
-    session = "session-quoted"
+    session = "session-pasted"
 
-    def failing(earlier, extra=None):
-        payload = _window_history(earlier)
-        if extra is not None:
-            payload["messages"].append(extra)
+    def failing(earlier, summary):
         return rewrite(
-            payload,
+            _window_history(earlier, summary),
             cfg=cfg,
             index=index,
             embed=FakeEmbedder(result=None),
@@ -1737,276 +1771,70 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
             session_id=session,
         )
 
-    def leading(message):
-        payload = _window_history(2)
-        payload["messages"].insert(1, dict(message))
-        return rewrite(
-            payload,
-            cfg=cfg,
-            index=index,
-            embed=FakeEmbedder(result=None),
-            rerank=FakeReranker(),
-            session_id=session,
+    assert failing(3, SUMMARY) is None, "the record, not the paste, decided the first dump"
+    assert search_module.dumped(session)
+
+    second = failing(4, SUMMARY)
+    assert second is not None, "a complete pasted summary opened a new window"
+    assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    changed = SUMMARY.replace("earlier work happened", "a later paste says something else")
+    assert failing(5, changed) is not None, "rewriting the pasted summary text opened a window"
+
+
+def test_the_compaction_callback_expires_both_ids_and_tolerates_anything(plugin_module):
+    """The hook expires both ids, never raises, and treats a missing id as nothing to do."""
+    search_module.remember_dump("session-new")
+    search_module.remember_dump("session-old")
+
+    assert (
+        plugin_module.on_post_compaction(
+            session_id="session-new",
+            old_session_id="session-old",
+            kind="summarize",
+            reason="handoff_commit",
+            before_tokens=None,
+            after_tokens=None,
+            messages_removed=2,
+            telemetry_schema_version="hermes.observer.v1",
         )
-
-    assert failing(3) is None
-    quoted = {"role": "user", "content": "[CONTEXT COMPACTION] a user message quoting the marker"}
-    assert failing(2, quoted) is not None, "a quoted marker expired the dump record"
-    forged = {
-        "role": "user",
-        "content": "[CONTEXT COMPACTION] a pasted summary\nnot the summary above ---",
-    }
-    assert failing(2, forged) is not None, "a pasted marker with the closing suffix expired the record"
-    long_tool = {
-        "role": "tool",
-        "content": (
-            "[CONTEXT COMPACTION REFERENCE ONLY] tool output that quotes the marker\n"
-            + "z" * 2200
-            + "\nnot the summary above ---"
-        ),
-    }
-    stripped = leading(long_tool)
-    assert stripped is not None, "a leading tool message expired the dump record"
-    assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-
-    merged_forged = {
-        "role": "user",
-        "content": (
-            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
-            + "x" * 2200
-            + "\nnot the summary above ---"
-        ),
-    }
-    assert (
-        leading(merged_forged) is not None
-    ), "a pasted merge delimiter expired the dump record"
-
-    merged_valid = {
-        "role": "user",
-        "content": (
-            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
-            "[CONTEXT COMPACTION REFERENCE ONLY]\n"
-            + "x" * 2200
-            + "\nnot the summary above ---"
-        ),
-    }
-    assert leading(merged_valid) is None, "a merged host summary did not open a window"
-
-    misplaced = {
-        "role": "user",
-        "content": (
-            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
-            + "x" * 2200
-            + "\n[CONTEXT COMPACTION REFERENCE ONLY] filler then a marker\n"
-            + "not the summary above ---"
-        ),
-    }
-    assert (
-        leading(misplaced) is not None
-    ), "a merged marker with filler before the prefix expired the dump record"
-
-    retained_tail = {
-        "role": "user",
-        "content": (
-            "retained tail that quotes the delimiter "
-            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW] "
-            + "f" * 200
-            + "\n[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
-            "[CONTEXT COMPACTION REFERENCE ONLY]\n"
-            + "x" * 2200
-            + "\nnot the summary above ---"
-        ),
-    }
-    assert (
-        leading(retained_tail) is None
-    ), "a retained tail that quoted the merge delimiter hid the host summary"
-
-    tail_quote_only = {
-        "role": "user",
-        "content": (
-            "retained tail that quotes the delimiter "
-            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW] "
-            + "f" * 2200
-            + "\nnot the summary above ---"
-        ),
-    }
-    assert (
-        leading(tail_quote_only) is not None
-    ), "a quoted merge delimiter in the tail expired the dump record"
-
-    host_header = (
-        "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the summary "
-        "below. This is a handoff from a previous conversation summary.\n## Summary\n- one line\n"
+        is None
     )
-    short_host = {
-        "role": "user",
-        "content": host_header + "y" * 1100 + "\nnot the summary above ---",
-    }
-    assert leading(short_host) is None, "a short host summary did not open a window"
+    assert not search_module.dumped("session-new")
+    assert not search_module.dumped("session-old")
 
-    short_paste = {
-        "role": "user",
-        "content": host_header + "y" * 300 + "\nnot the summary above ---",
-    }
-    assert (
-        leading(short_paste) is not None
-    ), "a short host-shaped paste expired the dump record"
+    assert plugin_module.on_post_compaction() is None
+    assert plugin_module.on_post_compaction(session_id="") is None
+    assert plugin_module.on_post_compaction(session_id=None, old_session_id=7) is None
 
-    abbreviated = {
-        "role": "user",
-        "content": (
-            "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
-            "summary below.\n## Summary\n- one line\n"
-            + "y" * 1100
-            + "\nnot the summary above ---"
-        ),
-    }
-    assert (
-        leading(abbreviated) is not None
-    ), "an abbreviated header with a long body expired the dump record"
-
-    full_prefix = {
-        "role": "user",
-        "content": (
-            "[CONTEXT COMPACTION REFERENCE ONLY] a short pasted marker\n"
-            "respond to the message below, not the summary above ---"
-        ),
-    }
-    padded = {
-        "role": "user",
-        "content": full_prefix["content"] + " " * (2000 - len(full_prefix["content"])),
-    }
-    assert (
-        failing(2, full_prefix) is not None
-    ), "a short pasted reference-only marker expired the dump record"
-    assert (
-        failing(2, padded) is not None
-    ), "a space-padded short marker expired the dump record"
-
-    leading_short = _window_history(2)
-    leading_short["messages"].insert(1, dict(full_prefix))
-    assert (
-        rewrite(
-            leading_short,
-            cfg=cfg,
-            index=index,
-            embed=FakeEmbedder(result=None),
-            rerank=FakeReranker(),
-            session_id=session,
-        )
-        is not None
-    ), "a leading short pasted reference-only marker expired the dump record"
-
-    suffix = "not the summary above ---"
-    base = full_prefix["content"]
-    padded_invisible = {
-        "role": "user",
-        "content": (
-            base[: base.rindex(suffix)]
-            + "\u200b" * (2000 - len("".join(base.split())))
-            + suffix
-        ),
-    }
-    def padded_with(filler):
-        base = full_prefix["content"]
-        return {
-            "role": "user",
-            "content": base[: base.rindex(suffix)]
-            + filler
-            + suffix,
-        }
-
-    filler_width = 2000 - len("".join(full_prefix["content"].split()))
-    for filler in (
-        "\u200b" * filler_width,
-        "\u034f" * filler_width,
-        "\u00ad" * filler_width,
-    ):
-        result = leading(padded_with(filler))
-        assert result is not None, "a padded short marker expired the dump record"
-        assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-
-    jamo_width = 2000 - len("".join(full_prefix["content"].split()))
-    for filler in (
-        "\u115f" * jamo_width,
-        "\u1160" * jamo_width,
-        "\u3164" * jamo_width,
-        "\uffa0" * jamo_width,
-    ):
-        result = leading(padded_with(filler))
-        assert result is not None, "a Jamo-filled short marker expired the dump record"
-        assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-
-    signed_jamo = {
-        "role": "user",
-        "content": (
-            "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
-            "summary below. This is a handoff from a previous\n"
-            + "\u115f" * 1000
-            + "\n"
-            + suffix
-        ),
-    }
-    assert leading(signed_jamo) is not None, "a Jamo-padded signed marker expired the dump record"
-
-    leading_invisible = _window_history(2)
-    leading_invisible["messages"].insert(1, dict(padded_invisible))
-    invisible_result = rewrite(
-        leading_invisible,
-        cfg=cfg,
-        index=index,
-        embed=FakeEmbedder(result=None),
-        rerank=FakeReranker(),
-        session_id=session,
-    )
-    assert invisible_result is not None, "a zero-width-padded short marker expired the dump record"
-    assert invisible_result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-
-    leading_padded = _window_history(2)
-    leading_padded["messages"].insert(1, dict(padded))
-    stripped_padded = rewrite(
-        leading_padded,
-        cfg=cfg,
-        index=index,
-        embed=FakeEmbedder(result=None),
-        rerank=FakeReranker(),
-        session_id=session,
-    )
-    assert (
-        stripped_padded is not None
-    ), "a leading space-padded short marker expired the dump record"
-    assert stripped_padded["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-
-    leading = _window_history(2)
-    leading["messages"].insert(1, dict(forged))
-    assert (
-        rewrite(
-            leading,
-            cfg=cfg,
-            index=index,
-            embed=FakeEmbedder(result=None),
-            rerank=FakeReranker(),
-            session_id=session,
-        )
-        is not None
-    ), "a leading user message pasted as a summary expired the dump record"
+    search_module.remember_dump("session-repeat")
+    assert plugin_module.on_post_compaction(session_id="session-repeat") is None
+    assert not search_module.dumped("session-repeat")
+    assert plugin_module.on_post_compaction(session_id="session-repeat") is None
 
 
-def test_a_metadata_tagged_summary_is_a_window_boundary(tmp_path):
-    """The host's private metadata tag identifies its summary even without the reference prefix."""
+def test_the_registered_hook_opens_the_window_the_rewrite_reads(tmp_path, plugin_module):
+    """The event reaches the window through the registration route the host uses.
+
+    ``register`` stores the callback under ``post_compaction``; invoking the stored callback, as
+    the host's dispatcher does, makes the next failed pass dump the catalog again, after one more
+    failure has already stripped it. This is the route the host takes, not a direct call to the
+    record's expire operation.
+    """
+    ctx = RecordingContext()
+    plugin_module.register(ctx)
+
+    assert ctx.tools == ["skill_router_search"]
+    assert len(ctx.middleware) == 1
+    assert [name for name, _callback in ctx.hooks] == ["post_compaction"]
+    callback = ctx.hooks[0][1]
+
     cfg = make_config(tmp_path)
     index = make_index()
-    session = "session-metadata"
-    summary = {
-        "role": "user",
-        "content": "[CONTEXT COMPACTION] compacted earlier turns\n",
-        "_compressed_summary": True,
-    }
+    session = "session-registered"
+    payload = _window_history(2, SUMMARY)
 
-    def failing(earlier, extra=None):
-        payload = _window_history(earlier)
-        if extra is not None:
-            payload["messages"].insert(1, extra)
+    def failing():
         return rewrite(
             payload,
             cfg=cfg,
@@ -2016,10 +1844,29 @@ def test_a_metadata_tagged_summary_is_a_window_boundary(tmp_path):
             session_id=session,
         )
 
-    assert failing(3) is None
+    assert failing() is None, "the window's first failure leaves the catalog in place"
     assert search_module.dumped(session)
-    assert failing(2, summary) is None, "a metadata-tagged summary did not open a new window"
-    assert search_module.dumped(session)
+
+    stripped = failing()
+    assert stripped is not None, "a later failure in the same window stripped the catalog"
+    assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    assert (
+        callback(
+            session_id=session,
+            old_session_id="",
+            kind="summarize",
+            reason="handoff_commit",
+            before_tokens=None,
+            after_tokens=None,
+            messages_removed=2,
+            telemetry_schema_version="hermes.observer.v1",
+        )
+        is None
+    )
+
+    assert not search_module.dumped(session), "the registered callback did not expire the record"
+    assert failing() is None, "the registered event did not open the window the rewrite reads"
 
 
 def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatch):

@@ -70,10 +70,8 @@ because Hermes replays recorded request bytes on later turns.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import unicodedata
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .catalog import strip_catalog
@@ -198,12 +196,10 @@ def _compose(
         return None
     previous = _prior_blocks(messages)
     dropped_before = _dropped_before(messages)
-    # The dump record carries the compaction summary its window opened with. A request whose last
-    # summary token differs was compacted since the dump, so the catalog may be dumped once more. A
-    # request list that is merely shorter is not a boundary: Hermes may replace the request-local
-    # messages for one call without compacting durable history, and that must not expire the record.
-    summary_token = _summary_token(messages)
-    dumped_before = dumped(session_id, summary_token)
+    # The dump record says whether a failed pass in this session's current window already sent the
+    # whole catalog. The host's post_compaction event expires that mark when a compaction commits,
+    # so no message text is inspected for a summary: a paste can neither open nor keep a window.
+    dumped_before = dumped(session_id)
     if dumped_before:
         dropped_before = True
     stripped, partition = strip_catalog(
@@ -229,7 +225,7 @@ def _compose(
         _log_once(reason)
         inert()
         if not previous and not dropped_before and not dumped_before:
-            remember_dump(session_id, summary_token or "")
+            remember_dump(session_id)
             return None
         return {
             "request": {
@@ -441,108 +437,6 @@ def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str
         if path:
             paths[name] = str(path)
     return paths
-
-
-#: The host's compaction summary opens with this prefix, a summary merged into a retained tail
-#: carries this delimiter, and every summary ends with this suffix. All three are plain ASCII
-#: fragments of the host's own markers, and the host's private metadata key is the provenance
-#: signal when the suffix is absent.
-_SUMMARY_PREFIX = "[CONTEXT COMPACTION"
-_MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT"
-_SUMMARY_SUFFIX = "not the summary above ---"
-_SUMMARY_METADATA_KEY = "_compressed_summary"
-
-
-#: The shortest text that counts as a host summary when the private metadata tag is absent. The host
-#: writes a fixed header that alone carries 1,632 visible characters, so a text that quotes the
-#: header's signature clears the lower floor even with a short body, while a pasted marker that only
-#: copies the opening tag must reach the higher floor. Neither floor is a security boundary: the
-#: page-long paste that reproduces the header is the documented input condition.
-_SUMMARY_MIN_CHARS = 1000
-_SUMMARY_FULL_CHARS = 2000
-_SUMMARY_HEADER_SIGNATURE = (
-    "Earlier turns were compacted into the summary below. This is a handoff from a previous"
-)
-
-#: Unicode categories that carry no visible substance and so count as padding rather than text:
-#: separators and spaces, controls, format characters, combining marks, surrogates, and unassigned
-#: code points. Letters, digits, punctuation and symbols do count.
-_PADDING_CATEGORIES = frozenset({"Mn", "Me", "Cc", "Cf", "Cs", "Cn"})
-
-#: The only Unicode default-ignorable characters outside the padding categories are the four Hangul
-#: fillers, which Python reports as ordinary letters, so the category filter above would count them.
-_DEFAULT_IGNORABLE_FILLERS = frozenset("\u115f\u1160\u3164\uffa0")
-
-
-def _substantive_length(text: str) -> int:
-    """Count the characters of `text` that carry visible substance rather than padding."""
-    return sum(
-        1
-        for char in text
-        if not char.isspace()
-        and unicodedata.category(char) not in _PADDING_CATEGORIES
-        and char not in _DEFAULT_IGNORABLE_FILLERS
-    )
-
-
-def _is_compaction_summary(message: Mapping, content: str) -> bool:
-    """Return whether one message is the host's compaction summary, by the host's own marks.
-
-    The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
-    message cannot carry. When that tag is absent, the text must close with the host's suffix, open
-    with the host's reference-only prefix or contain the merge delimiter followed by that prefix,
-    and carry at least
-    ``_SUMMARY_MIN_CHARS`` characters that are neither whitespace nor invisible padding, so a short
-    marker padded with spaces or zero-width characters is not mistaken for a real summary.
-    """
-    if bool(message.get(_SUMMARY_METADATA_KEY)):
-        return True
-    if not content.rstrip().endswith(_SUMMARY_SUFFIX):
-        return False
-    signed = _SUMMARY_HEADER_SIGNATURE in content
-    floor = _SUMMARY_MIN_CHARS if signed else _SUMMARY_FULL_CHARS
-    if _substantive_length(content) < floor:
-        return False
-    head = content[:96]
-    if head.startswith(_SUMMARY_PREFIX) and "REFERENCE ONLY" in head:
-        return True
-    index = content.find(_MERGED_SUMMARY_DELIMITER)
-    while index >= 0:
-        remainder = content[index + len(_MERGED_SUMMARY_DELIMITER) :]
-        label = remainder[:160]
-        if _SUMMARY_PREFIX in label and "REFERENCE ONLY" in label:
-            return True
-        index = content.find(_MERGED_SUMMARY_DELIMITER, index + 1)
-    return False
-
-
-def _summary_token(messages: Any) -> Optional[str]:
-    """Return a token for the payload's leading compaction summary, or ``None`` when it carries none.
-
-    The token is the summary text's digest, so the same window answers the same token and a merged
-    or replaced summary answers a different one. Only the first few non-system messages are
-    candidates, because that is where the host puts a compaction summary, and only a message that
-    ends with the host's closing suffix qualifies. A user or tool message quoting the marker
-    anywhere else in the history therefore cannot expire a dump record. A missing summary is
-    ``None`` on both sides, so it never expires a record on its own.
-    """
-    if not isinstance(messages, (list, tuple)):
-        return None
-    candidates = 0
-    for message in messages:
-        if not isinstance(message, Mapping) or message.get("role") == "system":
-            continue
-        candidates += 1
-        if candidates > 3:
-            break
-        if message.get("role") not in ("user", "assistant"):
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        if _is_compaction_summary(message, content):
-            return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
-    return None
 
 
 def _recorder(
