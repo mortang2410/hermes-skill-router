@@ -15,13 +15,13 @@ Model page: https://huggingface.co/BAAI/bge-m3
 Install the Hugging Face CLI, then download the model:
 
 ```bash
-pip install -U "huggingface_hub[cli]"
+pip install -U huggingface_hub
 hf download BAAI/bge-m3 --local-dir /path/to/bge-m3
 ```
 
 The CLI guide is at https://huggingface.co/docs/huggingface_hub/en/guides/cli and the download guide is at https://huggingface.co/docs/huggingface_hub/en/guides/download.
 The bundled server reads `onnx/model.onnx` and `tokenizer.json` below `HSR_MODEL_DIR`, so the local directory must keep that layout. The ONNX graph keeps its weights in `onnx/model.onnx_data` (about 2.3 GB), so keep that file beside `model.onnx`; the runtime loads it from the same directory, and a copy of `model.onnx` alone fails to open. The full repository is about 4.5 GB.
-The alternative is the git route: `git lfs install` then `git clone https://huggingface.co/BAAI/bge-m3 /path/to/bge-m3`, which the download guide describes as the classic workflow the CLI replaces.
+The alternative is the git route: `git lfs install` then `git clone https://huggingface.co/BAAI/bge-m3 /path/to/bge-m3`.
 
 ### Option 1: bundled service in this repo
 
@@ -54,7 +54,7 @@ The quick tour shows this pattern with a `--model-id` flag and a volume mounted 
 CPU installs without Docker are documented at https://huggingface.co/docs/text-embeddings-inference/en/local_cpu, which launches `text-embeddings-router --model-id <model>`.
 
 Health check: request `POST http://127.0.0.1:8012/v1/embeddings` with `{"model": "bge-m3", "input": ["test"]}` and expect a response with a `data` list whose entries carry `embedding` vectors.
-TEI lists `/health` in its CLI reference; the embeddings request above is the portable check.
+TEI serves a `/health` route on the same port; the embeddings request above is the portable check.
 
 ### Option 3: Ollama
 
@@ -64,9 +64,9 @@ Ollama hosts a BGE-M3 model at https://ollama.com/library/bge-m3. It lists a 1.2
 ollama pull bge-m3
 ```
 
-Ollama serves embeddings at `POST /api/embed` with `{"model": "bge-m3", "input": "..."}`. Its response uses `embeddings`, not the OpenAI `data` shape, so you need a small proxy that translates between the two.
-Ollama also exposes an OpenAI-compatible embeddings route in recent versions; that claim is unverified because the Ollama docs page was not fetched for this document.
-The model name must match what Ollama knows (`bge-m3`), which is why this option needs the proxy plus a matching `embedModelId`.
+Ollama serves embeddings at `POST /api/embed` with `{"model": "bge-m3", "input": "..."}`. Its response uses `embeddings`, not the OpenAI `data` shape, so the native route needs a small proxy that translates between the two. The native route is documented at https://docs.ollama.com/api/embed.
+Ollama also serves an OpenAI-compatible route at `POST /v1/embeddings` with `model` and `input`, which matches the default `embedPath`; point `embedBaseUrl` at Ollama and no proxy is needed. The OpenAI-compatibility page documents it at https://docs.ollama.com/api/openai-compatibility.
+The model name must match what Ollama knows (`bge-m3`), so set `embedModelId` to that name. Check the first response's vector width with one request, because the plugin requires a consistent width, not 1024.
 
 Health check: `curl http://localhost:11434/api/tags` returns a list that contains `bge-m3`.
 
@@ -148,5 +148,5 @@ Plugin config keys that point at these endpoints:
 
 ## If the endpoint is down
 
-The plugin fails open. When an endpoint is unreachable or times out, the plugin leaves the full catalog in the prompt and adds no suggestions, so routing degrades instead of failing.
+The plugin fails open. When the first routing pass in a compaction window fails because an endpoint is unreachable or times out, the plugin leaves the full catalog in the prompt and adds no suggestions, so routing degrades instead of failing. A later failure in the same window strips the catalog and leaves the dropped-catalog marker.
 `README.md` states this as the fallback, and `technical-documentation.md` lists the failure reasons and the `healthCheckMs` window that skips re-probing a failed endpoint.

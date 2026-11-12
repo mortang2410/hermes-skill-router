@@ -26,8 +26,8 @@ Every setting, both endpoint protocols, the display record and the measurements 
 ## How it works
 
 Hermes dumps the whole skill catalog into the model context. This plugin hides the catalog and only
-surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that gets
-listed at the start of each compaction window.
+surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that
+appears under `Pinned skills:` in the router block.
 
 The embeddings endpoint compares your newest message, together with the typed
 messages before it (up to 10,000 characters), with the skill rows and keeps a cosine order. A BM25
@@ -44,21 +44,25 @@ reaches the model twice in the same window.
 
 ### Historical learning (associations)
 
-The router learns which skills you loaded for similar prompts. It counts each load once per
-session and turn, decays the count with a 14-day half-life, and surfaces skills with support
-of three or more for the current prompt's terms. A missing database means the channel is off
-with one warning and the other two channels still route.
+The router learns which skills you loaded for similar prompts. The association channel decays
+each load with a 30-day half-life and surfaces skills with support of three or more for the
+current prompt's terms. A separate recency bump counts a skill once per session turn and fades
+it with a 14-day half-life, moving it up at most five shortlist positions. A missing database
+means the channel is off with one warning and the other two channels still route.
 
-To seed it from your history, run once:
+To seed it from your history, let one routed turn write the index at `cachePath`, then run:
 
 ```bash
 python3 -m hermes_skill_router.associations --catalog ~/.cache/hermes-skill-router/index.json
 ```
 
 That reads `~/.hermes/state.db` read-only and writes
-`~/.cache/hermes-skill-router/associations.db`. Add `--max-sessions N` for a bounded scan.
-The command is idempotent, so re-running it adds nothing. From then on, new loads are tracked
-live.
+`~/.cache/hermes-skill-router/associations.db`. The `--catalog` file is the index at `cachePath`,
+which defaults to `~/.cache/hermes-skill-router/index.json`; pass your configured path when you
+changed it. The command exits 1 with `cannot read catalog` when that file is absent. Add
+`--max-sessions N` for a bounded scan. The command is idempotent, so re-running it adds nothing.
+The backfill is the only writer: a routed turn opens the store read-only, so rerun the command
+after a batch of work whose loads you want the channel to learn from.
 
 ### Pre-reranking
 
@@ -145,8 +149,8 @@ The defaults are what we run, so you only have to set the two base URLs:
 
 ## Use
 
-A routed turn ends with one extra system message. The sample below is the opening block of a
-compaction window: suggestion rows come first, then the pinned rows:
+A routed turn ends with one extra system message. The sample below carries suggestion rows first,
+then the pinned rows:
 
 ```
 Suggestions:
@@ -162,13 +166,14 @@ Pinned skills:
 
 Every suggestion and pinned row carries its name, its description and the path the host's skill lookup
 resolved, which is the file `skill_view` opens. Suggestions are best first, capped at
-`maxSuggestions`, where `0` means no cap. Pinned rows appear only in the block that opens a compaction
-window; a later turn in the same window carries the suggestions only, and a turn whose messages no
-longer carry an earlier block opens the next window with the pinned rows again. Rows that
-`deferredSkills` leaves listed stay under an `Also listed:` marker on every turn and are never
-suggested. The model can open any row with `skill_view`, and `skills_list` still lists the whole
-catalog. When the shortlist misses, it can search by hand: `skill_router_search` takes any `query` in
-the model's own words and returns ranked names, descriptions and skill paths.
+`maxSuggestions`, where `0` means no cap. Pinned rows appear in the block of a request whose messages
+carry no earlier router block, which is what opens a compaction window; a request whose messages carry
+an earlier block carries the suggestions only, and a request whose earlier block a compaction removed
+lists the pinned rows again. Rows that `deferredSkills` leaves listed stay under an `Also listed:`
+marker on every turn and are never suggested. The model can open any row with `skill_view`, and
+`skills_list` still lists the whole catalog. When the shortlist misses, it can search by hand:
+`skill_router_search` takes any `query` in the model's own words and returns ranked names,
+descriptions and skill paths.
 
 The last decision also appears on screen, and neither place costs a token. The desktop app gets a
 `Skills routed` pane on the right rail, collapsed by default, with the names and one caption line. In
@@ -188,7 +193,7 @@ the ones most setups touch:
 | `embedModelId` | `bge-m3` | Model name sent to the embeddings endpoint. |
 | `rerankBaseUrl` | `http://127.0.0.1:8010` | Rerank endpoint root. |
 | `rerankModel` | `tasksource-decider-nano` | Model name sent to the rerank endpoint. |
-| `eagerSkills` | empty | Skills listed once in each compaction window's opening block, under `Pinned skills:`, with their read paths, and never suggested. |
+| `eagerSkills` | empty | Skills listed under `Pinned skills:` in the router block, with their read paths, and never suggested. |
 | `maxSuggestions` | `10` | Cap on suggested rows, from 0 to 50. `0` means unlimited. |
 
 Every other key, with its bound and its effect, is in the

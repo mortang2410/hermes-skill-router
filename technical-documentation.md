@@ -69,10 +69,19 @@ document length computed over the same catalog. The constants are module constan
 The term index is built during an index build and written atomically to `bm25.json` beside
 `cachePath`, so a restart does not re-tokenise the catalog. It carries a digest over the document
 texts and the scoring constants, and a loader refuses a file whose digest does not match the rows in
-hand. It is loaded once per process. A missing, corrupt or foreign term index contributes no BM25
-ranks, logs one warning, and leaves the other channels routing. A term index that cannot be built
-does not fail the index build: the vector index stays usable, the BM25 channel is disabled for that
-pass with one warning, and the remaining channels are fused.
+hand. It is loaded once per process. A corrupt or foreign term index contributes no BM25 ranks, logs
+one warning, and leaves the other channels routing. A missing one is rebuilt from the catalog rows on
+the next load, even when the vector cache is warm, so an install whose cache predates this channel
+picks it up without waiting for a catalog change. A term index that cannot be built does not fail the
+index build: the vector index stays usable, the BM25 channel is disabled for that pass with one
+warning, and the remaining channels are fused.
+
+Read paths are cached beside the index too, in `paths.json`. Resolving one skill name through the
+host lookup parses every `SKILL.md` under the search roots, which measured about 230 ms per name on a
+420-row catalog, so the pass keeps a name-to-path map keyed to the index fingerprint. A name is
+looked up at most once per pass, and once per catalog across processes. An entry whose file no longer
+exists is resolved again, so a moved skill costs one lookup rather than a stale path, and a new
+catalog starts with an empty map.
 
 The association channel reads the learned load store at `associationDbPath` open read-only. It
 normalises the composed query with the module's own term rule, reads the decayed weights for those
@@ -99,10 +108,11 @@ a candidate just below the cut can still enter it. The defaults are 14 days and 
 
 `fusionMode: live` is the default: the shortlist is the fused, bumped, cut order.
 
-`fusionMode: shadow` computes the same fused, bumped, cut order and logs one line per turn carrying
-each candidate's three channel ranks, its movement and its final position, then returns the cosine
-order cut to `shortlistSize`. It is the side-by-side comparison mode. The line carries skill names
-and ranks only, never request text.
+`fusionMode: shadow` computes the fused order and logs one line per turn carrying each candidate's
+three channel ranks and its fused position before the recency bump, then returns the cosine order
+cut to `shortlistSize`. The logged movement reads `0`, because the bump has not been applied to that
+order. It is the side-by-side comparison mode. The line carries skill names and ranks only, never
+request text.
 
 `fusionMode: cosine` returns the cosine order cut to `shortlistSize` with no BM25 score, no
 association store open and no bump. It is the single rollback switch: no rebuild and no config
@@ -188,9 +198,9 @@ guidance the removed prose provided, including the call to `skills_list` when no
 fits, and both name the loader tools `skill_view` and `skills_list`.
 
 Below the header the block carries the selected suggestions, best first. Every suggestion carries its
-name, its description and the absolute read path the host lookup resolved. The opening block of a
-compaction window adds the pinned rows in their own section, and a later turn in that window carries
-the suggestions only:
+name, its description and the absolute read path the host lookup resolved. A request whose messages
+carry no earlier router block opens a compaction window, and its block adds the pinned rows in their
+own section; a request carrying an earlier block carries the suggestions only:
 
 ```
 Suggestions:
@@ -229,8 +239,7 @@ returns the names in the suggestions section only, never a pinned or also-listed
 
 The strip and the injection are atomic. The plugin removes the section only when it can replace it
 with a non-empty block, so a request with no suggestion and no kept row keeps its original section
-byte for byte. The first line of the block is a marker, not the removed `## Skills` heading, so a
-request dump shows whether the plugin ran.
+byte for byte.
 
 The plugin rewrites only OpenAI-compatible Chat Completions requests, with
 `api_mode: "chat_completions"`. Codex Responses (`api_mode: "codex_responses"`) carries the prompt in
@@ -356,11 +365,11 @@ request.
 `eagerSkills` and `deferredSkills` split the catalog into a pinned list and a routable pool. The
 partition is computed per request from the catalog rows.
 
-- `eagerSkills` names skills that are listed once, in the opening block of a compaction window,
-  under `Pinned skills:`, each with its name, description and read path, and that are never routed. A
-  later turn in the window carries the suggestions only, and the next window opens with them again.
-  Example: `eagerSkills: [writing-for-agents]` keeps that skill in that opening block and out of the
-  index, the rerank call and the display record.
+- `eagerSkills` names skills that the router lists in a compaction window's opening block, under
+  `Pinned skills:`, each with its name, description and read path, and that are never routed. A
+  request whose messages carry no earlier router block is the opening block; a request carrying an
+  earlier block carries the suggestions only. Example: `eagerSkills: [writing-for-agents]` keeps that
+  skill in that opening block and out of the index, the rerank call and the display record.
 - `deferredSkills` names the routable pool. An empty list, the default, means every skill that is not
   eager is routable. A non-empty list restricts routing to the named skills and leaves every other
   skill listed. Example: `deferredSkills: [github-pr-workflow, code-review]` suggests only those two
@@ -376,7 +385,7 @@ partition is computed per request from the catalog rows.
 | Key | Default | Bound | Effect |
 | --- | --- | --- | --- |
 | `enabled` | `true` | boolean | Master switch. False leaves every request untouched. |
-| `eagerSkills` | empty | list of skill names | Skills listed once in each compaction window's opening block under `Pinned skills:`, with name, description and read path, and never routed. A name in both lists is eager. |
+| `eagerSkills` | empty | list of skill names | Skills listed in a compaction window's opening block under `Pinned skills:`, with name, description and read path, and never routed. A name in both lists is eager. |
 | `embedBaseUrl` | `http://127.0.0.1:8012` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Embeddings endpoint root. A rejected value falls back to the default with one warning. |
 | `embedPath` | `/v1/embeddings` | path starting with `/` | Path appended to `embedBaseUrl`. |
 | `embedModelId` | `bge-m3` | non-empty string | `model` field sent to the embeddings endpoint. Part of the index fingerprint, so a change rebuilds the cache. |
@@ -388,8 +397,8 @@ partition is computed per request from the catalog rows.
 | `documentPrefix` | `This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: ` | non-empty string | Exact text before `<name> - <description>` in a rerank document. The default matches the format the shared rerank service parses. |
 | `deferredSkills` | empty | list of skill names | Routable skills. Empty means every non-eager skill is routable; a non-empty list restricts routing to the named skills and lists the rest. |
 | `rerankTimeoutMs` | `20000` | 100..60000 | Per-request rerank timeout. One rerank call carries the whole shortlist. |
-| `routingTimeoutMs` | `30000` | 1000..60000 | Whole routing pass budget, from the query embed through the rerank reply. It starts after the index is loaded or built, so the cold build is never cut, and each per-request timeout is capped at the time left. On expiry the request keeps the bare catalog and gets no suggestions. |
-| `shortlistSize` | `50` | 1..383 | Candidates carried from embeddings into rerank. |
+| `routingTimeoutMs` | `30000` | 1000..60000 | Whole routing pass budget, from the query embed through the rerank reply. It starts after the index is loaded or built, so the cold build is never cut, and each per-request timeout is capped at the time left. On expiry the first failed pass in a window keeps the catalog and gets no suggestions; a later failure strips it and leaves the dropped marker. |
+| `shortlistSize` | `50` | 1..383 | Cut applied to the fused order after the recency bump; the resulting candidates go to rerank. `fusionMode: cosine` cuts the cosine order here instead. |
 | `cutoff` | `0.01` | 0..1 | Rerank `relevance_score` a candidate needs, compared inclusively. |
 | `maxSuggestions` | `10` | 0..50 | Cap on suggested rows, applied once in the selector. Zero means unlimited. |
 | `fusionMode` | `live` | `live`, `shadow` or `cosine` | Fusion mode. `live` returns the fused order, `shadow` logs the diagnostics and returns the cosine order, `cosine` is the rollback switch with no channel read and no bump. |
@@ -400,7 +409,7 @@ partition is computed per request from the catalog rows.
 | `frecencyCapPositions` | `5` | 0..50 | Most shortlist positions the recency bump can move one candidate. Zero disables the bump and keeps the channels fused. |
 | `maxDisplayNames` | `12` | 1..50 | Names the desktop pane and the TUI widget list. The count stays visible when collapsed. |
 | `maxDescriptionChars` | `400` | 3..4000 | Description characters kept per row, in the block and the embedding text. Part of the index fingerprint. |
-| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. |
+| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory, and the term index and read-path map are not kept either. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. The term index (`bm25.json`) and the read-path map (`paths.json`) sit beside it. |
 | `associationDbPath` | empty | path, empty means beside the index | Association store file. Empty puts `associations.db` beside `cachePath`; with `cachePath` also empty, the store is not opened. A missing or unreadable store contributes no association ranks with one warning. |
 | `showSuggestions` | `true` | boolean | Let the display read the last suggestion names. False stops the record and removes an existing one. |
 | `suggestionsPath` | `~/.cache/hermes-skill-router/suggestions.json` | path, empty disables the record | Display record both surfaces read. Names only, never request text. |
@@ -418,12 +427,14 @@ and `http://127.0.0.1:8010` for rerank.
 
 ### Data disclosure
 
-On every routed request the plugin sends the text of the request's last user message to the
-embeddings endpoint. On a cold index build it sends the name and description of every routed skill
-there too. It sends the shortlisted skill names and descriptions to the rerank endpoint. Nothing else
-is sent to either endpoint. Request text is never written to the display record, is never written to
-the index cache and never appears in a warning. The one exception is the decision line described
-below: the plugin's own log carries the query text and the scores of each routing pass.
+On every routed request the plugin sends the composed query to the embeddings endpoint: the newest
+typed user message plus up to 10,000 characters of the typed user messages before it, taken whole
+from the newest backwards as described under How routing works. On a cold index build it sends the
+name and description of every routed skill there too. It sends the same query and the shortlisted
+skill names and descriptions to the rerank endpoint. Nothing else is sent to either endpoint.
+Request text is never written to the display record, is never written to the index cache and never
+appears in a warning. The one exception is the decision line described below: the plugin's own log
+carries the query text and the scores of each routing pass.
 
 ### The decision line
 
@@ -508,7 +519,7 @@ Content-Type: application/json
 
 {
   "model": "tasksource-decider-nano",
-  "query": "<the last user message text>",
+  "query": "<the composed query text>",
   "documents": [
     "This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: code-review - <description>",
     "This skill supplies a procedure, tool, or domain-specific instructions that the agent would actually need to carry out the current task correctly. Skill: github-pr-workflow - <description>"
@@ -578,9 +589,10 @@ variables: `HSR_MODEL_DIR`, `HSR_PORT` (default 8012), `HSR_MODEL_ID` (default `
 `HSR_MAX_LENGTH` (default 512). While it loads its model it answers `{"status": "loading"}` and
 returns 503 for embeddings requests.
 
-The tracked systemd user unit runs the same command, but it carries the author's model path in
-`HSR_MODEL_DIR`, so override that value for your host, for example with
-`systemctl --user edit hermes-skill-router-embed.service`. Then link and start the unit:
+The tracked systemd user unit runs the same command, but it carries the author's paths: the model in
+`HSR_MODEL_DIR`, the checkout in `WorkingDirectory`, and the interpreter in `ExecStart`. Its
+`Documentation=` line points at that checkout too. Override those three values for your host, for
+example with `systemctl --user edit hermes-skill-router-embed.service`. Then link and start the unit:
 
 ```bash
 ln -sfn /path/to/hermes-skill-router/service/hermes-skill-router-embed.service ~/.config/systemd/user/
@@ -643,24 +655,30 @@ window:
 - The plugin is disabled, or the request carries no skills section.
 
 The catalog is shown once per compaction window. The first failed pass in a window leaves the
-request unchanged and sends the whole catalog, a dump, and the rewrite records that fact in the
-payload it returns by appending one marker message, `Skill catalog dropped after a routing
-failure`. Hermes rebuilds the system message each turn from its cached prompt and drops the prior
-turn's appended system messages, so the marker reaches the payload the rewrite sees through the
-history the host carries forward. The rewrite recognises the marker in a later request and, on any
-further failed pass in that window, strips the catalog and appends the marker again instead of
-dumping the catalog a second time. It also suggests nothing after a dump, because the dump showed
-every skill and nothing is suggestible for the rest of that window. The marker names no skill and
-does not read as a routed block. A compaction that removes the marker starts a new window and the
-catalog may be dumped once again. When the first failure arrives in a window the request is left
-unchanged, and when the marker is already present the rewrite is a clean catalog strip plus one
-marker message, never a partial strip. `None` is still returned whenever there is no marker and no
-prior block, so a strip without a replacement never loses the catalog for nothing.
+request unchanged and sends the whole catalog, a dump, and records that fact in a per-session
+durable record next to the search partitions, because Hermes rebuilds every request from message
+history and never copies the middleware's `api_kwargs` messages back into it, so a marker appended
+to that payload never reaches the next turn. On any further failed pass in that window the rewrite
+strips the catalog and appends one marker message, `Skill catalog dropped after a routing failure`,
+instead of dumping the catalog a second time. It also suggests nothing after a dump, because the
+dump showed every skill and nothing is suggestible for the rest of that window. A payload check for
+the marker is system-role only and reads list-shaped content, so a user message that quotes the
+marker text cannot silence routing. The marker names no skill and does not read as a routed block.
+A compaction replaces the history with a shorter one, so a request that arrives with fewer messages
+than its window has already carried is a new window: the record expires there, and the catalog may be
+dumped once again. No request inside a window shrinks the history, so the record never expires there. When the first failure arrives in a window the request is
+left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
+one marker message, never a partial strip. `None` is still returned when there is no earlier block,
+no marker and no recorded dump for the session, so a strip without a replacement never loses the
+catalog for nothing. A completed pass whose selection is empty because everything was already
+suggested or fell below the cutoff is healthy, not a failure: it returns nothing and sets no dump
+record.
 
 Each distinct failure reason logs one warning per process, not one per request, and no warning
 contains the user's text. The reasons are `embed unreachable`, `embed timeout`, `index build failed`,
-`rerank unreachable`, `no user text`, and `unsupported api mode`. A routing pass that runs out of its
-budget logs one line naming that budget, `routing budget <n> ms exhausted`, and then abandons the
+`rerank unreachable`, `no user text`, `no routed skill to suggest`, `the skill index carries no row`,
+`catalog already dumped in this window`, and `unsupported api mode`. A routing pass that runs out of
+its budget logs one line naming that budget, `routing budget <n> ms exhausted`, and then abandons the
 pass. After a failure the endpoint is not probed again until `healthCheckMs` has passed, so a stopped
 service costs one attempt per window instead of one timeout per request. A cache write failure is
 logged once and the in-memory index is still used.
@@ -690,8 +708,9 @@ the background review can still list and open every skill.
 
 ## Spawn coverage
 
-The plugin runs on every request that reaches the middleware, using that request's last user text as
-the query. There is no spawn list. A `/btw` side question, the after-turn background review, a cron
+The plugin runs on every request that reaches the middleware, using that request's composed query
+(the newest typed user message plus the capped typed messages before it) as the query. There is no
+spawn list. A `/btw` side question, the after-turn background review, a cron
 job and a kanban worker get exactly the same treatment as an interactive turn. A forked agent replays
 its own recorded request text, and that text is what ships, so the fork routes on its own turn rather
 than on its parent's wording. `skills_list` and `skill_view` stay available on every spawn, which is
@@ -709,7 +728,9 @@ same vectors and scores, so it suggests the same skills for the same query.
 
 Measured against live endpoints on `127.0.0.1:8012` and
 `127.0.0.1:8010`, during `hermes -z` turns recorded with `HERMES_DUMP_REQUESTS=1`, which writes the
-request to `~/.hermes/sessions/request_dump_*.json` under `request.body`.
+request to `~/.hermes/sessions/request_dump_*.json` under `request.body`. The figures are
+measurements from the tree at commit `7c38fb1`, whose catalog carried 424 rows; a rerun against a
+later catalog reports its own counts.
 
 | Measure | Result |
 | --- | --- |
@@ -736,16 +757,17 @@ until the fingerprint changes.
 
 ## Verification status
 
-Verified live on 2026-11-10, with Hermes Agent v0.22.2+1671, Python 3.12.11 and
-pytest 9.1.1:
+The live checks below were run at commit `7c38fb1`, with Hermes Agent v0.22.2+1671, Python 3.12.11
+and pytest 9.1.1. Their counts are measurements from that tree, whose catalog carried 424 rows; a
+rerun against a later catalog reports its own counts.
 
 - Both endpoints answered their health routes, and the embeddings unit was linked from the checkout
   into `~/.config/systemd/user/` and running.
 - Live `hermes -z` turns with `HERMES_DUMP_REQUESTS=1` produced dumps whose payloads show the catalog
   stripped, the last message starting with `Skills routed for this request`, and the `model` and
   `tools` fields intact. The dumps carry the 70,743, 424, 22,657 and 1,233 numbers above.
-- The cache at the default path matched the live catalog fingerprint with 424 vectors of width 1024,
-  and a warm rewrite over the same payload measured 0.75 to 0.79 seconds.
+- The cache at the default path matched the catalog fingerprint of that tree with 424 vectors of
+  width 1024, and a warm rewrite over the same payload measured 0.75 to 0.79 seconds.
 - The cold build of those 424 rows took 27 chunked calls and 37.8 seconds against the live service,
   with 16-row chunks measured at 1.2 to 2.0 seconds in the live run (2.4 seconds at the peak of a
   repeat).

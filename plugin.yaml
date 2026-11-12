@@ -21,7 +21,7 @@ config_schema:
     type: list
     items: str
     default: []
-    description: "Skill names that are always listed and never routed."
+    description: "Skill names listed in the router block and never routed."
   embedBaseUrl:
     type: str
     default: "http://127.0.0.1:8012"
@@ -77,13 +77,13 @@ config_schema:
     default: 30000
     minimum: 1000
     maximum: 60000
-    description: "Whole routing pass budget in milliseconds (1000..60000), from the query embed through the rerank reply. It starts after the skill index is loaded or built, so the cold build is never cut, and caps each per-request timeout at the time left. On expiry the request keeps the bare skill catalog and gets no suggestions."
+    description: "Whole routing pass budget in milliseconds (1000..60000), from the query embed through the rerank reply. It starts after the skill index is loaded or built, so the cold build is never cut, and caps each per-request timeout at the time left. On expiry the first failed pass in a compaction window keeps the bare skill catalog and gets no suggestions; a later failure strips it and leaves the dropped-catalog marker."
   shortlistSize:
     type: int
     default: 50
     minimum: 1
     maximum: 383
-    description: "Candidates carried from embeddings into rerank (1..383)."
+    description: "Cut applied to the fused order after the recency bump; these candidates go to rerank (1..383). Cosine mode cuts the cosine order here instead."
   cutoff:
     type: float
     default: 0.01
