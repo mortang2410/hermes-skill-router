@@ -471,7 +471,8 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
 
     The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
     message cannot carry. When that tag is absent, the text must close with the host's suffix, open
-    with the host's reference-only prefix or carry its merge delimiter, and carry at least
+    with the host's reference-only prefix or contain the merge delimiter followed by that prefix,
+    and carry at least
     ``_SUMMARY_MIN_CHARS`` characters that are neither whitespace nor invisible padding, so a short
     marker padded with spaces or zero-width characters is not mistaken for a real summary.
     """
@@ -484,7 +485,11 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
     head = content[:96]
     if head.startswith(_SUMMARY_PREFIX) and "REFERENCE ONLY" in head:
         return True
-    return _MERGED_SUMMARY_DELIMITER in content
+    index = content.find(_MERGED_SUMMARY_DELIMITER)
+    if index < 0:
+        return False
+    remainder = content[index + len(_MERGED_SUMMARY_DELIMITER) :]
+    return _SUMMARY_PREFIX in remainder and "REFERENCE ONLY" in remainder
 
 
 def _summary_token(messages: Any) -> Optional[str]:

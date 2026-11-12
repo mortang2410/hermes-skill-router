@@ -1331,7 +1331,7 @@ def test_a_cached_path_matches_the_name_the_host_would_give(tmp_path, monkeypatc
     assert second("alpha") == str(alpha)
     assert calls == [], "a file named by its directory was resolved again"
 
-    beta = tmp_path / "roots" / "beta" / "SKILL.md"
+    beta = tmp_path / "roots" / "other-bom" / "SKILL.md"
     beta.parent.mkdir(parents=True)
     beta.write_text("\ufeff---\nname: beta\n---\n\nbody\n", encoding="utf-8")
     assert library_module._path_is_usable(str(beta), "beta"), "a BOM broke the name check"

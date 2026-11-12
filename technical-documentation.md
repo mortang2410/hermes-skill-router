@@ -675,11 +675,13 @@ window and the catalog may be dumped once again. A request that is merely shorte
 boundary, because Hermes may replace the request-local messages for one call without compacting
 durable history, and the record must not expire there. Within a window the same summary keeps the
 record, so the catalog is dumped once. Two compactions whose summary text is byte-identical cannot be
-told apart by this record; the host merges later turns into the summary, so its text changes at each
-compaction. A user message that pastes a complete, long summary at the head of the history is
-indistinguishable from one the host wrote, which is an accepted input condition; a short message
-that quotes the opening marker or the closing suffix, and a short marker padded with whitespace or
-invisible characters, are not mistaken for a summary. When the first failure arrives in a window the request is
+told apart by this record, because the host accepts the summarizer's text without comparing it with
+the previous summary, so the text may repeat and the record then keeps the catalog dumped. Only the
+first three user or assistant messages are candidates; tool messages never qualify, so a tool result
+that quotes the markers cannot open a window. A leading user message that pastes a complete, long
+summary is indistinguishable from one the host wrote, which is an accepted input condition; a short
+message that quotes the opening marker or the closing suffix, and a short marker padded with
+whitespace or invisible characters, are not mistaken for a summary. When the first failure arrives in a window the request is
 left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
 one marker message, never a partial strip. `None` is still returned when there is no earlier block,
 no marker and no recorded dump for the session, so a strip without a replacement never loses the
