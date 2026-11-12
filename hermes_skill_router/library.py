@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass, replace
@@ -763,23 +764,31 @@ def reset_path_memo() -> None:
 
 
 def _declared_name(path: str) -> Optional[str]:
-    """Return the ``name`` the skill file at *path* declares, or ``None`` when it has none."""
+    """Return the name the host would give the skill file at *path*, or ``None`` when unreadable.
+
+    The host reads the first front-matter block and falls back to the parent directory's name when
+    that block carries no ``name``, so this mirrors both: a cached path whose file names another
+    skill, or whose directory does not name it either, is resolved again. The leading BOM is
+    stripped for the same reason the host strips it, or the fence check would fail on a file a
+    Windows editor saved.
+    """
+    parent = os.path.basename(os.path.dirname(path))
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             head = handle.read(4096)
     except OSError:
         return None
-    lines = head.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    for line in lines[1:]:
-        stripped = line.strip()
-        if stripped == "---":
-            break
-        if stripped.startswith("name:"):
-            value = stripped[len("name:"):].strip().strip("'\"")
-            return value or None
-    return None
+    head = head.removeprefix("\ufeff")
+    if not head.startswith("---"):
+        return parent or None
+    end = re.search(r"\n---\s*(?:\n|$)", head[3:])
+    block = head[3 : end.start() + 3] if end else head[3:]
+    for line in block.splitlines():
+        if line.strip().startswith("name:"):
+            value = line.split(":", 1)[1].strip().strip("'\"")
+            if value:
+                return value
+    return parent or None
 
 
 def _path_is_usable(path: str, name: str) -> bool:

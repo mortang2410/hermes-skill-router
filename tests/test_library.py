@@ -1307,3 +1307,32 @@ def test_a_project_root_switch_in_one_process_uses_the_new_profile(tmp_path, mon
     second = library_module.path_resolver(cfg, _path_index(), lambda name: b_alpha)
     assert second("alpha") == b_alpha, "a project switch reused the previous profile's path"
     library_module.reset_path_memo()
+
+
+def test_a_cached_path_matches_the_name_the_host_would_give(tmp_path, monkeypatch):
+    """Validation mirrors the host: front-matter name, else the parent directory's name."""
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(tmp_path / "roots")])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    alpha = tmp_path / "roots" / "alpha" / "SKILL.md"
+    alpha.parent.mkdir(parents=True)
+    alpha.write_text("---\ndescription: no name here\n---\n\nbody\n", encoding="utf-8")
+
+    first = library_module.path_resolver(cfg, _path_index(), lambda name: str(alpha))
+    assert first("alpha") == str(alpha)
+
+    calls = []
+
+    def resolve(name):
+        calls.append(name)
+        return str(alpha)
+
+    second = library_module.path_resolver(cfg, _path_index(), resolve)
+    assert second("alpha") == str(alpha)
+    assert calls == [], "a file named by its directory was resolved again"
+
+    beta = tmp_path / "roots" / "beta" / "SKILL.md"
+    beta.parent.mkdir(parents=True)
+    beta.write_text("\ufeff---\nname: beta\n---\n\nbody\n", encoding="utf-8")
+    assert library_module._path_is_usable(str(beta), "beta"), "a BOM broke the name check"
+    library_module.reset_path_memo()
