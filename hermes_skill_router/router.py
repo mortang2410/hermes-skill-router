@@ -70,6 +70,7 @@ because Hermes replays recorded request bytes on later turns.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -196,11 +197,12 @@ def _compose(
         return None
     previous = _prior_blocks(messages)
     dropped_before = _dropped_before(messages)
-    # The dump record carries the highest message count its window has seen. A request with fewer
-    # messages than that is a new window: a compaction replaced the history, and the catalog may be
-    # dumped once more. Nothing inside a window shrinks the history, so the record never expires
-    # there.
-    dumped_before = dumped(session_id, _message_count(messages))
+    # The dump record carries the compaction summary its window opened with. A request whose last
+    # summary token differs was compacted since the dump, so the catalog may be dumped once more. A
+    # request list that is merely shorter is not a boundary: Hermes may replace the request-local
+    # messages for one call without compacting durable history, and that must not expire the record.
+    summary_token = _summary_token(messages)
+    dumped_before = dumped(session_id, summary_token)
     if dumped_before:
         dropped_before = True
     stripped, partition = strip_catalog(
@@ -226,7 +228,7 @@ def _compose(
         _log_once(reason)
         inert()
         if not previous and not dropped_before and not dumped_before:
-            remember_dump(session_id, _message_count(messages))
+            remember_dump(session_id, summary_token or "")
             return None
         return {
             "request": {
@@ -440,9 +442,32 @@ def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str
     return paths
 
 
-def _message_count(messages: Any) -> int:
-    """Return the number of messages a payload carries, the window's high-water unit."""
-    return len(messages) if isinstance(messages, list) else 0
+#: The host's compaction summary opens with this prefix, and a summary merged into a retained tail
+#: carries this delimiter. Both are plain ASCII so the check does not depend on the host's dashes.
+_SUMMARY_PREFIX = "[CONTEXT COMPACTION"
+_MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT"
+
+
+def _summary_token(messages: Any) -> Optional[str]:
+    """Return a token for the payload's latest compaction summary, or ``None`` when it carries none.
+
+    The token is the summary text's digest, so the same window answers the same token and a merged
+    or replaced summary answers a different one. The check reads list-shaped text only and requires
+    the host's own summary prefix or merge delimiter, so a user message quoting the marker cannot
+    expire a dump record. A missing summary is ``None`` on both sides, so it never expires a record
+    on its own.
+    """
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if content[:64].startswith(_SUMMARY_PREFIX) or _MERGED_SUMMARY_DELIMITER in content:
+            return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
+    return None
 
 
 def _recorder(

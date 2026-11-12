@@ -78,10 +78,14 @@ warning, and the remaining channels are fused.
 
 Read paths are cached beside the index too, in `paths.json`. Resolving one skill name through the
 host lookup parses every `SKILL.md` under the search roots, which measured about 230 ms per name on a
-420-row catalog, so the pass keeps a name-to-path map keyed to the index fingerprint. A name is
-looked up at most once per pass, and once per catalog across processes. An entry whose file no longer
-exists is resolved again, so a moved skill costs one lookup rather than a stale path, and a new
-catalog starts with an empty map.
+420-row catalog, so the pass keeps a name-to-path map keyed to the index fingerprint and to the
+active skill roots. The roots key keeps two profiles that share one cache directory out of each
+other's map, and the file is named after them, `paths.<digest>.json`, with the plain `paths.json`
+name when the host cannot report its roots. A name is looked up at most once per pass, a failed
+lookup included, and once per catalog across processes. Every hit is checked again against the file
+it names: a path whose file is gone, or whose file now declares another skill, is dropped and
+resolved again, so a moved or replaced skill costs one lookup rather than a stale path. A new
+catalog starts with an empty map, and failures are never saved.
 
 The association channel reads the learned load store at `associationDbPath` open read-only. It
 normalises the composed query with the module's own term rule, reads the decayed weights for those
@@ -108,11 +112,10 @@ a candidate just below the cut can still enter it. The defaults are 14 days and 
 
 `fusionMode: live` is the default: the shortlist is the fused, bumped, cut order.
 
-`fusionMode: shadow` computes the fused order and logs one line per turn carrying each candidate's
-three channel ranks and its fused position before the recency bump, then returns the cosine order
-cut to `shortlistSize`. The logged movement reads `0`, because the bump has not been applied to that
-order. It is the side-by-side comparison mode. The line carries skill names and ranks only, never
-request text.
+`fusionMode: shadow` computes the fused order, applies the recency bump and the cut, then logs one
+line per turn carrying each candidate's three channel ranks, its movement and its final position, and
+returns the cosine order cut to `shortlistSize`. It is the side-by-side comparison mode. The line
+carries skill names and ranks only, never request text.
 
 `fusionMode: cosine` returns the cosine order cut to `shortlistSize` with no BM25 score, no
 association store open and no bump. It is the single rollback switch: no rebuild and no config
@@ -409,7 +412,7 @@ partition is computed per request from the catalog rows.
 | `frecencyCapPositions` | `5` | 0..50 | Most shortlist positions the recency bump can move one candidate. Zero disables the bump and keeps the channels fused. |
 | `maxDisplayNames` | `12` | 1..50 | Names the desktop pane and the TUI widget list. The count stays visible when collapsed. |
 | `maxDescriptionChars` | `400` | 3..4000 | Description characters kept per row, in the block and the embedding text. Part of the index fingerprint. |
-| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory, and the term index and read-path map are not kept either. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. The term index (`bm25.json`) and the read-path map (`paths.json`) sit beside it. |
+| `cachePath` | `~/.cache/hermes-skill-router/index.json` | path, empty disables persistence | Persisted index. Empty means each process builds its own index and keeps it in memory, and the term index and read-path map are not kept either. A routed catalog with fewer than half the rows of this file is refused and the file is kept, so remove it to force a rebuild. The term index (`bm25.json`) and the read-path map (`paths.json`, or `paths.<digest>.json` once the host reports its skill roots) sit beside it. |
 | `associationDbPath` | empty | path, empty means beside the index | Association store file. Empty puts `associations.db` beside `cachePath`; with `cachePath` also empty, the store is not opened. A missing or unreadable store contributes no association ranks with one warning. |
 | `showSuggestions` | `true` | boolean | Let the display read the last suggestion names. False stops the record and removes an existing one. |
 | `suggestionsPath` | `~/.cache/hermes-skill-router/suggestions.json` | path, empty disables the record | Display record both surfaces read. Names only, never request text. |
@@ -664,9 +667,13 @@ instead of dumping the catalog a second time. It also suggests nothing after a d
 dump showed every skill and nothing is suggestible for the rest of that window. A payload check for
 the marker is system-role only and reads list-shaped content, so a user message that quotes the
 marker text cannot silence routing. The marker names no skill and does not read as a routed block.
-A compaction replaces the history with a shorter one, so a request that arrives with fewer messages
-than its window has already carried is a new window: the record expires there, and the catalog may be
-dumped once again. No request inside a window shrinks the history, so the record never expires there. When the first failure arrives in a window the request is
+A compaction replaces the history with a summary, and that summary is the window boundary the next
+request still carries: the record holds the summary's digest, so a later request carrying a
+different summary, whether it appeared, was replaced or was merged into a later one, is a new
+window and the catalog may be dumped once again. A request that is merely shorter is not a
+boundary, because Hermes may replace the request-local messages for one call without compacting
+durable history, and the record must not expire there. Within a window the same summary keeps the
+record, so the catalog is dumped once. When the first failure arrives in a window the request is
 left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
 one marker message, never a partial strip. `None` is still returned when there is no earlier block,
 no marker and no recorded dump for the session, so a strip without a replacement never loses the

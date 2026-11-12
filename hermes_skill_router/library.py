@@ -39,7 +39,7 @@ import os
 import tempfile
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import associations, bm25
 from .catalog import CatalogRows
@@ -175,26 +175,39 @@ def path_resolver(
 
     The host lookup behind *resolve* scans and parses every ``SKILL.md`` under the search roots to
     resolve one name, which measured about 230 ms per call on the live 420-row catalog. One pass
-    must therefore never ask it twice for the same name, and a later pass or a later process must
-    not ask again at all. Each index fingerprint owns one map, saved beside the index cache: a new
-    catalog starts with an empty map, and an entry loaded from disk is reused only while the file it
-    names still exists, so a skill that moved is resolved again instead of pointing at a missing
-    file. ``None`` stays ``None``, so a caller that resolves nothing keeps that behavior.
+    must therefore never ask it twice for the same name, a failed lookup included, and a later pass
+    or a later process must not ask again at all. Each catalog fingerprint and each set of active
+    skill roots owns one map, saved beside the index cache: a new catalog or another profile starts
+    with an empty map, a cached path is reused only while its file still exists and still declares
+    that name, and a skill that moved or was replaced is resolved again instead of pointing at a
+    stale or foreign file. ``None`` stays ``None``, so a caller that resolves nothing keeps that
+    behavior.
     """
     if resolve is None:
         return None
-    saved = _saved_paths(cfg, index)
+    namespace = _roots_namespace()
+    saved = _saved_paths(cfg, index, namespace)
+    misses: Set[str] = set()
+    verified: Set[str] = set()
 
     def _resolve(name: str) -> Optional[str]:
         path = saved.get(name)
         if path is not None:
-            return path
+            if name in verified or _path_is_usable(path, name):
+                verified.add(name)
+                return path
+            with _MEMO_LOCK:
+                saved.pop(name, None)
+        if name in misses:
+            return None
         resolved = resolve(name)
         if not resolved:
+            misses.add(name)
             return None
         with _MEMO_LOCK:
             saved[name] = str(resolved)
-        _write_paths(cfg, index, saved)
+        verified.add(name)  # a path the host just resolved is trusted for the rest of this pass
+        _write_paths(cfg, index, namespace, saved)
         return saved[name]
 
     return _resolve
@@ -685,27 +698,116 @@ def _cache_path(cfg: Config) -> Optional[str]:
     return os.path.expanduser(raw)
 
 
-def _paths_path(cfg: Config) -> Optional[str]:
-    """Return the saved read-path map's file beside the vector cache, or ``None`` offline."""
+def _paths_path(cfg: Config, namespace: str = "") -> Optional[str]:
+    """Return the saved read-path map's file beside the vector cache, or ``None`` offline.
+
+    The file name carries the active skill roots' digest, so two profiles sharing one cache
+    directory keep separate maps instead of overwriting each other's entries. A host that cannot
+    report its roots keeps the plain ``paths.json`` name and the earlier behavior.
+    """
     path = _cache_path(cfg)
     if path is None:
         return None
-    return os.path.join(os.path.dirname(path), PATH_CACHE_FILENAME)
+    directory = os.path.dirname(path)
+    name = f"paths.{namespace}.json" if namespace else PATH_CACHE_FILENAME
+    return os.path.join(directory, name)
 
 
-def _saved_paths(cfg: Config, index: Index) -> Dict[str, str]:
-    """Return this process' read-path map for *index*, reading it once per cache file.
+def _active_roots() -> List[str]:
+    """Return the host's active skill search roots, or an empty list when it cannot report them.
 
-    The map belongs to one catalog in one cache directory, so it is memoised under both: two
-    profiles, and two tests that share a fingerprint but not a cache path, never share a map. An
-    entry whose file no longer exists is dropped, because a skill that moved changed no catalog text
-    and so cannot invalidate the map by fingerprint alone. With persistence off there is no map to
-    keep, and every pass starts from an empty one.
+    The host has carried two shapes of this call: the public ``skill_search_dirs`` pair and the
+    earlier private one. Both are read here for the cache namespace only, so a host that exports
+    neither scopes no map and behaves as before.
     """
-    path = _paths_path(cfg)
+    try:
+        from tools.skills_tool import skill_search_dirs
+    except Exception:
+        skill_search_dirs = None
+    if skill_search_dirs is not None:
+        try:
+            roots, _active = skill_search_dirs()
+        except Exception:
+            logger.debug("skill index: the host skill roots failed", exc_info=True)
+            return []
+        return [str(root) for root in roots or ()]
+    try:
+        from tools.skills_tool import _skill_search_dirs
+    except Exception:
+        return []
+    try:
+        project_dirs, all_dirs, _active = _skill_search_dirs()
+    except Exception:
+        logger.debug("skill index: the host skill roots failed", exc_info=True)
+        return []
+    return [str(root) for root in list(project_dirs or ()) + list(all_dirs or ())]
+
+
+def _roots_namespace() -> str:
+    """Return the active skill roots' digest, the profile identity a saved path map belongs to.
+
+    The default cache path is shared by every profile on a machine, while skill roots differ per
+    profile. The digest keeps one profile's resolved paths out of another profile's map. A host
+    that cannot report its roots scopes nothing and keeps the earlier behavior.
+    """
+    global _ROOT_NAMESPACE
+    with _MEMO_LOCK:
+        if _ROOT_NAMESPACE is not None:
+            return _ROOT_NAMESPACE
+        roots = sorted({root for root in _active_roots() if root})
+        digest = hashlib.sha256("\x00".join(roots).encode("utf-8")).hexdigest()[:16] if roots else ""
+        _ROOT_NAMESPACE = digest
+        return digest
+
+
+def reset_path_memo() -> None:
+    """Forget the process-level read-path memos. Tests call this; production never needs it."""
+    global _ROOT_NAMESPACE
+    with _MEMO_LOCK:
+        _PATH_MEMO.clear()
+        _ROOT_NAMESPACE = None
+
+
+def _declared_name(path: str) -> Optional[str]:
+    """Return the ``name`` the skill file at *path* declares, or ``None`` when it has none."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return None
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if stripped.startswith("name:"):
+            value = stripped[len("name:"):].strip().strip("'\"")
+            return value or None
+    return None
+
+
+def _path_is_usable(path: str, name: str) -> bool:
+    """Return whether a cached path still names *name* on disk, so a moved skill is resolved again."""
+    if not os.path.isfile(path):
+        return False
+    return _declared_name(path) == name
+
+
+def _saved_paths(cfg: Config, index: Index, namespace: str) -> Dict[str, str]:
+    """Return this process' read-path map for *index* in *namespace*, reading it once per file.
+
+    The map belongs to one catalog in one cache directory under one set of skill roots, so it is
+    memoised under all three: two profiles, and two tests that share a fingerprint but not a cache
+    path, never share a map. An entry whose file no longer exists is dropped here, and the resolver
+    validates every later hit again, because a file can move while the process stays warm. With
+    persistence off there is no map to keep, and every pass starts from an empty one.
+    """
+    path = _paths_path(cfg, namespace)
     if path is None:
         return {}
-    key = (path, index.fingerprint)
+    key = (path, namespace, index.fingerprint)
     with _MEMO_LOCK:
         saved = _PATH_MEMO.get(key)
         if saved is not None:
@@ -726,6 +828,7 @@ def _saved_paths(cfg: Config, index: Index) -> Dict[str, str]:
         if (
             isinstance(data, dict)
             and data.get("version") == PATH_CACHE_VERSION
+            and data.get("roots") == namespace
             and data.get("fingerprint") == index.fingerprint
             and isinstance(data.get("paths"), dict)
         ):
@@ -738,19 +841,21 @@ def _saved_paths(cfg: Config, index: Index) -> Dict[str, str]:
         return saved
 
 
-def _write_paths(cfg: Config, index: Index, paths: Dict[str, str]) -> None:
+def _write_paths(cfg: Config, index: Index, namespace: str, paths: Dict[str, str]) -> None:
     """Save the read-path map beside the index cache, or log the failure once.
 
     The file is a cache: a lost update costs one later host lookup, never a wrong path, so the
-    replace is atomic and not fsynced.
+    replace is atomic and not fsynced. The stored namespace is the active skill roots' digest, so a
+    different profile never reads entries that belong to another one.
     """
-    path = _paths_path(cfg)
+    path = _paths_path(cfg, namespace)
     if path is None:
         return
     with _MEMO_LOCK:  # the map is shared between passes; snapshot it before iterating
         snapshot = dict(paths)
     payload = {
         "version": PATH_CACHE_VERSION,
+        "roots": namespace,
         "fingerprint": index.fingerprint,
         "paths": snapshot,
     }
@@ -926,11 +1031,14 @@ _MEMO: Dict[str, Index] = {}
 #: The loaded term index per path and the digest it matched, so a warm process reads it once.
 _TERM_MEMO: Dict[str, Tuple[str, Optional[bm25.TermIndex]]] = {}
 
-#: The read-path map per cache file and fingerprint: one host lookup per name per catalog.
-_PATH_MEMO: Dict[Tuple[str, str], Dict[str, str]] = {}
+#: The read-path map per cache file, skill-root namespace and fingerprint: one lookup per catalog.
+_PATH_MEMO: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+
+#: The active skill roots' digest for this process, computed once and reused by every pass.
+_ROOT_NAMESPACE: Optional[str] = None
 
 #: Saved read-path map schema. Bumped when the file's shape changes, which invalidates every map.
-PATH_CACHE_VERSION = 1
+PATH_CACHE_VERSION = 3
 
 #: The saved read-path map's file name, beside the vector index cache.
 PATH_CACHE_FILENAME = "paths.json"

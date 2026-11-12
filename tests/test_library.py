@@ -1158,3 +1158,133 @@ def test_a_refused_sibling_removal_keeps_one_file_and_names_it(tmp_path, monkeyp
     assert len(siblings) == 1, "exactly the one file the removal refused to discard"
     messages = " ".join(caplog.messages)
     assert str(siblings[0]) in messages, "the kept sibling's path is logged"
+
+
+def _skill_file(root, name, body="body"):
+    """Write one skill file with the front matter the host resolver reads."""
+    path = Path(root) / name / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {name}\ndescription: {name} skill\n---\n\n{body}\n", encoding="utf-8"
+    )
+    return str(path)
+
+
+def _path_index(fingerprint="fp-paths"):
+    return library_module.Index(
+        names=["alpha"], descriptions=["Alpha"], vectors=[[1.0, 0.0]], dim=2,
+        fingerprint=fingerprint,
+    )
+
+
+def test_saved_read_paths_are_reused_by_a_later_process(tmp_path, monkeypatch):
+    """A warm process answers from the saved map instead of scanning the skill roots again."""
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(tmp_path / "roots")])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    alpha = _skill_file(tmp_path / "roots", "alpha")
+    calls = []
+
+    def resolve(name):
+        calls.append(name)
+        return alpha
+
+    first = library_module.path_resolver(cfg, _path_index(), resolve)
+    assert first("alpha") == alpha
+    assert calls == ["alpha"]
+    assert list(tmp_path.glob("paths*.json")), "the map was not saved"
+
+    library_module.reset_path_memo()
+    second = library_module.path_resolver(cfg, _path_index(), resolve)
+    assert second("alpha") == alpha
+    assert calls == ["alpha"], "a later process scanned the roots again"
+    library_module.reset_path_memo()
+
+
+def test_a_moved_skill_is_resolved_again_while_the_process_stays_warm(tmp_path, monkeypatch):
+    """A cached hit is validated against the file and its declared name before it is reused.
+
+    Each turn builds its own resolver, so the map outlives the pass while validation runs again on
+    the next hit: a deleted file and a file that now declares another skill both force a lookup.
+    """
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(tmp_path / "roots")])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    old = _skill_file(tmp_path / "roots", "alpha")
+    new = _skill_file(tmp_path / "other", "alpha")
+
+    def pass_with(path):
+        resolver = library_module.path_resolver(cfg, _path_index(), lambda name: path)
+        return resolver("alpha")
+
+    assert pass_with(old) == old
+
+    Path(old).unlink()
+    assert pass_with(new) == new, "the stale hit was reused after the file moved"
+
+    Path(new).write_text("---\nname: other\n---\n\nbody\n", encoding="utf-8")
+    replaced = _skill_file(tmp_path / "third", "alpha")
+    assert pass_with(replaced) == replaced, "a hit whose file names another skill was reused"
+    library_module.reset_path_memo()
+
+
+def test_saved_read_paths_are_scoped_to_the_active_skill_roots(tmp_path, monkeypatch):
+    """Two profiles sharing one cache directory never read each other's resolved paths."""
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    a_roots = tmp_path / "profile-a"
+    b_roots = tmp_path / "profile-b"
+    a_alpha = _skill_file(a_roots, "alpha")
+    b_alpha = _skill_file(b_roots, "alpha")
+    calls = []
+
+    def resolve_a(name):
+        calls.append("A")
+        return a_alpha
+
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(a_roots)])
+    library_module.reset_path_memo()
+    first = library_module.path_resolver(cfg, _path_index(), resolve_a)
+    assert first("alpha") == a_alpha
+
+    def resolve_b(name):
+        calls.append("B")
+        return b_alpha
+
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(b_roots)])
+    library_module.reset_path_memo()
+    second = library_module.path_resolver(cfg, _path_index(), resolve_b)
+    assert second("alpha") == b_alpha, "profile B received profile A's read path"
+    assert calls == ["A", "B"]
+    library_module.reset_path_memo()
+
+
+def test_a_failed_path_lookup_is_asked_once_per_pass(tmp_path, monkeypatch):
+    """A name the host lookup cannot resolve is not handed to it again in the same pass."""
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": ""})
+    calls = []
+
+    def resolve(name):
+        calls.append(name)
+        return None
+
+    resolver = library_module.path_resolver(cfg, _path_index(), resolve)
+    assert resolver("alpha") is None
+    assert resolver("alpha") is None
+    assert calls == ["alpha"], "a failed lookup was repeated in the same pass"
+    library_module.reset_path_memo()
+
+
+def test_saved_read_paths_use_the_plain_name_without_host_roots(tmp_path, monkeypatch):
+    """A host that cannot report its roots keeps the earlier single-file behavior."""
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    alpha = _skill_file(tmp_path / "roots", "alpha")
+    resolver = library_module.path_resolver(cfg, _path_index(), lambda name: alpha)
+
+    assert resolver("alpha") == alpha
+    assert (tmp_path / "paths.json").exists()
+    library_module.reset_path_memo()

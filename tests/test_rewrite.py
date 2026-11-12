@@ -1608,34 +1608,71 @@ def test_two_empty_session_tests_do_not_leak_a_dump(tmp_path):
     assert "- beta: Beta skill" in block_of(good)
 
 
-def test_a_dump_record_expires_when_a_compaction_opens_a_new_window(tmp_path):
-    """Invariant 3, same-session probe: the record lasts one window, not the life of the process.
+def _window_history(earlier, summary=None):
+    """Build the same-session payload shape the window tests drive."""
+    system = _payload()["messages"][0]
+    query = _payload()["messages"][1]
+    messages = [system]
+    if summary is not None:
+        messages.append({"role": "user", "content": summary})
+    for turn in range(earlier):
+        messages.append({"role": "assistant", "content": f"answer {turn}"})
+        messages.append({"role": "user", "content": f"earlier request {turn}"})
+    messages.append(query)
+    return {**_payload(), "messages": messages}
 
-    Hermes rebuilds every request from message history and never carries the middleware's marker
-    back, so the history itself is the only durable window boundary: the record carries the highest
-    message count its window has seen, and a request carrying fewer messages is a compaction. Same
-    session id throughout. The window's first failure dumps the catalog and records the count; a
-    later failure in that window strips instead of dumping again; a shorter history expires the
-    record, so the next failure dumps again and the one after it strips again; a further compaction
-    lets a healthy pass route, which the poisoned record used to make impossible.
+
+SUMMARY = (
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.\n"
+    "## Conversation Summary\n- earlier work happened\n"
+    "--- END OF CONTEXT SUMMARY"
+)
+
+
+def test_a_dump_record_ignores_a_shrinking_request_list(tmp_path):
+    """A shorter request list is not a window boundary.
+
+    Hermes may replace the request-local messages for one call without compacting durable history,
+    so a shrink must not expire the record: the second failure in the same window strips the
+    catalog and appends the marker instead of dumping the catalog again.
+    """
+    cfg = make_config(tmp_path)
+    index = make_index()
+    session = "session-shrink"
+
+    def failing(earlier):
+        return rewrite(
+            _window_history(earlier),
+            cfg=cfg,
+            index=index,
+            embed=FakeEmbedder(result=None),
+            rerank=FakeReranker(),
+            session_id=session,
+        )
+
+    assert failing(4) is None, "the window's first failure leaves the catalog in place"
+    assert search_module.dumped(session)
+
+    short = failing(2)
+    assert short is not None, "a shorter request list expired the dump record"
+    assert short["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+    assert "## Skills" not in short["request"]["messages"][0]["content"]
+
+
+def test_a_dump_record_expires_when_a_compaction_summary_appears(tmp_path):
+    """The compaction summary is the window boundary the request still carries.
+
+    The record carries the summary token seen at dump time. The same summary keeps the record; a
+    different one, whether it appears, is replaced or is merged into a later summary, expires it,
+    so the next failure dumps again and the one after strips again.
     """
     cfg = make_config(tmp_path)
     index = make_index()
     session = "session-window"
-    system = _payload()["messages"][0]
-    query = _payload()["messages"][1]
 
-    def history(earlier):
-        messages = [system]
-        for turn in range(earlier):
-            messages.append({"role": "assistant", "content": f"answer {turn}"})
-            messages.append({"role": "user", "content": f"earlier request {turn}"})
-        messages.append(query)
-        return {**_payload(), "messages": messages}
-
-    def failing(earlier):
+    def failing(earlier, summary=None):
         return rewrite(
-            history(earlier),
+            _window_history(earlier, summary),
             cfg=cfg,
             index=index,
             embed=FakeEmbedder(result=None),
@@ -1651,25 +1688,29 @@ def test_a_dump_record_expires_when_a_compaction_opens_a_new_window(tmp_path):
     assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
     assert "## Skills" not in second["request"]["messages"][0]["content"]
 
-    assert failing(1) is None, "a new window must not strip the catalog"
-    assert search_module.dumped(session), "the new window's dump was not recorded"
-    fourth = failing(2)
-    assert fourth is not None, "the new window dumped the catalog a second time"
-    assert fourth["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+    assert failing(1, SUMMARY) is None, "an appearing summary must open a new window"
+    assert search_module.dumped(session)
+    assert failing(2, SUMMARY) is not None, "the same summary expired the record"
 
+    merged = SUMMARY + "\n- a later turn merged into the summary"
+    assert failing(3, merged) is None, "a merged summary must open a new window"
+    assert search_module.dumped(session)
+    assert failing(4, merged) is not None, "the merged summary expired the record"
+
+    after = merged + "\n- a later turn merged again"
     good = rewrite(
-        history(1),
+        _window_history(6, after),
         cfg=cfg,
         index=index,
         embed=FakeEmbedder(),
         rerank=FakeReranker(),
         session_id=session,
     )
-    assert good is not None, "the expired record still silenced routing"
+    assert good is not None, "the record silenced a healthy pass in a new window"
     assert "## Skills" not in good["request"]["messages"][0]["content"]
     assert block_of(good).startswith(HEADER.split("\n", 1)[0])
     assert "- beta: Beta skill" in block_of(good)
-    assert not search_module.dumped(session)
+    assert not search_module.dumped(session), "the new window's record did not expire"
 
 
 def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatch):

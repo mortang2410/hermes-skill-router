@@ -107,22 +107,29 @@ class Ranked:
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
 _PARTITIONS: Dict[str, Partition] = {}
-#: The compaction windows in which the whole catalog already went out, per session, carrying the
-#: highest message count the window has seen since the dump. Hermes rebuilds every request from
+#: The compaction windows in which the whole catalog already went out, per session, carrying a
+#: token for the compaction summary the window opened with. Hermes rebuilds every request from
 #: message history and never copies the middleware's ``api_kwargs`` messages back into history, so
 #: a marker appended to that payload never reaches the next turn. This record is that fact instead,
-#: and the history itself is the only durable window boundary: a request that arrives with fewer
-#: messages than the window's high-water mark had its history replaced by a compaction, so the
-#: record expires there and the catalog may be dumped once more. Nothing inside a window shrinks
-#: the history, so the record never expires mid-window.
-_DUMPED: Dict[str, int] = {}
+#: and the compaction summary is the only durable window boundary the request still carries: a
+#: later request whose last summary token differs was compacted since the dump, so the record
+#: expires there and the catalog may be dumped once more. A shorter request list alone is not a
+#: boundary, because Hermes may replace the request-local messages for one call without compacting
+#: durable history, and that must not expire the record.
+_DUMPED: Dict[str, str] = {}
 _PARTITIONS_LOCK = threading.Lock()
 
 
-def remember_dump(session_id: str, message_count: int = 0) -> None:
-    """Record that the whole catalog went out in *session_id*'s window at *message_count* messages."""
+def remember_dump(session_id: str, summary_token: str = "") -> None:
+    """Record that the whole catalog went out in *session_id*'s window.
+
+    *summary_token* identifies the compaction summary the request carried, or ``""`` when it
+    carried none. That token is the window's identity: a later request carrying a different
+    summary is a different window, and a request carrying the same one, or none on either side,
+    stays in the window the dump happened in.
+    """
     with _PARTITIONS_LOCK:
-        _DUMPED[session_id] = message_count
+        _DUMPED[session_id] = summary_token
 
 
 def clear_dumps() -> None:
@@ -131,25 +138,24 @@ def clear_dumps() -> None:
         _DUMPED.clear()
 
 
-def dumped(session_id: str, message_count: Optional[int] = None) -> bool:
+def dumped(session_id: str, summary_token: Optional[str] = None) -> bool:
     """Return whether the whole catalog already went out in this session's current window.
 
-    With *message_count*, the payload's own message count decides the window: a request carrying
-    fewer messages than the window has seen is a new window, so the record expires and this call
-    reports ``False``; a larger count raises the window's high-water mark. Without it the record is
-    only read, which is what a probe or a test that inspects the record needs.
+    With *summary_token*, the request's own compaction summary decides the window: a non-empty
+    token that differs from the recorded one means the history was compacted since the dump, so the
+    record expires and this call reports ``False``. A missing token, on the request or in the
+    record, is not evidence of a new window and keeps the record. Without the argument the record
+    is only read, which is what a probe or a test that inspects the record needs.
     """
     with _PARTITIONS_LOCK:
-        highest = _DUMPED.get(session_id)
-        if highest is None:
+        recorded = _DUMPED.get(session_id)
+        if recorded is None:
             return False
-        if message_count is None:
+        if summary_token is None:
             return True
-        if message_count < highest:
+        if summary_token != recorded:
             _DUMPED.pop(session_id, None)
             return False
-        if message_count > highest:
-            _DUMPED[session_id] = message_count
         return True
 
 

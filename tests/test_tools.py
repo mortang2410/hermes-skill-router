@@ -229,7 +229,7 @@ def test_the_search_tool_still_answers_after_a_dump_record(tmp_path, fake_client
     reads the session's dump record, so a window whose rewrite dumped the catalog still answers
     with ranked rows. This pins that behavior, which the module comment used to claim away.
     """
-    remember_dump(session, 4)
+    remember_dump(session)
 
     answer = json.loads(handle({"query": QUERY}, settings=settings(tmp_path), session_id=session))
 
