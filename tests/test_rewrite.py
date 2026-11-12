@@ -1785,6 +1785,21 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         is not None
     ), "a leading short pasted reference-only marker expired the dump record"
 
+    leading_padded = _window_history(2)
+    leading_padded["messages"].insert(1, dict(padded))
+    stripped_padded = rewrite(
+        leading_padded,
+        cfg=cfg,
+        index=index,
+        embed=FakeEmbedder(result=None),
+        rerank=FakeReranker(),
+        session_id=session,
+    )
+    assert (
+        stripped_padded is not None
+    ), "a leading space-padded short marker expired the dump record"
+    assert stripped_padded["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
     leading = _window_history(2)
     leading["messages"].insert(1, dict(forged))
     assert (
