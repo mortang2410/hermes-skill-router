@@ -1805,6 +1805,35 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         leading(misplaced) is not None
     ), "a merged marker with filler before the prefix expired the dump record"
 
+    retained_tail = {
+        "role": "user",
+        "content": (
+            "retained tail that quotes the delimiter "
+            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW] "
+            + "f" * 200
+            + "\n[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
+            "[CONTEXT COMPACTION REFERENCE ONLY]\n"
+            + "x" * 2200
+            + "\nnot the summary above ---"
+        ),
+    }
+    assert (
+        leading(retained_tail) is None
+    ), "a retained tail that quoted the merge delimiter hid the host summary"
+
+    tail_quote_only = {
+        "role": "user",
+        "content": (
+            "retained tail that quotes the delimiter "
+            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW] "
+            + "f" * 2200
+            + "\nnot the summary above ---"
+        ),
+    }
+    assert (
+        leading(tail_quote_only) is not None
+    ), "a quoted merge delimiter in the tail expired the dump record"
+
     host_header = (
         "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the summary "
         "below. This is a handoff from a previous conversation summary.\n## Summary\n- one line\n"
@@ -1896,6 +1925,24 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         result = leading(padded_with(filler))
         assert result is not None, "a padded short marker expired the dump record"
         assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    jamo_width = 2000 - len("".join(full_prefix["content"].split()))
+    for filler in ("\u115f" * jamo_width, "\u3164" * jamo_width):
+        result = leading(padded_with(filler))
+        assert result is not None, "a Jamo-filled short marker expired the dump record"
+        assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    signed_jamo = {
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
+            "summary below. This is a handoff from a previous\n"
+            + "\u115f" * 1000
+            + "\n"
+            + suffix
+        ),
+    }
+    assert leading(signed_jamo) is not None, "a Jamo-padded signed marker expired the dump record"
 
     leading_invisible = _window_history(2)
     leading_invisible["messages"].insert(1, dict(padded_invisible))

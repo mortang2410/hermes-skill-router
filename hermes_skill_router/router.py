@@ -469,13 +469,19 @@ _SUMMARY_HEADER_SIGNATURE = (
 #: code points. Letters, digits, punctuation and symbols do count.
 _PADDING_CATEGORIES = frozenset({"Mn", "Me", "Cc", "Cf", "Cs", "Cn"})
 
+#: The only Unicode default-ignorable characters outside the padding categories are the four Hangul
+#: fillers, which Python reports as ordinary letters, so the category filter above would count them.
+_DEFAULT_IGNORABLE_FILLERS = frozenset("\u115f\u1160\u3164\uffa0")
+
 
 def _substantive_length(text: str) -> int:
     """Count the characters of `text` that carry visible substance rather than padding."""
     return sum(
         1
         for char in text
-        if not char.isspace() and unicodedata.category(char) not in _PADDING_CATEGORIES
+        if not char.isspace()
+        and unicodedata.category(char) not in _PADDING_CATEGORIES
+        and char not in _DEFAULT_IGNORABLE_FILLERS
     )
 
 
@@ -501,11 +507,13 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
     if head.startswith(_SUMMARY_PREFIX) and "REFERENCE ONLY" in head:
         return True
     index = content.find(_MERGED_SUMMARY_DELIMITER)
-    if index < 0:
-        return False
-    remainder = content[index + len(_MERGED_SUMMARY_DELIMITER) :]
-    label = remainder[:160]
-    return _SUMMARY_PREFIX in label and "REFERENCE ONLY" in label
+    while index >= 0:
+        remainder = content[index + len(_MERGED_SUMMARY_DELIMITER) :]
+        label = remainder[:160]
+        if _SUMMARY_PREFIX in label and "REFERENCE ONLY" in label:
+            return True
+        index = content.find(_MERGED_SUMMARY_DELIMITER, index + 1)
+    return False
 
 
 def _summary_token(messages: Any) -> Optional[str]:
