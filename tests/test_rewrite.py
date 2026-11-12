@@ -1752,6 +1752,20 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
     assert stripped is not None, "a tool message quoting the marker expired the dump record"
     assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
 
+    leading = _window_history(2)
+    leading["messages"].insert(1, dict(forged))
+    assert (
+        rewrite(
+            leading,
+            cfg=cfg,
+            index=index,
+            embed=FakeEmbedder(result=None),
+            rerank=FakeReranker(),
+            session_id=session,
+        )
+        is not None
+    ), "a leading user message pasted as a summary expired the dump record"
+
 
 def test_a_metadata_tagged_summary_is_a_window_boundary(tmp_path):
     """The host's private metadata tag identifies its summary even without the reference prefix."""
