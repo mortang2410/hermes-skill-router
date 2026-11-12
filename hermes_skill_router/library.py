@@ -747,25 +747,19 @@ def _roots_namespace() -> str:
     """Return the active skill roots' digest, the profile identity a saved path map belongs to.
 
     The default cache path is shared by every profile on a machine, while skill roots differ per
-    profile. The digest keeps one profile's resolved paths out of another profile's map. A host
-    that cannot report its roots scopes nothing and keeps the earlier behavior.
+    profile. The digest keeps one profile's resolved paths out of another profile's map. It is
+    computed for every pass, not memoised, because the host reads the current project roots when it
+    is called: a project switch inside one process changes them without a restart. A host that
+    cannot report its roots scopes nothing and keeps the earlier behavior.
     """
-    global _ROOT_NAMESPACE
-    with _MEMO_LOCK:
-        if _ROOT_NAMESPACE is not None:
-            return _ROOT_NAMESPACE
-        roots = sorted({root for root in _active_roots() if root})
-        digest = hashlib.sha256("\x00".join(roots).encode("utf-8")).hexdigest()[:16] if roots else ""
-        _ROOT_NAMESPACE = digest
-        return digest
+    roots = sorted({root for root in _active_roots() if root})
+    return hashlib.sha256("\x00".join(roots).encode("utf-8")).hexdigest()[:16] if roots else ""
 
 
 def reset_path_memo() -> None:
-    """Forget the process-level read-path memos. Tests call this; production never needs it."""
-    global _ROOT_NAMESPACE
+    """Forget the process-level read-path memo. Tests call this; production never needs it."""
     with _MEMO_LOCK:
         _PATH_MEMO.clear()
-        _ROOT_NAMESPACE = None
 
 
 def _declared_name(path: str) -> Optional[str]:
@@ -1034,8 +1028,6 @@ _TERM_MEMO: Dict[str, Tuple[str, Optional[bm25.TermIndex]]] = {}
 #: The read-path map per cache file, skill-root namespace and fingerprint: one lookup per catalog.
 _PATH_MEMO: Dict[Tuple[str, str, str], Dict[str, str]] = {}
 
-#: The active skill roots' digest for this process, computed once and reused by every pass.
-_ROOT_NAMESPACE: Optional[str] = None
 
 #: Saved read-path map schema. Bumped when the file's shape changes, which invalidates every map.
 PATH_CACHE_VERSION = 3

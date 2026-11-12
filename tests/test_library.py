@@ -1288,3 +1288,22 @@ def test_saved_read_paths_use_the_plain_name_without_host_roots(tmp_path, monkey
     assert resolver("alpha") == alpha
     assert (tmp_path / "paths.json").exists()
     library_module.reset_path_memo()
+
+
+def test_a_project_root_switch_in_one_process_uses_the_new_profile(tmp_path, monkeypatch):
+    """The roots digest is read per pass, so a project switch does not keep the old profile's map."""
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    a_roots = tmp_path / "profile-a"
+    b_roots = tmp_path / "profile-b"
+    a_alpha = _skill_file(a_roots, "alpha")
+    b_alpha = _skill_file(b_roots, "alpha")
+
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(a_roots)])
+    first = library_module.path_resolver(cfg, _path_index(), lambda name: a_alpha)
+    assert first("alpha") == a_alpha
+
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(b_roots)])
+    second = library_module.path_resolver(cfg, _path_index(), lambda name: b_alpha)
+    assert second("alpha") == b_alpha, "a project switch reused the previous profile's path"
+    library_module.reset_path_memo()

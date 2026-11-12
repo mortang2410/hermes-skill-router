@@ -1623,9 +1623,9 @@ def _window_history(earlier, summary=None):
 
 
 SUMMARY = (
-    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.\n"
+    "[CONTEXT COMPACTION] Earlier turns were compacted into the summary below.\n"
     "## Conversation Summary\n- earlier work happened\n"
-    "--- END OF CONTEXT SUMMARY"
+    "respond to the message below, not the summary above ---"
 )
 
 
@@ -1692,12 +1692,12 @@ def test_a_dump_record_expires_when_a_compaction_summary_appears(tmp_path):
     assert search_module.dumped(session)
     assert failing(2, SUMMARY) is not None, "the same summary expired the record"
 
-    merged = SUMMARY + "\n- a later turn merged into the summary"
+    merged = SUMMARY.replace("earlier work happened", "earlier work happened, then more")
     assert failing(3, merged) is None, "a merged summary must open a new window"
     assert search_module.dumped(session)
     assert failing(4, merged) is not None, "the merged summary expired the record"
 
-    after = merged + "\n- a later turn merged again"
+    after = merged.replace("then more", "then more and more")
     good = rewrite(
         _window_history(6, after),
         cfg=cfg,
@@ -1711,6 +1711,41 @@ def test_a_dump_record_expires_when_a_compaction_summary_appears(tmp_path):
     assert block_of(good).startswith(HEADER.split("\n", 1)[0])
     assert "- beta: Beta skill" in block_of(good)
     assert not search_module.dumped(session), "the new window's record did not expire"
+
+
+def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
+    """Only a summary the host wrote is a window boundary.
+
+    A user or tool message that merely quotes the opening marker, or both markers without the host's
+    closing suffix, must not expire the record: the catalog stays dumped for the rest of the window.
+    """
+    cfg = make_config(tmp_path)
+    index = make_index()
+    session = "session-quoted"
+
+    def failing(earlier, extra=None):
+        payload = _window_history(earlier)
+        if extra is not None:
+            payload["messages"].append(extra)
+        return rewrite(
+            payload,
+            cfg=cfg,
+            index=index,
+            embed=FakeEmbedder(result=None),
+            rerank=FakeReranker(),
+            session_id=session,
+        )
+
+    assert failing(3) is None
+    quoted = {"role": "user", "content": "[CONTEXT COMPACTION] a user message quoting the marker"}
+    assert failing(2, quoted) is not None, "a quoted marker expired the dump record"
+    tool = {
+        "role": "tool",
+        "content": "[CONTEXT COMPACTION] tool output that quotes the marker",
+    }
+    stripped = failing(2, tool)
+    assert stripped is not None, "a tool message quoting the marker expired the dump record"
+    assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
 
 
 def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatch):

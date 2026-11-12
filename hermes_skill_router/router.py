@@ -442,20 +442,37 @@ def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str
     return paths
 
 
-#: The host's compaction summary opens with this prefix, and a summary merged into a retained tail
-#: carries this delimiter. Both are plain ASCII so the check does not depend on the host's dashes.
+#: The host's compaction summary opens with this prefix, a summary merged into a retained tail
+#: carries this delimiter, and every summary ends with this suffix. All three are plain ASCII
+#: fragments of the host's own markers, and the host's private metadata key is the provenance
+#: signal when the suffix is absent.
 _SUMMARY_PREFIX = "[CONTEXT COMPACTION"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT"
+_SUMMARY_SUFFIX = "not the summary above ---"
+_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+
+def _is_compaction_summary(message: Mapping, content: str) -> bool:
+    """Return whether one message is the host's compaction summary, by the host's own marks.
+
+    The head prefix and the merge delimiter say what the message claims to be; the closing suffix
+    or the host's private metadata key say the host wrote it. A user or tool message that merely
+    quotes the opening marker fails the second test and cannot expire a dump record.
+    """
+    if not content[:64].startswith(_SUMMARY_PREFIX) and _MERGED_SUMMARY_DELIMITER not in content:
+        return False
+    if content.rstrip().endswith(_SUMMARY_SUFFIX):
+        return True
+    return bool(message.get(_SUMMARY_METADATA_KEY))
 
 
 def _summary_token(messages: Any) -> Optional[str]:
     """Return a token for the payload's latest compaction summary, or ``None`` when it carries none.
 
     The token is the summary text's digest, so the same window answers the same token and a merged
-    or replaced summary answers a different one. The check reads list-shaped text only and requires
-    the host's own summary prefix or merge delimiter, so a user message quoting the marker cannot
-    expire a dump record. A missing summary is ``None`` on both sides, so it never expires a record
-    on its own.
+    or replaced summary answers a different one. Only a message the host wrote qualifies, so a user
+    or tool message quoting the marker cannot expire a dump record. A missing summary is ``None`` on
+    both sides, so it never expires a record on its own.
     """
     if not isinstance(messages, (list, tuple)):
         return None
@@ -465,7 +482,7 @@ def _summary_token(messages: Any) -> Optional[str]:
         content = message.get("content")
         if not isinstance(content, str):
             continue
-        if content[:64].startswith(_SUMMARY_PREFIX) or _MERGED_SUMMARY_DELIMITER in content:
+        if _is_compaction_summary(message, content):
             return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
     return None
 
