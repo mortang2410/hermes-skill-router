@@ -454,8 +454,10 @@ _SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
 #: The shortest text that counts as a host summary when the private metadata tag is absent, so a
-#: short pasted marker cannot expire a dump record. A real compaction summary is thousands of bytes.
-_SUMMARY_MIN_CHARS = 2000
+#: short pasted marker cannot expire a dump record. The host's fixed header alone is 1,632 visible
+#: characters, so every host summary clears this floor even with a short body, while a pasted
+#: marker stays far below it.
+_SUMMARY_MIN_CHARS = 1000
 
 #: Unicode categories that carry no visible substance and so count as padding rather than text:
 #: separators and spaces, controls, format characters, combining marks, surrogates, and unassigned
@@ -495,7 +497,8 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
     if index < 0:
         return False
     remainder = content[index + len(_MERGED_SUMMARY_DELIMITER) :]
-    return _SUMMARY_PREFIX in remainder and "REFERENCE ONLY" in remainder
+    label = remainder[:160]
+    return _SUMMARY_PREFIX in label and "REFERENCE ONLY" in label
 
 
 def _summary_token(messages: Any) -> Optional[str]:

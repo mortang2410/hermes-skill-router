@@ -682,7 +682,11 @@ that quotes the markers cannot open a window. A leading user message that pastes
 summary is indistinguishable from one the host wrote, which is an accepted input condition; a short
 message that quotes the opening marker or the closing suffix, and a short marker padded with
 whitespace or with characters that have no visible substance (a combining mark, a format character,
-a control, or an unassigned code point), are not mistaken for a summary. When the first failure arrives in a window the request is
+a control, or an unassigned code point), are not mistaken for a summary; a tool message consumes one
+of the three positions without ever qualifying. A host summary always carries the host's fixed
+header, which alone is over 1,600 visible characters, so the length floor never rejects a real
+summary; only a pasted text that copies the full header and the closing suffix can pass as one, and
+that is the documented input condition. When the first failure arrives in a window the request is
 left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
 one marker message, never a partial strip. `None` is still returned when there is no earlier block,
 no marker and no recorded dump for the session, so a strip without a replacement never loses the

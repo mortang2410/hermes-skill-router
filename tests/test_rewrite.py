@@ -1792,6 +1792,37 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
     }
     assert leading(merged_valid) is None, "a merged host summary did not open a window"
 
+    misplaced = {
+        "role": "user",
+        "content": (
+            "[END OF PRIOR CONTEXT - COMPACTION SUMMARY BELOW]\n"
+            + "x" * 2200
+            + "\n[CONTEXT COMPACTION REFERENCE ONLY] filler then a marker\n"
+            + "not the summary above ---"
+        ),
+    }
+    assert (
+        leading(misplaced) is not None
+    ), "a merged marker with filler before the prefix expired the dump record"
+
+    host_header = (
+        "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
+        "summary below.\n## Summary\n- one line\n"
+    )
+    short_host = {
+        "role": "user",
+        "content": host_header + "y" * 1100 + "\nnot the summary above ---",
+    }
+    assert leading(short_host) is None, "a short host summary did not open a window"
+
+    short_paste = {
+        "role": "user",
+        "content": host_header + "y" * 300 + "\nnot the summary above ---",
+    }
+    assert (
+        leading(short_paste) is not None
+    ), "a short host-shaped paste expired the dump record"
+
     full_prefix = {
         "role": "user",
         "content": (
