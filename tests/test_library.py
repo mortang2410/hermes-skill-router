@@ -1347,3 +1347,27 @@ def test_a_duplicate_name_takes_the_last_one_like_the_host_parser(tmp_path):
     assert library_module._path_is_usable(str(path), "beta"), "the last declared name was ignored"
     assert not library_module._path_is_usable(str(path), "alpha")
     library_module.reset_path_memo()
+
+
+def test_a_warm_cache_rejects_a_file_replaced_with_duplicate_names(tmp_path, monkeypatch):
+    """The host parses a replaced file as its last duplicate name, so the warm hit is dropped."""
+    monkeypatch.setattr(library_module, "_active_roots", lambda: [str(tmp_path / "roots")])
+    library_module.reset_path_memo()
+    cfg = load({"cachePath": str(tmp_path / "index.json")})
+    original = _skill_file(tmp_path / "roots", "alpha")
+
+    first = library_module.path_resolver(cfg, _path_index(), lambda name: original)
+    assert first("alpha") == original
+
+    current = _skill_file(tmp_path / "current", "alpha")
+    Path(original).write_text("---\nname: alpha\nname: other\n---\n\nbody\n", encoding="utf-8")
+    calls = []
+
+    def resolve(name):
+        calls.append(name)
+        return current
+
+    second = library_module.path_resolver(cfg, _path_index(), resolve)
+    assert second("alpha") == current, "a duplicate-name replacement was served from the cache"
+    assert calls == ["alpha"]
+    library_module.reset_path_memo()

@@ -83,8 +83,9 @@ active skill roots. The roots key keeps two profiles that share one cache direct
 other's map, and the file is named after them, `paths.<digest>.json`, with the plain `paths.json`
 name when the host cannot report its roots. A name is looked up at most once per pass, a failed
 lookup included, and once per catalog across processes. Every hit is checked again against the file
-it names: a path whose file is gone, or whose file now declares another skill, is dropped and
-resolved again, so a moved or replaced skill costs one lookup rather than a stale path. A new
+it names: a path whose file is gone, or whose file now resolves to another name under the host's own
+parsing (the last duplicate `name` key, else the directory name, with a leading BOM ignored), is
+dropped and resolved again, so a moved or replaced skill costs one lookup rather than a stale path. A new
 catalog starts with an empty map, and failures are never saved.
 
 The association channel reads the learned load store at `associationDbPath` open read-only. It
@@ -673,7 +674,11 @@ different summary, whether it appeared, was replaced or was merged into a later 
 window and the catalog may be dumped once again. A request that is merely shorter is not a
 boundary, because Hermes may replace the request-local messages for one call without compacting
 durable history, and the record must not expire there. Within a window the same summary keeps the
-record, so the catalog is dumped once. When the first failure arrives in a window the request is
+record, so the catalog is dumped once. Two compactions whose summary text is byte-identical cannot be
+told apart by this record; the host merges later turns into the summary, so its text changes at each
+compaction. A user or tool message that pastes a complete summary at the head of the history is
+indistinguishable from one the host wrote, which is an accepted input condition, and a message that
+merely quotes the opening marker is not mistaken for a summary. When the first failure arrives in a window the request is
 left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
 one marker message, never a partial strip. `None` is still returned when there is no earlier block,
 no marker and no recorded dump for the session, so a strip without a replacement never loses the
