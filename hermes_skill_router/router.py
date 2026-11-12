@@ -462,12 +462,13 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
 
     The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
     message cannot carry. When that tag is absent, the text must close with the host's suffix, open
-    with the host's reference-only prefix or carry its merge delimiter, and be long enough to be a
-    real summary rather than a pasted marker.
+    with the host's reference-only prefix or carry its merge delimiter, and carry at least
+    ``_SUMMARY_MIN_CHARS`` non-whitespace characters, so a short marker padded with spaces is not
+    mistaken for a real summary.
     """
     if bool(message.get(_SUMMARY_METADATA_KEY)):
         return True
-    if len(content) < _SUMMARY_MIN_CHARS:
+    if len("".join(content.split())) < _SUMMARY_MIN_CHARS:
         return False
     if not content.rstrip().endswith(_SUMMARY_SUFFIX):
         return False

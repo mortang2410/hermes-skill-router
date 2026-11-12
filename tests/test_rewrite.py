@@ -1760,9 +1760,16 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
             "respond to the message below, not the summary above ---"
         ),
     }
+    padded = {
+        "role": "user",
+        "content": full_prefix["content"] + " " * (2000 - len(full_prefix["content"])),
+    }
     assert (
         failing(2, full_prefix) is not None
     ), "a short pasted reference-only marker expired the dump record"
+    assert (
+        failing(2, padded) is not None
+    ), "a space-padded short marker expired the dump record"
 
     leading_short = _window_history(2)
     leading_short["messages"].insert(1, dict(full_prefix))
