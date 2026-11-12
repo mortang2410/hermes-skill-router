@@ -1927,7 +1927,12 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
 
     jamo_width = 2000 - len("".join(full_prefix["content"].split()))
-    for filler in ("\u115f" * jamo_width, "\u3164" * jamo_width):
+    for filler in (
+        "\u115f" * jamo_width,
+        "\u1160" * jamo_width,
+        "\u3164" * jamo_width,
+        "\uffa0" * jamo_width,
+    ):
         result = leading(padded_with(filler))
         assert result is not None, "a Jamo-filled short marker expired the dump record"
         assert result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
