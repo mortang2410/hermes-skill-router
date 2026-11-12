@@ -678,8 +678,8 @@ record, so the catalog is dumped once. Two compactions whose summary text is byt
 told apart by this record; the host merges later turns into the summary, so its text changes at each
 compaction. A user message that pastes a complete, long summary at the head of the history is
 indistinguishable from one the host wrote, which is an accepted input condition; a short message
-that quotes the opening marker or the closing suffix, and a short marker padded with whitespace,
-are not mistaken for a summary. When the first failure arrives in a window the request is
+that quotes the opening marker or the closing suffix, and a short marker padded with whitespace or
+invisible characters, are not mistaken for a summary. When the first failure arrives in a window the request is
 left unchanged, and on a later failure in the same window the rewrite is a clean catalog strip plus
 one marker message, never a partial strip. `None` is still returned when there is no earlier block,
 no marker and no recorded dump for the session, so a strip without a replacement never loses the

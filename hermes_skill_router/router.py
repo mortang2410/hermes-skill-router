@@ -456,6 +456,15 @@ _SUMMARY_METADATA_KEY = "_compressed_summary"
 #: short pasted marker cannot expire a dump record. A real compaction summary is thousands of bytes.
 _SUMMARY_MIN_CHARS = 2000
 
+#: Invisible characters that pad text without adding substance: zero width space, zero width
+#: non-joiner, zero width joiner, word joiner and the byte order mark.
+_INVISIBLE_CHARS = frozenset("\u200b\u200c\u200d\u2060\ufeff")
+
+
+def _substantive_length(text: str) -> int:
+    """Count the characters of `text` that carry substance rather than padding."""
+    return sum(1 for char in text if not char.isspace() and char not in _INVISIBLE_CHARS)
+
 
 def _is_compaction_summary(message: Mapping, content: str) -> bool:
     """Return whether one message is the host's compaction summary, by the host's own marks.
@@ -463,12 +472,12 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
     The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
     message cannot carry. When that tag is absent, the text must close with the host's suffix, open
     with the host's reference-only prefix or carry its merge delimiter, and carry at least
-    ``_SUMMARY_MIN_CHARS`` non-whitespace characters, so a short marker padded with spaces is not
-    mistaken for a real summary.
+    ``_SUMMARY_MIN_CHARS`` characters that are neither whitespace nor invisible padding, so a short
+    marker padded with spaces or zero-width characters is not mistaken for a real summary.
     """
     if bool(message.get(_SUMMARY_METADATA_KEY)):
         return True
-    if len("".join(content.split())) < _SUMMARY_MIN_CHARS:
+    if _substantive_length(content) < _SUMMARY_MIN_CHARS:
         return False
     if not content.rstrip().endswith(_SUMMARY_SUFFIX):
         return False

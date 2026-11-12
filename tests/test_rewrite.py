@@ -1785,6 +1785,29 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
         is not None
     ), "a leading short pasted reference-only marker expired the dump record"
 
+    suffix = "not the summary above ---"
+    base = full_prefix["content"]
+    padded_invisible = {
+        "role": "user",
+        "content": (
+            base[: base.rindex(suffix)]
+            + "\u200b" * (2000 - len("".join(base.split())))
+            + suffix
+        ),
+    }
+    leading_invisible = _window_history(2)
+    leading_invisible["messages"].insert(1, dict(padded_invisible))
+    invisible_result = rewrite(
+        leading_invisible,
+        cfg=cfg,
+        index=index,
+        embed=FakeEmbedder(result=None),
+        rerank=FakeReranker(),
+        session_id=session,
+    )
+    assert invisible_result is not None, "a zero-width-padded short marker expired the dump record"
+    assert invisible_result["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
     leading_padded = _window_history(2)
     leading_padded["messages"].insert(1, dict(padded))
     stripped_padded = rewrite(
