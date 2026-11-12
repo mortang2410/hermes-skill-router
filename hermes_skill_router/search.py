@@ -43,7 +43,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from .catalog import CatalogRows, Partition
 from .config import Config
 from .embed import embed_texts as default_embed
-from .library import Index, load_or_build, shortlist
+from .library import Index, load_or_build, path_resolver, shortlist
 from .rerank import rerank as default_rerank
 from .select import select
 
@@ -107,22 +107,22 @@ class Ranked:
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
 _PARTITIONS: Dict[str, Partition] = {}
-#: Sessions in which the whole catalog already went out in the current compaction window.
-#: Hermes rebuilds every request from message history and never copies the middleware's
-#: ``api_kwargs`` messages back into history, so a marker appended to that payload never
-#: reaches the next turn. This record is that durable fact instead. The rewrite clears a
-#: session's entry when a request shows no prior router block, so a compaction that removes
-#: the window's blocks starts a new window and the record expires with it, never forever.
-#: The search tool reads it to answer healthy-empty after a dump, so a name the dump already
-#: showed is never suggested again.
-_DUMPED: set[str] = set()
+#: The compaction windows in which the whole catalog already went out, per session, carrying the
+#: highest message count the window has seen since the dump. Hermes rebuilds every request from
+#: message history and never copies the middleware's ``api_kwargs`` messages back into history, so
+#: a marker appended to that payload never reaches the next turn. This record is that fact instead,
+#: and the history itself is the only durable window boundary: a request that arrives with fewer
+#: messages than the window's high-water mark had its history replaced by a compaction, so the
+#: record expires there and the catalog may be dumped once more. Nothing inside a window shrinks
+#: the history, so the record never expires mid-window.
+_DUMPED: Dict[str, int] = {}
 _PARTITIONS_LOCK = threading.Lock()
 
 
-def remember_dump(session_id: str) -> None:
-    """Record that the whole catalog went out in *session_id*'s current compaction window."""
+def remember_dump(session_id: str, message_count: int = 0) -> None:
+    """Record that the whole catalog went out in *session_id*'s window at *message_count* messages."""
     with _PARTITIONS_LOCK:
-        _DUMPED.add(session_id)
+        _DUMPED[session_id] = message_count
 
 
 def clear_dumps() -> None:
@@ -131,16 +131,26 @@ def clear_dumps() -> None:
         _DUMPED.clear()
 
 
-def clear_dump(session_id: str) -> None:
-    """Expire the dump record for *session_id*; a payload with no prior block is a new window."""
-    with _PARTITIONS_LOCK:
-        _DUMPED.discard(session_id)
+def dumped(session_id: str, message_count: Optional[int] = None) -> bool:
+    """Return whether the whole catalog already went out in this session's current window.
 
-
-def dumped(session_id: str) -> bool:
-    """Return whether the whole catalog already went out in this session's current window."""
+    With *message_count*, the payload's own message count decides the window: a request carrying
+    fewer messages than the window has seen is a new window, so the record expires and this call
+    reports ``False``; a larger count raises the window's high-water mark. Without it the record is
+    only read, which is what a probe or a test that inspects the record needs.
+    """
     with _PARTITIONS_LOCK:
-        return session_id in _DUMPED
+        highest = _DUMPED.get(session_id)
+        if highest is None:
+            return False
+        if message_count is None:
+            return True
+        if message_count < highest:
+            _DUMPED.pop(session_id, None)
+            return False
+        if message_count > highest:
+            _DUMPED[session_id] = message_count
+        return True
 
 
 def remember_partition(session_id: str, partition: Partition) -> None:
@@ -194,7 +204,8 @@ def select_rows(
     is the caller's index when it already holds one, otherwise the shared loader builds or loads it
     from these rows. *deadline* is the routing pass' absolute ``monotonic`` deadline; when it is
     ``None`` the budget starts after the index is in hand, so a cold build is never cut, exactly as
-    a turn's budget starts. *resolve* names one reranked candidate's ``SKILL.md`` path.
+    a turn's budget starts. *resolve* names one reranked candidate's ``SKILL.md`` path through
+    the saved read-path map, so a repeated name costs no host lookup.
 
     Every candidate the pass reranked gets its path resolved before the cutoff, the cap or the
     suppressed set is applied: a refused or raising lookup costs that candidate its slot, and the
@@ -225,6 +236,9 @@ def select_rows(
             return SearchOutcome(reason=NO_INDEX, detail="the skill index could not be built")
     if not index.names:
         return SearchOutcome(reason=NO_INDEX, detail="the skill index carries no row")
+    # The gate and the selection share one resolver, and every path it answers is saved beside the
+    # index cache, so a name is looked up at most once a pass and never again once known.
+    resolve = path_resolver(cfg, index, resolve)
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank, deadline=deadline, resolve=resolve)
     if ranked.reason:
         return SearchOutcome(reason=ranked.reason, detail=ranked.detail)

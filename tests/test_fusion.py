@@ -248,25 +248,53 @@ def test_cosine_mode_reads_no_term_index_opens_no_store_and_does_not_bump(monkey
     assert [name for name, _description in rows] == ["alpha", "beta", "gamma"]
 
 
-def test_shadow_mode_logs_the_diagnostics_and_returns_the_cosine_order(tmp_path, caplog):
-    cfg = load(
+def test_shadow_mode_logs_the_bumped_order_and_returns_the_cosine_order(tmp_path, caplog):
+    """Shadow mode publishes the order live mode would return, then returns the cosine order.
+
+    One seeded load for gamma moves it to the front of the fused order. The logged line has to carry
+    that movement and that position, because its whole purpose is comparing the two orders; only the
+    returned rows stay the cosine order.
+    """
+    now_ms = T0 + DAY
+    shadow = load(
         {
-            "cachePath": "",
+            "cachePath": str(tmp_path / "index.json"),
             "fusionMode": "shadow",
             "channelsBm25": False,
             "channelsAssociations": False,
         }
     )
+    live = load(
+        {
+            "cachePath": str(tmp_path / "index.json"),
+            "fusionMode": "live",
+            "channelsBm25": False,
+            "channelsAssociations": False,
+        }
+    )
+    seed_usage(tmp_path / "associations.db", now_ms, ["gamma"])
     index = make_index()
+    resolver = lambda name: f"/skills/{name}/SKILL.md"
 
     with caplog.at_level(logging.INFO, logger="hermes_skill_router.library"):
-        rows = shortlist(index, [1.0], "alpha review", 2, cfg=cfg)
+        rows = shortlist(index, [1.0], "review store", 4, cfg=shadow, resolver=resolver, now_ms=now_ms)
+    live_rows = shortlist(index, [1.0], "review store", 4, cfg=live, resolver=resolver, now_ms=now_ms)
 
-    assert [name for name, _description in rows] == ["alpha", "beta"]
+    assert [name for name, _description in rows] == ["alpha", "beta", "gamma", "delta"], (
+        "shadow mode returned the fused order instead of the cosine rollback order"
+    )
     lines = [record.getMessage() for record in caplog.records if "mode=shadow" in record.getMessage()]
     assert len(lines) == 1
-    assert '"name":"alpha"' in lines[0]
-    assert '"position":2' in lines[0]
+    payload = json.loads(lines[0].split("candidates=", 1)[1])
+    assert [(entry["name"], entry["movement"], entry["position"]) for entry in payload] == [
+        ("gamma", 5, 1),
+        ("alpha", 0, 2),
+        ("beta", 0, 3),
+        ("delta", 0, 4),
+    ], "the shadow line does not carry the bump live mode applies"
+    assert [name for name, _description in live_rows] == [entry["name"] for entry in payload], (
+        "the shadow line and the live order disagree"
+    )
 
 
 def test_the_bump_is_gated_on_a_resolvable_catalog_path(tmp_path):
@@ -310,6 +338,73 @@ def test_the_bump_is_gated_on_a_resolvable_catalog_path(tmp_path):
         "five",
         "six",
     ]
+
+
+def test_the_usage_gate_looks_up_at_most_the_candidates_that_can_still_move(tmp_path):
+    """The bump reaches at most ``limit + capPositions`` fused positions, so nothing below is looked up.
+
+    A candidate below that bound can never enter the cut, whatever its usage is, so its path is
+    never resolved: the host lookup costs about 230 ms per call on the live catalog, and the bound
+    keeps one pass' cost tied to the shortlist instead of to the history the store carries.
+    """
+    now_ms = T0 + DAY
+    cfg = load(
+        {
+            "cachePath": str(tmp_path / "index.json"),
+            "channelsBm25": False,
+            "channelsAssociations": False,
+            "frecencyCapPositions": 2,
+        }
+    )
+    names = tuple(f"n{position}" for position in range(8))
+    index = make_index(names)
+    seed_usage(tmp_path / "associations.db", now_ms, ["n0", "n1", "n5", "n7"])
+    calls = []
+
+    def resolver(name):
+        calls.append(name)
+        return f"/skills/{name}/SKILL.md"
+
+    rows = shortlist(
+        index, [1.0], "review store", 3, cfg=cfg, resolver=resolver, now_ms=now_ms
+    )
+
+    assert [name for name, _description in rows] == ["n0", "n1", "n2"]
+    assert calls == ["n0", "n1"], (
+        "the gate resolved a candidate the bump cannot reach the cut with, or one name twice"
+    )
+
+
+def test_a_zero_cap_reads_no_usage_and_resolves_no_path(tmp_path, monkeypatch):
+    """A zero cap moves nothing, so the usage read and every path lookup behind it are skipped."""
+    now_ms = T0 + DAY
+    cfg = load(
+        {
+            "cachePath": str(tmp_path / "index.json"),
+            "channelsBm25": False,
+            "channelsAssociations": False,
+            "frecencyCapPositions": 0,
+        }
+    )
+    index = make_index()
+    seed_usage(tmp_path / "associations.db", now_ms, ["gamma"])
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("a zero cap read the usage store")
+
+    monkeypatch.setattr(library_module, "_usage_scores", boom)
+    calls = []
+
+    def resolver(name):
+        calls.append(name)
+        return f"/skills/{name}/SKILL.md"
+
+    rows = shortlist(
+        index, [1.0], "review store", 3, cfg=cfg, resolver=resolver, now_ms=now_ms
+    )
+
+    assert [name for name, _description in rows] == ["alpha", "beta", "gamma"]
+    assert calls == [], "a zero cap resolved a candidate path"
 
 
 def test_a_missing_store_leaves_the_other_channels_routing_with_one_warning(tmp_path, caplog):

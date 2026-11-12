@@ -1608,6 +1608,96 @@ def test_two_empty_session_tests_do_not_leak_a_dump(tmp_path):
     assert "- beta: Beta skill" in block_of(good)
 
 
+def test_a_dump_record_expires_when_a_compaction_opens_a_new_window(tmp_path):
+    """Invariant 3, same-session probe: the record lasts one window, not the life of the process.
+
+    Hermes rebuilds every request from message history and never carries the middleware's marker
+    back, so the history itself is the only durable window boundary: the record carries the highest
+    message count its window has seen, and a request carrying fewer messages is a compaction. Same
+    session id throughout. The window's first failure dumps the catalog and records the count; a
+    later failure in that window strips instead of dumping again; a shorter history expires the
+    record, so the next failure dumps again and the one after it strips again; a further compaction
+    lets a healthy pass route, which the poisoned record used to make impossible.
+    """
+    cfg = make_config(tmp_path)
+    index = make_index()
+    session = "session-window"
+    system = _payload()["messages"][0]
+    query = _payload()["messages"][1]
+
+    def history(earlier):
+        messages = [system]
+        for turn in range(earlier):
+            messages.append({"role": "assistant", "content": f"answer {turn}"})
+            messages.append({"role": "user", "content": f"earlier request {turn}"})
+        messages.append(query)
+        return {**_payload(), "messages": messages}
+
+    def failing(earlier):
+        return rewrite(
+            history(earlier),
+            cfg=cfg,
+            index=index,
+            embed=FakeEmbedder(result=None),
+            rerank=FakeReranker(),
+            session_id=session,
+        )
+
+    assert failing(3) is None, "the window's first failure leaves the catalog in place"
+    assert search_module.dumped(session)
+
+    second = failing(4)
+    assert second is not None, "the same window dumped the catalog a second time"
+    assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+    assert "## Skills" not in second["request"]["messages"][0]["content"]
+
+    assert failing(1) is None, "a new window must not strip the catalog"
+    assert search_module.dumped(session), "the new window's dump was not recorded"
+    fourth = failing(2)
+    assert fourth is not None, "the new window dumped the catalog a second time"
+    assert fourth["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+
+    good = rewrite(
+        history(1),
+        cfg=cfg,
+        index=index,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id=session,
+    )
+    assert good is not None, "the expired record still silenced routing"
+    assert "## Skills" not in good["request"]["messages"][0]["content"]
+    assert block_of(good).startswith(HEADER.split("\n", 1)[0])
+    assert "- beta: Beta skill" in block_of(good)
+    assert not search_module.dumped(session)
+
+
+def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatch):
+    """The turn's recency gate and its selection share one resolver.
+
+    The usage map is supplied directly because the store read is another contract's test: what
+    this pins is that a name the gate resolved is never handed to the host lookup again before the
+    selection, so one pass costs one lookup per distinct candidate. The empty cache path keeps the
+    saved map out of it, so only the per-pass memo can prevent the repeat.
+    """
+    calls = []
+
+    def counting(name):
+        calls.append(name)
+        return f"/skills/{name}/SKILL.md"
+
+    monkeypatch.setattr(router_module, "skill_path", counting)
+    monkeypatch.setattr(library_module, "_usage_scores", lambda *_args: {"alpha": 1.0, "beta": 0.8})
+
+    result = rewrite(_payload(), cfg=make_config(tmp_path), index=make_index(), embed=FakeEmbedder(), rerank=FakeReranker())
+
+    assert result is not None
+    assert len(calls) == len(set(calls)), f"a candidate was looked up twice: {calls}"
+    assert sorted(calls) == ["alpha", "beta", "delta", "gamma"], (
+        "a candidate was looked up twice in one pass, or a pathless candidate was dropped"
+    )
+
+
 def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):
     """Invariant 1, routed branch: the catalog is stripped every turn, never re-dumped."""
     cfg = make_config(tmp_path)

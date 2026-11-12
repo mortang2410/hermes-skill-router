@@ -79,9 +79,9 @@ from .config import Config
 from .display import INERT, ROUTED, record
 from .embed import embed_texts as default_embed
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
-from .library import Index, load_or_build
+from .library import Index, PathResolver, load_or_build, path_resolver
 from .rerank import rerank as default_rerank
-from .search import Ranked, clear_dump, dumped, forget_session, rank, remember_dump, remember_partition
+from .search import Ranked, dumped, forget_session, rank, remember_dump, remember_partition
 from .select import Suggestion, select
 from .tools import skill_path
 
@@ -196,11 +196,13 @@ def _compose(
         return None
     previous = _prior_blocks(messages)
     dropped_before = _dropped_before(messages)
-    dumped_before = dumped(session_id)
+    # The dump record carries the highest message count its window has seen. A request with fewer
+    # messages than that is a new window: a compaction replaced the history, and the catalog may be
+    # dumped once more. Nothing inside a window shrinks the history, so the record never expires
+    # there.
+    dumped_before = dumped(session_id, _message_count(messages))
     if dumped_before:
         dropped_before = True
-    elif not previous and not dropped_before:
-        clear_dump(session_id)
     stripped, partition = strip_catalog(
         payload, eager=cfg.eager_skills, deferred=cfg.deferred_skills
     )
@@ -224,7 +226,7 @@ def _compose(
         _log_once(reason)
         inert()
         if not previous and not dropped_before and not dumped_before:
-            remember_dump(session_id)
+            remember_dump(session_id, _message_count(messages))
             return None
         return {
             "request": {
@@ -256,7 +258,10 @@ def _compose(
         # A dump earlier in this window already showed every skill, so nothing is suggestible
         # for the rest of the window even when ranking would succeed now.
         return _fail("catalog already dumped in this window")
-    ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=skill_path)
+    # One memo for the whole pass: the recency gate and the selection both resolve through the
+    # same saved map, so a candidate is looked up at most once a pass and never again once known.
+    resolve = path_resolver(cfg, index, skill_path)
+    ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve)
     if ranked.reason:
         return _fail(ranked.detail)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
@@ -265,7 +270,7 @@ def _compose(
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
     wanted.extend(name for name in partition.kept.names if name in eager)
-    paths = _resolve_paths(wanted)
+    paths = _resolve_paths(wanted, resolve)
     selected = select(
         [score for _name, score in ranked.candidates],
         [name for name, _score in ranked.candidates],
@@ -412,25 +417,32 @@ def _dropped_before(messages: Any) -> bool:
     return False
 
 
-def _resolve_paths(names: Sequence[str]) -> Dict[str, str]:
+def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str]:
     """Resolve every candidate's and pinned name's read path before the selector cuts.
 
-    The host lookup is the resolver ``skill_view`` uses, so the path a row carries is the file the
-    model can open. A name the lookup refuses, or a lookup that raises, costs that row its slot and
-    never the whole block. Repeated names are looked up once.
+    *resolve* is this pass' resolver: the host lookup is the resolver ``skill_view`` uses, so the
+    path a row carries is the file the model can open, and the pass wraps it in one memo so a name
+    the recency gate already resolved is never looked up again. A name the lookup refuses, or a
+    lookup that raises, costs that row its slot and never the whole block. Repeated names are
+    looked up once.
     """
     paths: Dict[str, str] = {}
     for name in names:
         if name in paths:
             continue
         try:
-            path = skill_path(name)
+            path = resolve(name)
         except Exception:  # the host lookup never raises, but the block must not depend on it
             logger.debug("skill router: the path lookup for %r raised", name, exc_info=True)
             path = None
         if path:
             paths[name] = str(path)
     return paths
+
+
+def _message_count(messages: Any) -> int:
+    """Return the number of messages a payload carries, the window's high-water unit."""
+    return len(messages) if isinstance(messages, list) else 0
 
 
 def _recorder(

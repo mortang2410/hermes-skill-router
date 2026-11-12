@@ -35,7 +35,9 @@ from hermes_skill_router.search import (  # noqa: E402
     NO_INDEX,
     RERANK_FAILED,
     SearchOutcome,
+    dumped,
     forget_session,
+    remember_dump,
     remember_partition,
 )
 from hermes_skill_router.tools import handle, register_tools  # noqa: E402
@@ -218,6 +220,21 @@ def test_a_healthy_search_returns_the_rows_and_writes_the_search_record(
     assert stored["names"] == ["beta", "alpha", "gamma"]
     assert stored["session_id"] == "session-1"
     assert stored["turn_id"] == ""
+
+
+def test_the_search_tool_still_answers_after_a_dump_record(tmp_path, fake_clients, session):
+    """The dump record governs the turn's rewrite, not the search tool.
+
+    The tool's contract is to search every skill the current prompt showed, and no path in it
+    reads the session's dump record, so a window whose rewrite dumped the catalog still answers
+    with ranked rows. This pins that behavior, which the module comment used to claim away.
+    """
+    remember_dump(session, 4)
+
+    answer = json.loads(handle({"query": QUERY}, settings=settings(tmp_path), session_id=session))
+
+    assert [row["name"] for row in answer["skills"]] == ["beta", "alpha", "gamma"]
+    assert dumped(session), "the tool consumed the turn's dump record"
 
 
 def test_an_empty_selection_is_written_as_a_healthy_empty_record(tmp_path, fake_clients, session):

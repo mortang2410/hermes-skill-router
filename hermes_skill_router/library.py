@@ -39,7 +39,7 @@ import os
 import tempfile
 import threading
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import associations, bm25
 from .catalog import CatalogRows
@@ -126,7 +126,8 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
     The BM25 term index is built in the same pass and written beside the vector index. A term index
     that cannot be built does not fail the build: the returned index carries ``None``, one warning
     is logged, and the vector pass stays usable. A warm vector cache loads the term index once per
-    process; a missing or foreign one leaves the channel with no ranks and warns once.
+    process, and a missing file is built from the catalog rows; a foreign or unreadable one leaves
+    the channel with no ranks and warns once.
     """
     unique = _unique(rows)
     key = _fingerprint(unique, cfg)
@@ -141,7 +142,7 @@ def load_or_build(cfg: Config, rows: CatalogRows, embedder: Embedder) -> Optiona
         if memo is not None:
             return memo
         if saved is not None and saved.fingerprint == key and len(saved.names) == len(unique):
-            index = _with_term_index(cfg, saved, _text_rows(cfg, unique))
+            index = _warm_term_index(cfg, saved, unique)
             _MEMO[key] = index
             return index
         index = _build(
@@ -163,6 +164,40 @@ def cached_row_count(cfg: Config) -> int:
     with _MEMO_LOCK:
         saved = _read_saved(cfg)
     return len(saved.names) if saved is not None else 0
+
+
+def path_resolver(
+    cfg: Config,
+    index: Index,
+    resolve: Optional[PathResolver],
+) -> Optional[PathResolver]:
+    """Return a resolver that answers from the saved read-path map and remembers every new path.
+
+    The host lookup behind *resolve* scans and parses every ``SKILL.md`` under the search roots to
+    resolve one name, which measured about 230 ms per call on the live 420-row catalog. One pass
+    must therefore never ask it twice for the same name, and a later pass or a later process must
+    not ask again at all. Each index fingerprint owns one map, saved beside the index cache: a new
+    catalog starts with an empty map, and an entry loaded from disk is reused only while the file it
+    names still exists, so a skill that moved is resolved again instead of pointing at a missing
+    file. ``None`` stays ``None``, so a caller that resolves nothing keeps that behavior.
+    """
+    if resolve is None:
+        return None
+    saved = _saved_paths(cfg, index)
+
+    def _resolve(name: str) -> Optional[str]:
+        path = saved.get(name)
+        if path is not None:
+            return path
+        resolved = resolve(name)
+        if not resolved:
+            return None
+        with _MEMO_LOCK:
+            saved[name] = str(resolved)
+        _write_paths(cfg, index, saved)
+        return saved[name]
+
+    return _resolve
 
 
 def shortlist(
@@ -218,11 +253,17 @@ def shortlist(
             },
             settings,
         )
+        # A zero cap moves nothing, so neither the usage read nor its path lookups can change the
+        # order and both are skipped outright.
+        usage = _usage_scores(store, settings, now_ms) if settings.cap_positions > 0 else {}
+        moved = apply_frecency(
+            fused, _gated_usage(usage, fused, resolver, limit, settings.cap_positions), settings
+        )
         if settings.mode == "shadow":
-            _log_fusion_diagnostics(cut_shortlist(fused, limit))
+            # The log carries the order live mode would return, movement and final positions
+            # included, so the two published orders compare directly.
+            _log_fusion_diagnostics(cut_shortlist(moved, limit))
             return _described(index, cosine_order[:limit])
-        usage = _usage_scores(store, settings, now_ms)
-        moved = apply_frecency(fused, _gated_usage(usage, fused, resolver), settings)
     finally:
         _close_store(store)
     cut = cut_shortlist(moved, limit)
@@ -306,6 +347,29 @@ def _load_term_index(cfg: Config, texts: Sequence[Tuple[str, str]]) -> Optional[
         _warn_term_index_missing(cfg)
     _TERM_MEMO[path] = (digest, loaded)
     return loaded
+
+
+def _warm_term_index(
+    cfg: Config,
+    saved: Index,
+    unique: Sequence[Tuple[str, str]],
+) -> Index:
+    """Return *saved* carrying a usable term index, building one when the file is missing.
+
+    A warm vector cache with no term index beside it is the state every install whose index predates
+    the term index is in. The vectors are still valid, so the term index is built from the catalog
+    rows and written, independently of the vector cache; otherwise the default-on BM25 channel would
+    stay off until the catalog fingerprint changed. A term index that exists but is foreign,
+    truncated or unreadable is left to the loader's own refusal, which warns once.
+    """
+    path = _term_path(cfg)
+    if path is not None and not os.path.exists(path):
+        term_index = _build_term_index(cfg, unique)
+        if term_index is None:
+            return saved
+        _write_term_index(cfg, term_index)
+        return replace(saved, term_index=term_index)
+    return _with_term_index(cfg, saved, _text_rows(cfg, unique))
 
 
 def _build_term_index(
@@ -459,27 +523,36 @@ def _gated_usage(
     usage: Dict[str, float],
     records: Sequence[CandidateDiagnostic],
     resolver: Optional[PathResolver],
+    limit: int,
+    cap_positions: int,
 ) -> Dict[str, float]:
-    """Keep usage rows for candidates the host lookup resolves, the gate on the bump.
+    """Keep usage rows for the candidates the bump can still carry into the shortlist.
 
-    A candidate no channel returned cannot reach the bump anyway, and is dropped here as well. With
-    no resolver every candidate is unresolved, which is the same rule as a path the lookup refuses:
-    no path, no bump.
+    The bump moves a candidate up by at most *cap_positions* places, so a candidate below
+    ``limit + cap_positions`` in the fused order can never reach the cut and keeps its fused
+    position whatever its usage is. Only the candidates at or above that bound are looked up, and
+    *records* arrive in fused order, so the scan stops there: the number of host lookups is bounded
+    by the shortlist size plus the cap, never by the usage history the store carries. A name no
+    channel returned is dropped as well. With no resolver every candidate is unresolved, which is
+    the same rule as a path the lookup refuses: no path, no bump.
     """
     if not usage or resolver is None:
         return {}
-    candidates = {record.name for record in records}
+    reachable = limit + cap_positions
     gated: Dict[str, float] = {}
-    for name, score in usage.items():
-        if name not in candidates:
+    for record in records:
+        if record.final_shortlist_position > reachable:
+            break
+        score = usage.get(record.name)
+        if score is None:
             continue
         try:
-            path = resolver(name)
+            path = resolver(record.name)
         except Exception:  # the host lookup never raises, but the pass must not depend on it
-            logger.debug("skill index: the path lookup for %r raised", name, exc_info=True)
+            logger.debug("skill index: the path lookup for %r raised", record.name, exc_info=True)
             path = None
         if path:
-            gated[name] = float(score)
+            gated[record.name] = float(score)
     return gated
 
 
@@ -610,6 +683,105 @@ def _cache_path(cfg: Config) -> Optional[str]:
     if not raw:
         return None
     return os.path.expanduser(raw)
+
+
+def _paths_path(cfg: Config) -> Optional[str]:
+    """Return the saved read-path map's file beside the vector cache, or ``None`` offline."""
+    path = _cache_path(cfg)
+    if path is None:
+        return None
+    return os.path.join(os.path.dirname(path), PATH_CACHE_FILENAME)
+
+
+def _saved_paths(cfg: Config, index: Index) -> Dict[str, str]:
+    """Return this process' read-path map for *index*, reading it once per cache file.
+
+    The map belongs to one catalog in one cache directory, so it is memoised under both: two
+    profiles, and two tests that share a fingerprint but not a cache path, never share a map. An
+    entry whose file no longer exists is dropped, because a skill that moved changed no catalog text
+    and so cannot invalidate the map by fingerprint alone. With persistence off there is no map to
+    keep, and every pass starts from an empty one.
+    """
+    path = _paths_path(cfg)
+    if path is None:
+        return {}
+    key = (path, index.fingerprint)
+    with _MEMO_LOCK:
+        saved = _PATH_MEMO.get(key)
+        if saved is not None:
+            return saved
+        data: Any = None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            data = None
+        except (OSError, ValueError) as exc:
+            _log_once(
+                f"paths-read:{path}",
+                f"skill index: the saved read paths at {path} are unreadable ({exc}), so "
+                "every path is resolved again",
+            )
+        saved = {}
+        if (
+            isinstance(data, dict)
+            and data.get("version") == PATH_CACHE_VERSION
+            and data.get("fingerprint") == index.fingerprint
+            and isinstance(data.get("paths"), dict)
+        ):
+            saved = {
+                name: value
+                for name, value in data["paths"].items()
+                if isinstance(name, str) and isinstance(value, str) and os.path.isfile(value)
+            }
+        _PATH_MEMO[key] = saved
+        return saved
+
+
+def _write_paths(cfg: Config, index: Index, paths: Dict[str, str]) -> None:
+    """Save the read-path map beside the index cache, or log the failure once.
+
+    The file is a cache: a lost update costs one later host lookup, never a wrong path, so the
+    replace is atomic and not fsynced.
+    """
+    path = _paths_path(cfg)
+    if path is None:
+        return
+    with _MEMO_LOCK:  # the map is shared between passes; snapshot it before iterating
+        snapshot = dict(paths)
+    payload = {
+        "version": PATH_CACHE_VERSION,
+        "fingerprint": index.fingerprint,
+        "paths": snapshot,
+    }
+    directory = os.path.dirname(path) or "."
+    temporary: Optional[str] = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".paths-",
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary = handle.name
+        with handle:
+            json.dump(payload, handle)
+        os.replace(temporary, path)
+        temporary = None
+    except OSError as exc:
+        _log_once(f"paths-write:{path}", f"skill index: could not write the read paths {path}: {exc}")
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError as exc:
+                _log_once(
+                    f"paths-leftover:{temporary}",
+                    f"skill index: cannot remove the temporary file {temporary}: {exc}",
+                )
 
 
 def _read_saved(cfg: Config) -> Optional[Index]:
@@ -753,6 +925,15 @@ _MEMO: Dict[str, Index] = {}
 
 #: The loaded term index per path and the digest it matched, so a warm process reads it once.
 _TERM_MEMO: Dict[str, Tuple[str, Optional[bm25.TermIndex]]] = {}
+
+#: The read-path map per cache file and fingerprint: one host lookup per name per catalog.
+_PATH_MEMO: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+#: Saved read-path map schema. Bumped when the file's shape changes, which invalidates every map.
+PATH_CACHE_VERSION = 1
+
+#: The saved read-path map's file name, beside the vector index cache.
+PATH_CACHE_FILENAME = "paths.json"
 
 _MEMO_LOCK = threading.Lock()
 

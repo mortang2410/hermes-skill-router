@@ -798,6 +798,34 @@ def test_a_term_index_that_cannot_be_built_keeps_the_vector_pass_and_warns_once(
     assert rows, "the vector channel still routes after a term build failure"
 
 
+def test_a_warm_vector_cache_rebuilds_a_missing_term_index(monkeypatch, tmp_path):
+    """A warm index with no ``bm25.json`` builds the term index instead of leaving BM25 off.
+
+    Every install whose vector cache predates the term index is in this state, and a removed or
+    never-written ``bm25.json`` is the same state. The vectors are still valid, so the build reuses
+    them and writes only the term index; the default-on BM25 channel then ranks on the first warm
+    load instead of staying off until the catalog fingerprint changes.
+    """
+    cfg = make_config(tmp_path)
+    built = load_or_build(cfg, BASE_ROWS, CountingEmbedder())
+    assert built is not None and built.term_index is not None
+    (tmp_path / "bm25.json").unlink()
+    monkeypatch.setattr(library_module, "_MEMO", {})
+    monkeypatch.setattr(library_module, "_TERM_MEMO", {})
+    embedder = CountingEmbedder()
+
+    index = load_or_build(cfg, BASE_ROWS, embedder)
+
+    assert index is not None
+    assert index.names == built.names
+    assert index.term_index is not None, "the missing term index was never rebuilt"
+    assert (tmp_path / "bm25.json").is_file(), "the rebuilt term index was not saved"
+    assert embedder.texts == [], "the warm vectors were embedded again instead of reused"
+    assert bm25_module.score_ranks(index.term_index, "alpha", len(BASE_ROWS.names)), (
+        "the rebuilt term index ranks nothing"
+    )
+
+
 def test_the_term_index_is_loaded_once_per_process(monkeypatch, tmp_path):
     cfg = make_config(tmp_path)
     load_or_build(cfg, BASE_ROWS, CountingEmbedder())
