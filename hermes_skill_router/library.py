@@ -783,11 +783,14 @@ def _declared_name(path: str) -> Optional[str]:
         return parent or None
     end = re.search(r"\n---\s*(?:\n|$)", head[3:])
     block = head[3 : end.start() + 3] if end else head[3:]
+    declared: Optional[str] = None
     for line in block.splitlines():
         if line.strip().startswith("name:"):
             value = line.split(":", 1)[1].strip().strip("'\"")
             if value:
-                return value
+                declared = value
+    if declared:
+        return declared
     return parent or None
 
 

@@ -1336,3 +1336,14 @@ def test_a_cached_path_matches_the_name_the_host_would_give(tmp_path, monkeypatc
     beta.write_text("\ufeff---\nname: beta\n---\n\nbody\n", encoding="utf-8")
     assert library_module._path_is_usable(str(beta), "beta"), "a BOM broke the name check"
     library_module.reset_path_memo()
+
+
+def test_a_duplicate_name_takes_the_last_one_like_the_host_parser(tmp_path):
+    """The host's parser keeps the last duplicate key, so validation does the same."""
+    path = tmp_path / "dup" / "alpha" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: alpha\nname: beta\n---\n\nbody\n", encoding="utf-8")
+
+    assert library_module._path_is_usable(str(path), "beta"), "the last declared name was ignored"
+    assert not library_module._path_is_usable(str(path), "alpha")
+    library_module.reset_path_memo()

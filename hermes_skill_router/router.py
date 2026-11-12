@@ -455,29 +455,41 @@ _SUMMARY_METADATA_KEY = "_compressed_summary"
 def _is_compaction_summary(message: Mapping, content: str) -> bool:
     """Return whether one message is the host's compaction summary, by the host's own marks.
 
-    The head prefix and the merge delimiter say what the message claims to be; the closing suffix
-    or the host's private metadata key say the host wrote it. A user or tool message that merely
-    quotes the opening marker fails the second test and cannot expire a dump record.
+    The host tags its summary with the private ``_compressed_summary`` metadata, which a chat
+    message cannot carry. When that tag is absent, the text must close with the host's suffix and
+    either open with the host's reference-only prefix or carry its merge delimiter, so a user
+    message that merely quotes the opening marker or a closing suffix is not mistaken for one.
     """
-    if not content[:64].startswith(_SUMMARY_PREFIX) and _MERGED_SUMMARY_DELIMITER not in content:
-        return False
-    if content.rstrip().endswith(_SUMMARY_SUFFIX):
+    if bool(message.get(_SUMMARY_METADATA_KEY)):
         return True
-    return bool(message.get(_SUMMARY_METADATA_KEY))
+    if not content.rstrip().endswith(_SUMMARY_SUFFIX):
+        return False
+    head = content[:96]
+    if head.startswith(_SUMMARY_PREFIX) and "REFERENCE ONLY" in head:
+        return True
+    return _MERGED_SUMMARY_DELIMITER in content
 
 
 def _summary_token(messages: Any) -> Optional[str]:
-    """Return a token for the payload's latest compaction summary, or ``None`` when it carries none.
+    """Return a token for the payload's leading compaction summary, or ``None`` when it carries none.
 
     The token is the summary text's digest, so the same window answers the same token and a merged
-    or replaced summary answers a different one. Only a message the host wrote qualifies, so a user
-    or tool message quoting the marker cannot expire a dump record. A missing summary is ``None`` on
-    both sides, so it never expires a record on its own.
+    or replaced summary answers a different one. Only the first few non-system messages are
+    candidates, because that is where the host puts a compaction summary, and only a message that
+    ends with the host's closing suffix qualifies. A user or tool message quoting the marker
+    anywhere else in the history therefore cannot expire a dump record. A missing summary is
+    ``None`` on both sides, so it never expires a record on its own.
     """
     if not isinstance(messages, (list, tuple)):
         return None
-    for message in reversed(messages):
-        if not isinstance(message, Mapping):
+    candidates = 0
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") == "system":
+            continue
+        candidates += 1
+        if candidates > 3:
+            break
+        if message.get("role") not in ("user", "assistant"):
             continue
         content = message.get("content")
         if not isinstance(content, str):
