@@ -1806,8 +1806,8 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
     ), "a merged marker with filler before the prefix expired the dump record"
 
     host_header = (
-        "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
-        "summary below.\n## Summary\n- one line\n"
+        "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the summary "
+        "below. This is a handoff from a previous conversation summary.\n## Summary\n- one line\n"
     )
     short_host = {
         "role": "user",
@@ -1822,6 +1822,19 @@ def test_a_quoted_summary_marker_does_not_expire_the_dump_record(tmp_path):
     assert (
         leading(short_paste) is not None
     ), "a short host-shaped paste expired the dump record"
+
+    abbreviated = {
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTION REFERENCE ONLY] Earlier turns were compacted into the "
+            "summary below.\n## Summary\n- one line\n"
+            + "y" * 1100
+            + "\nnot the summary above ---"
+        ),
+    }
+    assert (
+        leading(abbreviated) is not None
+    ), "an abbreviated header with a long body expired the dump record"
 
     full_prefix = {
         "role": "user",

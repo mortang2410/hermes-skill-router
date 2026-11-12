@@ -453,11 +453,16 @@ _SUMMARY_SUFFIX = "not the summary above ---"
 _SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
-#: The shortest text that counts as a host summary when the private metadata tag is absent, so a
-#: short pasted marker cannot expire a dump record. The host's fixed header alone is 1,632 visible
-#: characters, so every host summary clears this floor even with a short body, while a pasted
-#: marker stays far below it.
+#: The shortest text that counts as a host summary when the private metadata tag is absent. The host
+#: writes a fixed header that alone carries 1,632 visible characters, so a text that quotes the
+#: header's signature clears the lower floor even with a short body, while a pasted marker that only
+#: copies the opening tag must reach the higher floor. Neither floor is a security boundary: the
+#: page-long paste that reproduces the header is the documented input condition.
 _SUMMARY_MIN_CHARS = 1000
+_SUMMARY_FULL_CHARS = 2000
+_SUMMARY_HEADER_SIGNATURE = (
+    "Earlier turns were compacted into the summary below. This is a handoff from a previous"
+)
 
 #: Unicode categories that carry no visible substance and so count as padding rather than text:
 #: separators and spaces, controls, format characters, combining marks, surrogates, and unassigned
@@ -486,9 +491,11 @@ def _is_compaction_summary(message: Mapping, content: str) -> bool:
     """
     if bool(message.get(_SUMMARY_METADATA_KEY)):
         return True
-    if _substantive_length(content) < _SUMMARY_MIN_CHARS:
-        return False
     if not content.rstrip().endswith(_SUMMARY_SUFFIX):
+        return False
+    signed = _SUMMARY_HEADER_SIGNATURE in content
+    floor = _SUMMARY_MIN_CHARS if signed else _SUMMARY_FULL_CHARS
+    if _substantive_length(content) < floor:
         return False
     head = content[:96]
     if head.startswith(_SUMMARY_PREFIX) and "REFERENCE ONLY" in head:
