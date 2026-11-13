@@ -179,6 +179,16 @@ def test_the_documentation_names_the_compaction_event_as_the_window_boundary() -
         "a fork expires the record of the session it left and the record of the session it entered"
         in prose
     ), "the documentation does not state that a fork expires both session ids"
+    for stale in (
+        "the record holds the summary's digest",
+        "that summary is the window boundary",
+        "The first three non-system messages are checked",
+        "1,000 visible characters",
+        "2,000 visible characters",
+    ):
+        assert stale not in prose, (
+            f"the documentation restores the removed summary-scan claim: {stale!r}"
+        )
 
 
 def test_the_documentation_states_a_below_floor_host_registers_nothing() -> None:
@@ -227,6 +237,15 @@ def test_the_readme_names_the_rerank_cost_it_measured() -> None:
     assert "8 CPU threads" in readme, "the README does not name the CPU thread count"
     assert "50-row shortlist" in readme and "10-row shortlist" in readme, (
         "the README does not give the measured time at the default shortlist size and at a short one"
+    )
+    assert "median 0.71 seconds over ten calls" in readme, (
+        "the README does not carry the measured 50-row median it states"
+    )
+    assert "a 10-row shortlist took 0.15 seconds" in readme, (
+        "the README does not carry the measured 10-row time it states"
+    )
+    assert "4.5 and 5.2 seconds" in readme, (
+        "the README does not name the measured slow calls that widen the range"
     )
 
 
