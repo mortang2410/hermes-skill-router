@@ -120,9 +120,24 @@ verification_hooks: 7
 status: OK
 ```
 
-The probe was run before the review and again in Phase 5: the host loads the plugin through its own
-discovery, `fire_post_compaction` reaches the registered callback, the record expires, the next failed
-pass dumps the catalog once, and the second failed pass strips it. Exit 0, `PASS`.
+```text
+cd docs/work/compaction-window/probes
+HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONDONTWRITEBYTECODE=1 python3 end_to_end_event.py
+install=/home/wilder/.hermes/installs/5323f763494eb399/environments/6e4b37e4dab14600ac4818bd4b5ccaec/workspace
+post_compaction registered by the host load: True
+record before the event: dumped=True
+record after the event: dumped=False
+failed pass after the event: returned=None (catalog kept, dumped)
+second failed pass: stripped=True marker=True
+PASS: the event reached the router's registered callback, and the next passes dumped then stripped
+exit 0
+```
+
+The probe needs `HERMES_DISABLE_LAZY_INSTALLS=1` on this host right now. Without it the host module
+import starts the paused source update, which relaunches the interpreter and loses the YAML dependency
+the probe needs; the probe then dies before it reaches the plugin. The variable only skips that relaunch,
+so the run still discovers the plugin through the host's own loader and delivers through the host's own
+`fire_post_compaction`.
 
 ## Dispatch notes
 
