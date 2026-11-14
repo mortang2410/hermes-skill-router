@@ -53,9 +53,12 @@ On every request that carried the catalog on Chat Completions the same decision 
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
 names, or ``inert`` with no names. While the association store is incomplete, contract C5's one
 note rides on that record, so the surfaces can say history is incomplete and healing is running, or
-report the one pending heal failure the C6 job handed the turn; the note never enters the payload,
-so it costs no token, and a complete store adds nothing. The record is written after the payload is
-built and never enters it, so the display costs no token. A written record is announced on the
+report the one pending heal failure the C6 job handed the turn. When a per-request call fails,
+contract C7's one line rides on the inert record instead, so the surfaces can say the endpoints
+were unreachable and no suggestions were made; that line outranks both history lines, so a failed
+turn never consumes them. Either note never enters the payload, so it costs no token, and a
+complete store adds nothing. The record is written after the payload is built and never enters
+it, so the display costs no token. A written record is announced on the
 plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
 
 A completed pass also writes one info line to the plugin log, beginning ``skill router: query=``.
@@ -87,7 +90,16 @@ from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
 from .library import Index, PathResolver, load_or_build, path_resolver
 from .rerank import rerank as default_rerank
-from .search import Ranked, dumped, forget_session, rank, remember_dump, remember_partition
+from .search import (
+    EMBED_FAILED,
+    RERANK_FAILED,
+    Ranked,
+    dumped,
+    forget_session,
+    rank,
+    remember_dump,
+    remember_partition,
+)
 from .select import Suggestion, select
 from .tools import skill_path
 
@@ -98,6 +110,9 @@ CHAT_COMPLETIONS = "chat_completions"
 
 #: Contract C5's one line while the association store is incomplete; it rides on the record only.
 HISTORY_NOTE = "History is incomplete and healing is running in the background."
+
+#: Contract C7's one line when a per-request call fails; it rides on the inert record only.
+ENDPOINT_NOTE = "Routing endpoints are unreachable; no suggestions were made this turn."
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
@@ -221,18 +236,18 @@ def _compose(
     # The tool ranks the routed half of this partition, so it remembers the rows this prompt
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition)
-    inert = _recorder(cfg, INERT, (), session_id, turn_id, notify)
-
-    def _fail(reason: str):
+    def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass.
 
         The first failure in a window returns ``None`` and the request keeps its catalog, which
         is one clean dump. A later failure in the same window strips the catalog and appends the
         dropped marker, so the model never reads the whole catalog twice. Both paths record
-        inert and log once, and both leave the input payload untouched.
+        inert and log once, and both leave the input payload untouched. *note* is contract C7's
+        one line when a per-request call failed, which outranks every other note this turn; it
+        rides on the inert record only, so the surfaces can say no suggestions were made.
         """
         _log_once(reason)
-        inert()
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if not previous and not dropped_before and not dumped_before:
             remember_dump(session_id)
             return None
@@ -259,7 +274,7 @@ def _compose(
             logger.debug("skill router: index build raised", exc_info=True)
             index = None
         if index is None:
-            return _fail("index build failed")
+            return _fail("index build failed", ENDPOINT_NOTE)
     if not index.names:
         return _fail("the skill index carries no row")
     if dropped_before or dumped_before:
@@ -271,10 +286,13 @@ def _compose(
     resolve = path_resolver(cfg, index, skill_path)
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve)
     if ranked.reason:
-        return _fail(ranked.detail)
+        # A failed per-request call is a dead endpoint, and its line outranks the history
+        # line; a budget expiry keeps no line and never consumes the pending heal note.
+        note = ENDPOINT_NOTE if ranked.reason in (EMBED_FAILED, RERANK_FAILED) else ""
+        return _fail(ranked.detail, note)
     # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
     # heal when it was incomplete. Contract C5's note is read once here, so every record this turn
-    # writes carries the same line, and a more urgent note from a later ticket replaces it.
+    # writes carries the same line, and a failed pass never reaches here, so the dead-endpoint line outranks it.
     note = _history_note(cfg)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
@@ -506,8 +524,9 @@ def _history_note(cfg: Config) -> str:
     While the store is incomplete, C6's pending heal-failure note wins over the generic
     "healing is running" line: a failed heal is not running, so the generic line would claim work
     that stopped, and the failure is the state the user needs to see. The accessor is one-shot, so
-    it is read only after the turn is known to carry a history note - a turn that shows contract
-    C7's dead-endpoint note never reaches this chooser, and a complete store never consumes it.
+    it is read only after the turn is known to carry a history note: a turn that shows contract
+    C7's dead-endpoint note returns before this chooser runs, and a complete store never
+    consumes it.
     """
     if not _store_in_play(cfg):
         return ""

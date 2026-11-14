@@ -267,7 +267,8 @@ The record is one JSON file at `suggestionsPath`:
   "turn_id": "<turn id when the dispatcher supplies one, else an empty string>",
   "status": "routed",
   "origin": "turn",
-  "names": ["github-pr-workflow", "code-review"]
+  "names": ["github-pr-workflow", "code-review"],
+  "note": ""
 }
 ```
 
@@ -282,6 +283,12 @@ Fields:
 - `origin` is `turn` for the automatic pass and `search` for a model call to the search tool.
 - `names` holds the selected suggestion names only, capped at `maxDisplayNames`. A kept row is never
   recorded, so the display cannot present a pinned or deferred-excluded skill as a suggestion.
+- `note` is one line the plugin itself wrote for the turn, or an empty string when it has nothing to
+  say: history is incomplete and healing is running, a background heal failed once, or the routing
+  endpoints were unreachable and no suggestions were made. When several of those are true at once
+  the unreachable-endpoints line wins, then the heal-failure line, then the incomplete-history line.
+  Both surfaces render the note under their state line when it is present and keep their own fixed
+  line in its absence, and a record written before `note` existed reads with an empty note.
 
 The record never carries request text. The newest record wins, and it carries the session and turn
 ids the dispatcher supplies so a second session or a fork replacing it is visible on screen when the
@@ -578,6 +585,16 @@ slow case rather than a constant: a live run measured a full warm rewrite
 at 0.75 to 0.79 seconds, and a probe on 2026-11-10 measured a one-text embed at 84 ms and a
 50-document rerank at 287 ms. On a host whose endpoints are slower than the recorded figures, raise
 the budget above your own measured cold pass before lowering anything else.
+
+When a per-request embed or rerank call fails, because the endpoint is down, timed out, answered an
+error, or returned an unusable body, the pass ends the same way: the request keeps the full catalog
+on the first failure in a compaction window, a later failure strips it and leaves the dropped
+marker, and the once-per-window suggestion rule still applies. The endpoint is then not probed
+again for `healthCheckMs`, so a stopped service costs no per-request timeout on the next request.
+Each failure writes one warning to the host log naming the failed stage, once per process, and puts
+one line on the display record naming the unreachable endpoints. The surfaces render that line in
+place of their fixed idle line, and it outranks both history lines, so a dead-endpoint turn never
+consumes a pending heal failure. These four defaults stay at their current values.
 
 ## The bundled embeddings service
 

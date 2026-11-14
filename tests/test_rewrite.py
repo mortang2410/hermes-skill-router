@@ -814,6 +814,9 @@ def test_an_unreachable_embedder_keeps_the_request_and_records_inert(tmp_path):
     record = record_for(cfg)
     assert record["status"] == "inert"
     assert record["names"] == []
+    assert record["note"] == router_module.ENDPOINT_NOTE, (
+        "a dead embeddings endpoint must put its one line on the record"
+    )
 
 
 def test_an_unreachable_reranker_keeps_the_request_and_records_inert(tmp_path):
@@ -828,6 +831,22 @@ def test_an_unreachable_reranker_keeps_the_request_and_records_inert(tmp_path):
     record = record_for(cfg)
     assert record["status"] == "inert"
     assert record["names"] == []
+    assert record["note"] == router_module.ENDPOINT_NOTE, (
+        "a dead rerank endpoint must put its one line on the record"
+    )
+
+
+def test_a_non_endpoint_failure_carries_no_note(tmp_path):
+    """The endpoint note names a dead endpoint, so it stays off a failure with none."""
+    cfg = make_config(tmp_path)
+
+    result = rewrite(
+        _payload(user=None), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+
+    assert result is None
+    assert record_for(cfg)["status"] == "inert"
+    assert record_for(cfg)["note"] == "", "no user text is not a dead endpoint"
 
 
 def test_an_unbuildable_index_keeps_the_request_and_records_inert(tmp_path, caplog):
@@ -840,6 +859,9 @@ def test_an_unbuildable_index_keeps_the_request_and_records_inert(tmp_path, capl
 
     assert result is None
     assert record_for(cfg)["status"] == "inert"
+    assert record_for(cfg)["note"] == router_module.ENDPOINT_NOTE, (
+        "an embeddings endpoint that fails the index build is a dead endpoint"
+    )
     assert any("index build failed" in message for message in caplog.messages)
 
 

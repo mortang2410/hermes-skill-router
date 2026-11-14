@@ -220,7 +220,7 @@ def test_a_failed_heal_replaces_the_healing_line_once(tmp_path, monkeypatch):
 
 
 def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
-    """A turn that shows no history note must not consume it: C5 reads it only when it wins."""
+    """A turn that shows the dead-endpoint note must not consume the heal note: C5 reads it only when it wins."""
     store_path = tmp_path / "associations.db"
     associations_module.open_store(str(store_path)).close()
     cfg = make_config(tmp_path, associationDbPath=str(store_path))
@@ -238,8 +238,10 @@ def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
         notify=lambda _turn_id: None,
     )
     assert failed is None, "a failed rerank leaves the request unchanged"
-    assert read(cfg)["note"] == "", "the failed turn showed no history note"
-    assert _pending_failure(str(store_path)), "a turn that showed no note consumed it"
+    assert read(cfg)["note"] == router_module.ENDPOINT_NOTE, (
+        "the dead-endpoint note wins over the history and heal-failure notes"
+    )
+    assert _pending_failure(str(store_path)), "a turn that showed no heal note consumed it"
 
     assert _turn(cfg) is not None
     assert read(cfg)["note"] == associations_module.HEAL_FAILURE_NOTE

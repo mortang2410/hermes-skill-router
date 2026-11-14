@@ -193,6 +193,7 @@ def test_a_stub_endpoint_that_answers_past_the_budget_falls_back_with_one_budget
         record = json.loads((tmp_path / "suggestions.json").read_text(encoding="utf-8"))
         assert record["status"] == "inert", 'the expiry must write the inert display record'
         assert record["names"] == [], 'an inert record carries no names'
+        assert record["note"] == "", 'a budget expiry is not a dead endpoint and carries no endpoint note'
     finally:
         embeddings.close()
         reranking.close()
