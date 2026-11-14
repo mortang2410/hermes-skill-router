@@ -16,6 +16,8 @@ paths the live clients use rather than hardcoded ones.
 from __future__ import annotations
 
 import json
+import socket
+import urllib.error
 import urllib.request
 from time import monotonic
 from typing import Any, Mapping, Optional
@@ -42,11 +44,26 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_RefuseRedirect())
 
 
-def _json_request(url: str, *, body: Optional[Mapping[str, Any]], timeout: float) -> tuple[bool, Any]:
-    """Answer ``(True, decoded_json)`` for a parseable 2xx response, ``(False, None)`` otherwise.
+def _is_timeout(exc: BaseException) -> bool:
+    """Whether *exc* is a socket timeout, so a capped probe can tell a slow answer from a refusal."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(
+        getattr(exc, "reason", None), (TimeoutError, socket.timeout)
+    )
+
+
+def _json_request(
+    url: str, *, body: Optional[Mapping[str, Any]], timeout: float
+) -> tuple[bool, Any, bool]:
+    """Answer ``(True, decoded_json, False)`` for a parseable 2xx, else ``(False, None, timed_out)``.
 
     Never raises: a closed port, a timeout, any non-2xx status (including a refused redirect),
-    and a body that is not JSON are all unready values.
+    and a body that is not JSON are all unready values. ``timed_out`` separates a probe that
+    hit its timeout from one an endpoint definitely answered, so the deadline path can keep a
+    slow-but-healthy endpoint indeterminate instead of blaming it.
     """
     data = None if body is None else json.dumps(body).encode("utf-8")
     method = "GET" if body is None else "POST"
@@ -59,12 +76,12 @@ def _json_request(url: str, *, body: Optional[Mapping[str, Any]], timeout: float
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             raw = response.read()
-    except Exception:  # noqa: BLE001 - a probe failure is a readiness value, not an exception
-        return False, None
+    except Exception as exc:  # noqa: BLE001 - a probe failure is a readiness value, not an exception
+        return False, None, _is_timeout(exc)
     try:
-        return True, json.loads(raw)
+        return True, json.loads(raw), False
     except ValueError:
-        return False, None
+        return False, None, False
 
 
 def _probe_timeout(timeout: float, deadline: Optional[float]) -> Optional[float]:
@@ -77,6 +94,18 @@ def _probe_timeout(timeout: float, deadline: Optional[float]) -> Optional[float]
     return min(timeout, left)
 
 
+def _hit_deadline(timeout: float, current: float, timed_out: bool, deadline: Optional[float]) -> bool:
+    """Whether a failed probe timed out only because the routing deadline capped it.
+
+    A timeout at the full configured timeout is a definitive refusal; a timeout at a capped
+    timeout (or one that ends at the deadline) says the endpoint was too slow for the budget,
+    not that it is down, so it must not name the endpoint as failing.
+    """
+    if not timed_out or deadline is None:
+        return False
+    return current < timeout or monotonic() >= deadline
+
+
 def _endpoint_ready(
     base: str,
     model: str,
@@ -86,23 +115,34 @@ def _endpoint_ready(
     bundled_base: str,
     *,
     deadline: Optional[float] = None,
-) -> bool:
-    """Whether *base* is ready: a live answer, and for a bundled base its health rule first."""
+) -> Optional[bool]:
+    """Whether *base* is ready: ``True`` ready, ``False`` definitively not, ``None`` indeterminate.
+
+    ``None`` means a required probe was skipped or timed out under the routing deadline: the
+    endpoint never answered negatively, so no failing setting can be named from it. Without a
+    deadline this never returns ``None``.
+    """
     root = base.rstrip("/")
     if root == bundled_base.rstrip("/"):
         current = _probe_timeout(timeout, deadline)
         if current is None:
-            return False
-        healthy, health = _json_request(root + "/health", body=None, timeout=current)
+            return None
+        healthy, health, timed_out = _json_request(root + "/health", body=None, timeout=current)
         if not healthy or not isinstance(health, dict):
+            if _hit_deadline(timeout, current, timed_out, deadline):
+                return None
             return False
         if health.get("status") != "ok" or health.get("model") != model:
             return False
     current = _probe_timeout(timeout, deadline)
     if current is None:
-        return False
-    answered, _body = _json_request(root + path, body=payload, timeout=current)
-    return answered
+        return None
+    answered, _body, timed_out = _json_request(root + path, body=payload, timeout=current)
+    if answered:
+        return True
+    if _hit_deadline(timeout, current, timed_out, deadline):
+        return None
+    return False
 
 
 def check_setup_state(
@@ -119,9 +159,12 @@ def check_setup_state(
 
     *deadline* is the routing pass' absolute ``monotonic`` deadline: every probe's timeout is
     capped by the time left, so the check cannot outlive the budget a failed rank already spent.
+    When a required probe is skipped or times out under that cap, the answer is indeterminate
+    and this returns ``(False, "")``: no setting is named, because the endpoint never answered
+    negatively. Without a deadline the check is definitive, exactly as before.
     """
     embed_base = config.embed_base_url
-    if not _endpoint_ready(
+    embed_ready = _endpoint_ready(
         embed_base,
         config.embed_model_id,
         config.embed_path,
@@ -129,10 +172,13 @@ def check_setup_state(
         config.embed_timeout_ms / 1000.0,
         BUNDLED_BASES["embed"],
         deadline=deadline,
-    ):
+    )
+    if embed_ready is None:
+        return False, ""
+    if not embed_ready:
         return False, "embedBaseUrl"
     rerank_base = config.rerank_base_url
-    if not _endpoint_ready(
+    rerank_ready = _endpoint_ready(
         rerank_base,
         config.rerank_model,
         config.rerank_path,
@@ -145,7 +191,10 @@ def check_setup_state(
         config.rerank_timeout_ms / 1000.0,
         BUNDLED_BASES["rerank"],
         deadline=deadline,
-    ):
+    )
+    if rerank_ready is None:
+        return False, ""
+    if not rerank_ready:
         return False, "rerankBaseUrl"
     return True, ""
 

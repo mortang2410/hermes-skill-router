@@ -569,7 +569,13 @@ def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
 
     *deadline* is the routing pass' deadline: when the budget a failed rank already spent has
     run out, the probe is skipped (and nothing is cached), so the diagnostic never outlives
-    the budget it explains.
+    the budget it explains. An indeterminate check (a probe the deadline skipped or capped
+    into a timeout, so no endpoint answered negatively) likewise names nothing and is never
+    cached: caching it would pin a possibly wrong attribution for the whole health window.
+
+    The window is not part of the cache identity: expiry is evaluated against the current
+    ``health_check_ms`` on every look-up, so the configured minimum gap is enforced against
+    the live setting instead of a change to it forcing an immediate re-probe.
     """
     key = (
         cfg.embed_base_url,
@@ -580,7 +586,6 @@ def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
         cfg.rerank_model,
         cfg.embed_timeout_ms,
         cfg.rerank_timeout_ms,
-        cfg.health_check_ms,
     )
     window_s = cfg.health_check_ms / 1000.0
     now = monotonic()
@@ -594,6 +599,8 @@ def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
             ready, failing = check_setup_state(cfg, deadline=deadline)
         except Exception:  # the check never raises, but the note must not depend on it
             logger.debug("skill router: the setup check raised", exc_info=True)
+            return ""
+        if not ready and not failing:
             return ""
         _SETUP_CACHE[key] = (now, ready, failing)
     if ready or not failing:

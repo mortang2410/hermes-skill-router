@@ -95,9 +95,11 @@ def _fresh_state(monkeypatch):
         rerank_module.HEALTH.reset()
 
 
-def _embed_responder(path: str):
+def _embed_responder(path: str, *, fail: bool = False):
     def responder(request: Request) -> Response:
         if request.path == path:
+            if fail:
+                return Response(status=500, body={"error": "broken"})
             body = request.json()
             count = len(body.get("input", [])) or 1
             return Response(
@@ -317,6 +319,144 @@ def test_a_custom_endpoint_failure_tells_the_user_to_repair_the_service(tmp_path
         rerank.close()
 
 
+def test_a_custom_embed_failure_tells_the_user_to_repair_the_service(tmp_path):
+    embed = FakeEndpoint(_embed_responder("/custom/embeddings", fail=True))
+    rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=False))
+    try:
+        cfg = _config(tmp_path, embed, rerank)
+        result = _turn(cfg)
+        assert result is None
+        note = read(cfg)["note"]
+        assert "embedBaseUrl" in note, f"note named no failing setting: {note!r}"
+        assert "rerankBaseUrl" not in note
+        assert "repair" in note.lower(), (
+            f"the custom note must point at the configured service: {note!r}"
+        )
+        assert "setup script" not in note, (
+            f"the custom note must not send the user to the script: {note!r}"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_a_slow_healthy_rerank_after_an_embed_failure_is_not_blamed(tmp_path):
+    """A deadline-capped rerank probe is indeterminate, not a rerank failure.
+
+    The rank embed fails at once (500), the diagnostic embed succeeds after 0.75 s of a
+    1.0 s routing budget, and the healthy rerank answers after 0.4 s, past the ~0.25 s
+    left. The turn must carry the generic line, cache nothing, and an unbudgeted check
+    right after must report both endpoints ready.
+    """
+    from hermes_skill_router.setup_check import check_setup_state
+
+    counts = {"embed": 0, "rerank": 0}
+    embed_ok = _embed_responder("/custom/embeddings")
+    rerank_ok = _rerank_responder("/custom/rerank", fail=False)
+
+    def embed_responder(request: Request) -> Response:
+        counts["embed"] += 1
+        if counts["embed"] == 1:
+            return Response(status=500, body={"error": "rank failed"})
+        response = embed_ok(request)
+        if counts["embed"] == 2:
+            response.delay = 0.75
+        return response
+
+    def rerank_responder(request: Request) -> Response:
+        counts["rerank"] += 1
+        response = rerank_ok(request)
+        if counts["rerank"] == 1:
+            response.delay = 0.4
+        return response
+
+    embed = FakeEndpoint(embed_responder)
+    rerank = FakeEndpoint(rerank_responder)
+    try:
+        cfg = _config(
+            tmp_path,
+            embed,
+            rerank,
+            healthCheckMs=60000,
+            embedTimeoutMs=5000,
+            rerankTimeoutMs=5000,
+            routingTimeoutMs=1000,
+        )
+        assert _turn(cfg) is None
+        note = read(cfg)["note"]
+        assert note == router_module.ENDPOINT_NOTE, (
+            f"an indeterminate probe must stay generic, got {note!r}"
+        )
+        assert "rerankBaseUrl" not in note and "embedBaseUrl" not in note
+        assert router_module._SETUP_CACHE == {}, (
+            f"an indeterminate result must not be cached: {router_module._SETUP_CACHE!r}"
+        )
+        assert check_setup_state(cfg) == (True, ""), (
+            "an unbudgeted check right after must see both endpoints healthy"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_a_slow_embed_diagnostic_after_a_rerank_failure_is_not_blamed(tmp_path):
+    """A deadline-capped embed diagnostic is indeterminate, not an embed failure.
+
+    The rank embed succeeds after 0.6 s and the rerank fails at once, leaving ~0.4 s of
+    the 1.0 s budget; the diagnostic embed then needs 0.8 s and times out under the cap.
+    The turn must carry the generic line, cache nothing, and an unbudgeted check right
+    after must report both endpoints ready.
+    """
+    from hermes_skill_router.setup_check import check_setup_state
+
+    counts = {"embed": 0, "rerank": 0}
+    embed_ok = _embed_responder("/custom/embeddings")
+    rerank_ok = _rerank_responder("/custom/rerank", fail=False)
+
+    def embed_responder(request: Request) -> Response:
+        counts["embed"] += 1
+        response = embed_ok(request)
+        if counts["embed"] == 1:
+            response.delay = 0.6
+        elif counts["embed"] == 2:
+            response.delay = 0.8
+        return response
+
+    def rerank_responder(request: Request) -> Response:
+        counts["rerank"] += 1
+        if counts["rerank"] == 1:
+            return Response(status=500, body={"error": "rank failed"})
+        return rerank_ok(request)
+
+    embed = FakeEndpoint(embed_responder)
+    rerank = FakeEndpoint(rerank_responder)
+    try:
+        cfg = _config(
+            tmp_path,
+            embed,
+            rerank,
+            healthCheckMs=60000,
+            embedTimeoutMs=5000,
+            rerankTimeoutMs=5000,
+            routingTimeoutMs=1000,
+        )
+        assert _turn(cfg) is None
+        note = read(cfg)["note"]
+        assert note == router_module.ENDPOINT_NOTE, (
+            f"an indeterminate probe must stay generic, got {note!r}"
+        )
+        assert "embedBaseUrl" not in note and "rerankBaseUrl" not in note
+        assert router_module._SETUP_CACHE == {}, (
+            f"an indeterminate result must not be cached: {router_module._SETUP_CACHE!r}"
+        )
+        assert check_setup_state(cfg) == (True, ""), (
+            "an unbudgeted check right after must see both endpoints healthy"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
 def test_the_bundled_setup_note_keeps_the_setup_script_line():
     from hermes_skill_router.setup_check import setup_note
 
@@ -365,7 +505,13 @@ def test_a_bundled_endpoint_failure_keeps_the_setup_script_line(tmp_path, monkey
 def test_changing_the_health_window_reprobes_instead_of_serving_the_old_check(
     tmp_path, monkeypatch
 ):
-    """X2: healthCheckMs is part of the setup-check cache key."""
+    """The health window is not a cache key: expiry runs against the live window.
+
+    Changing healthCheckMs must not force a re-probe while the new minimum gap has
+    not elapsed; once it has, the next turn re-probes.
+    """
+    from time import monotonic as real_monotonic
+
     from hermes_skill_router import setup_check
 
     embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
@@ -399,7 +545,12 @@ def test_changing_the_health_window_reprobes_instead_of_serving_the_old_check(
         assert len(calls) == 1, "a second turn inside the window must serve the cache"
         narrower = _config(tmp_path, embed, rerank, healthCheckMs=30000)
         assert turn(narrower, "s-3") is None
-        assert len(calls) == 2, "changing the health window must reprobe"
+        assert len(calls) == 1, (
+            "changing the window must not re-probe while the new 30s gap has not elapsed"
+        )
+        monkeypatch.setattr(router_module, "monotonic", lambda: real_monotonic() + 31.0)
+        assert turn(narrower, "s-4") is None
+        assert len(calls) == 2, "once the live 30s window has elapsed the turn must re-probe"
     finally:
         embed.close()
         rerank.close()
