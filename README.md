@@ -113,7 +113,7 @@ still returning cosine.
    hermes plugins enable hermes-skill-router
    ```
 
-3. Point the plugin at an embedder and a reranker in the profile config:
+3. Point the plugin at your own endpoints if you use them. The bundled defaults need no setting:
 
    ```yaml
    plugins:
@@ -124,17 +124,23 @@ still returning cosine.
            rerankBaseUrl: http://127.0.0.1:8010
    ```
 
-4. Run both services. This repository ships an embeddings server for BGE-M3 on CPU:
+4. Download and start both model servers. Run the setup script from the checkout root:
 
    ```bash
-   HSR_MODEL_DIR=/path/to/bge-m3 HSR_PORT=8012 python3 -m service.embed_server
+   python3 tools/setup_models.py
    ```
 
-   It serves `POST /v1/embeddings` and `GET /health` on `127.0.0.1:8012`. No reranker is bundled, so
-   point `rerankBaseUrl` at any service that answers the rerank protocol in the technical
-   documentation. Both base URLs must be bare origins.
-   [default-models.md](default-models.md) covers the two default models, how to download them, and
-   three ways to serve the embedder and the reranker.
+   It asks where to download the two model files, then downloads, pin-checks and starts the
+   bundled embeddings server for BGE-M3 and the bundled decider rerank server for
+   `tasksource-decider-nano`. On Linux it installs two systemd user units and prints the
+   manage, start and stop commands; on macOS and Windows it starts both servers with
+   `python3` and prints the same three commands. It never runs automatically, and it changes
+   no plugin setting.
+
+   The servers answer `POST /v1/embeddings` and `GET /health` on `127.0.0.1:8012`, and
+   `POST /v1/rerank` and `GET /health` on `127.0.0.1:8010`. Both base URLs must be bare
+   origins. [default-models.md](default-models.md) covers the two default models, how to
+   download them by hand, and other ways to serve them.
 
 5. Check both health routes, then run one turn and read its dump:
 
@@ -150,12 +156,13 @@ still returning cosine.
 
 ## Recommended setup
 
-The defaults are what we run, so you only have to set the two base URLs:
+The defaults are what we run, and step 4 starts both servers on them, so a fresh install needs
+no endpoint setting:
 
 - Embeddings: BGE-M3 on CPU, served by the bundled `service.embed_server` on 8012, with
   `embedModelId: bge-m3`.
-- Rerank: `tasksource-decider-nano` through a Cohere-compatible rerank service on 8010, with
-  `rerankProvider: cohere`.
+- Rerank: `tasksource-decider-nano` through the bundled `service.decider_rerank_server` on 8010,
+  with `rerankProvider: cohere`.
 - Routing: `cutoff: 0.01`, `shortlistSize: 50`, `maxSuggestions: 10`, `fusionMode: live` with all
   three channels on, and the 6000, 20000 and 30000 ms timeouts. Keep them unless your endpoints need
   different budgets.
@@ -217,6 +224,8 @@ Every other key, with its bound and its effect, is in the
 - [technical-documentation.md](technical-documentation.md) covers routing end to end, the request
   rewrite, the suggestion record schema, both display protocols, every setting, both endpoint
   protocols, failure behaviour, the measured effect and the tests.
+- [after-install.md](after-install.md) is the short note shown after `hermes plugins install`: the
+  setup command, what it downloads and starts, and the route for custom endpoints.
 - [default-models.md](default-models.md) covers the default embedder and reranker models, how to
   download them, how to serve each one, how to check the endpoints answer, and what the plugin does
   when an endpoint is down.
