@@ -1919,7 +1919,19 @@ _HEAL_FINISHED = "finished"
 #: The last attempt per association-store path; the turn and the job's own thread both write it.
 _HEAL_STATE: Dict[str, str] = {}
 
-#: Guards :data:`_HEAL_STATE`: one turn and the job thread never disagree about an attempt.
+#: Contract C5's one-line note for a failed heal. The turn-side note chooser owns the record that
+#: carries it, because the heal thread has no :class:`~hermes_skill_router.config.Config` to write
+#: the display record itself.
+HEAL_FAILURE_NOTE = (
+    "History is incomplete and the background heal failed; routing continues without learned "
+    "history."
+)
+
+#: One pending failure note per association-store path, handed to contract C5 once and then cleared.
+_HEAL_FAILURES: Dict[str, str] = {}
+
+#: Guards :data:`_HEAL_STATE` and :data:`_HEAL_FAILURES`: one turn and the job thread never
+#: disagree about an attempt.
 _HEAL_LOCK = threading.Lock()
 
 
@@ -1968,7 +1980,9 @@ def request_heal(
 
     The entry point is resolved before the thread starts, so a test that replaces it for one turn
     cannot have a late thread fall back to the real job. One job runs at a time across stores,
-    which is the C4 invariant; a refused launch leaves the other store free to launch later.
+    which is the C4 invariant; a refused launch leaves the other store free to launch later. A
+    thread that cannot start is a failed heal: it warns in the host logger and leaves contract C5's
+    one-line failure note pending, exactly as a failed pass does.
     """
     entry = heal_store
     with _HEAL_LOCK:
@@ -1991,6 +2005,7 @@ def request_heal(
         )
         with _HEAL_LOCK:
             _HEAL_STATE[store_path] = _HEAL_FINISHED
+            _HEAL_FAILURES[store_path] = HEAL_FAILURE_NOTE
         return False
     return True
 
@@ -1999,17 +2014,35 @@ def note_store_complete(store_path: str) -> None:
     """Clear a finished heal attempt once the store is observed complete.
 
     A running attempt keeps its marker: the job's own thread settles it and clears it if the pass
-    made the store complete. A store that is complete with no attempt recorded stays without one.
+    made the store complete. A pending failure note is dropped here too, because a complete store
+    is evidence that the failure the note reported no longer holds. A store that is complete with
+    no attempt recorded stays without one.
     """
     with _HEAL_LOCK:
+        _HEAL_FAILURES.pop(store_path, None)
         if _HEAL_STATE.get(store_path) != _HEAL_RUNNING:
             _HEAL_STATE.pop(store_path, None)
+
+
+def heal_failure_note(store_path: str) -> Optional[str]:
+    """Return contract C5's one-line note for a failed heal of *store_path*, once, or ``None``.
+
+    The heal thread records the note when its pass fails, and contract C5's turn-side note chooser
+    reads it, because the thread has no :class:`~hermes_skill_router.config.Config` and therefore
+    cannot write the display record itself. Reading clears the note, so one failure produces exactly
+    one injected message, and a successful pass (:func:`_run_heal`) or a store observed complete
+    (:func:`note_store_complete`) clears it unread. *store_path* is the same path the heal was
+    requested for; never raises.
+    """
+    with _HEAL_LOCK:
+        return _HEAL_FAILURES.pop(store_path, None)
 
 
 def reset_heal_state() -> None:
     """Forget every launched heal attempt. Tests call this; production never needs it."""
     with _HEAL_LOCK:
         _HEAL_STATE.clear()
+        _HEAL_FAILURES.clear()
 
 
 def _run_heal(
@@ -2022,15 +2055,21 @@ def _run_heal(
     """Run the captured C6 entry point, then settle the one-attempt state for *store_path*.
 
     Failure is logged in the host logger and never raised: a heal thread has no listener, so this
-    is the only place that failure can be reported from. The note the turn surfaces, and the
-    injected message it rides on, are contract C5's and ticket 06's to add.
+    is the only place that failure can be reported from. The failure also leaves contract C5's
+    one-line note pending, because this thread has no ``Config`` to write the display record itself;
+    a pass that finishes clears the note. A store that the pass left complete drops the note too,
+    so a stale failure is never surfaced.
     """
     report: Optional[BackfillReport] = None
     try:
         report = entry(store_path, state_db_path, catalog=catalog, now_ms=now_ms)
     except Exception as exc:  # a failed heal must not kill the thread or the process
         logger.warning("skill associations: the background heal of %s failed: %s", store_path, exc)
+        with _HEAL_LOCK:
+            _HEAL_FAILURES[store_path] = HEAL_FAILURE_NOTE
     if report is not None:
+        with _HEAL_LOCK:
+            _HEAL_FAILURES.pop(store_path, None)
         logger.info(
             "skill associations: the background heal of %s finished: %d sessions, %d loads, %d ms",
             store_path,
