@@ -56,14 +56,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import pathlib
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 #: The schema version this build writes and the only one it opens.
 SCHEMA_VERSION = 1
@@ -1863,6 +1867,190 @@ def backfill(
             write_meta(store, META_LAST_SCAN_MS, str(report.last_scan_ms))
     report.ms = int((time.perf_counter() - started) * 1000)
     return report
+
+
+#: Contract C4: a store is complete when the newest session stamp is at most this far behind
+#: ``META_LAST_SCAN_MS``, because the last 24 hours are still updating.
+COMPLETENESS_WINDOW_MS = DAY_MS
+
+
+def newest_session_stamp_ms(state_db_path: Optional[str] = None) -> int:
+    """Return the newest session stamp in the Hermes store, or 0 when the store holds no session.
+
+    The stamp is the same expression the backfill reads per session: ``last_activity_at`` when the
+    session carries one, ``started_at`` otherwise, converted from epoch seconds to milliseconds.
+    A missing or unreadable session store raises so the caller can answer "not complete" rather
+    than guess; nothing here writes.
+    """
+    source = _open_state_db(state_db_path or default_state_db_path())
+    try:
+        row = source.execute(
+            "SELECT MAX(COALESCE(last_activity_at, started_at)) AS stamp FROM sessions"
+        ).fetchone()
+    finally:
+        source.close()
+    return _stamp_of(row["stamp"]) if row is not None else 0
+
+
+def is_store_complete(store: AssociationStore, state_db_path: Optional[str] = None) -> bool:
+    """Return whether *store* covers everything except possibly the last 24 hours.
+
+    Completeness is contract C6's rule: the newest session stamp minus the store's
+    ``META_LAST_SCAN_MS`` is at most :data:`COMPLETENESS_WINDOW_MS`. A store with no watermark is
+    incomplete, because no uncapped pass has finished on it, and a read failure answers
+    "incomplete" instead of raising: an unreadable store or session store is no evidence of
+    coverage, and a turn must never fail over this check.
+    """
+    try:
+        scanned = _meta_int(store, META_LAST_SCAN_MS)
+        if scanned <= 0:
+            return False
+        newest = newest_session_stamp_ms(state_db_path)
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    return newest - scanned <= COMPLETENESS_WINDOW_MS
+
+
+#: The two states one association store's heal attempt can be in. ``finished`` means the job ran
+#: and the store still reported incomplete, so no second attempt may start while that holds.
+_HEAL_RUNNING = "running"
+_HEAL_FINISHED = "finished"
+
+#: The last attempt per association-store path; the turn and the job's own thread both write it.
+_HEAL_STATE: Dict[str, str] = {}
+
+#: Guards :data:`_HEAL_STATE`: one turn and the job thread never disagree about an attempt.
+_HEAL_LOCK = threading.Lock()
+
+
+def heal_store(
+    store_path: str,
+    state_db_path: Optional[str] = None,
+    *,
+    catalog: Sequence[CatalogSkill] = (),
+    now_ms: Optional[int] = None,
+) -> BackfillReport:
+    """Run the C6 background job: open the association store writable, then backfill it uncapped.
+
+    This is the entry point contract C4 launches once per incomplete condition and the job contract
+    C6 owns. It runs after the turn has closed its read-only handle, so a pass and a job never
+    share a connection, and it opens the store itself because a missing or zero-byte file is one of
+    the conditions that asks for the job. ``state_db_path`` defaults to
+    :func:`default_state_db_path`, the only path this build reads; a later ``_Spec`` settings row
+    for it would be threaded through here.
+    """
+    store = open_store(os.path.expanduser(store_path))
+    try:
+        return backfill(
+            store,
+            state_db_path or default_state_db_path(),
+            catalog=catalog,
+            now_ms=now_ms,
+        )
+    finally:
+        store.close()
+
+
+def request_heal(
+    store_path: str,
+    state_db_path: Optional[str] = None,
+    *,
+    catalog: Sequence[CatalogSkill] = (),
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Start one background heal for *store_path* and return whether this call started it.
+
+    The first incomplete observation of a store starts the job. While the job runs, and after it
+    finishes with the store still incomplete, later turns get ``False``: a failed or slow heal can
+    therefore never become the reset loop contract C4 forbids. :func:`note_store_complete` clears
+    the attempt once any pass sees the store complete, which makes a later staleness a new
+    condition with its own single launch.
+
+    The entry point is resolved before the thread starts, so a test that replaces it for one turn
+    cannot have a late thread fall back to the real job. One job runs at a time across stores,
+    which is the C4 invariant; a refused launch leaves the other store free to launch later.
+    """
+    entry = heal_store
+    with _HEAL_LOCK:
+        if _HEAL_STATE.get(store_path) is not None:
+            return False
+        if _HEAL_RUNNING in _HEAL_STATE.values():
+            return False
+        _HEAL_STATE[store_path] = _HEAL_RUNNING
+    thread = threading.Thread(
+        target=_run_heal,
+        args=(entry, store_path, state_db_path, tuple(catalog), now_ms),
+        name="hermes-skill-router-heal",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError as exc:  # no thread can be started; never carry the failure into a turn
+        logger.warning(
+            "skill associations: cannot start the background heal of %s: %s", store_path, exc
+        )
+        with _HEAL_LOCK:
+            _HEAL_STATE[store_path] = _HEAL_FINISHED
+        return False
+    return True
+
+
+def note_store_complete(store_path: str) -> None:
+    """Clear a finished heal attempt once the store is observed complete.
+
+    A running attempt keeps its marker: the job's own thread settles it and clears it if the pass
+    made the store complete. A store that is complete with no attempt recorded stays without one.
+    """
+    with _HEAL_LOCK:
+        if _HEAL_STATE.get(store_path) != _HEAL_RUNNING:
+            _HEAL_STATE.pop(store_path, None)
+
+
+def reset_heal_state() -> None:
+    """Forget every launched heal attempt. Tests call this; production never needs it."""
+    with _HEAL_LOCK:
+        _HEAL_STATE.clear()
+
+
+def _run_heal(
+    entry: Callable[..., BackfillReport],
+    store_path: str,
+    state_db_path: Optional[str],
+    catalog: Sequence[CatalogSkill],
+    now_ms: Optional[int],
+) -> None:
+    """Run the captured C6 entry point, then settle the one-attempt state for *store_path*.
+
+    Failure is logged in the host logger and never raised: a heal thread has no listener, so this
+    is the only place that failure can be reported from. The note the turn surfaces, and the
+    injected message it rides on, are contract C5's and ticket 06's to add.
+    """
+    report: Optional[BackfillReport] = None
+    try:
+        report = entry(store_path, state_db_path, catalog=catalog, now_ms=now_ms)
+    except Exception as exc:  # a failed heal must not kill the thread or the process
+        logger.warning("skill associations: the background heal of %s failed: %s", store_path, exc)
+    if report is not None:
+        logger.info(
+            "skill associations: the background heal of %s finished: %d sessions, %d loads, %d ms",
+            store_path,
+            report.sessions_found,
+            report.loads,
+            report.ms,
+        )
+    complete = False
+    try:
+        store = open_store(store_path, read_only=True)
+        try:
+            complete = is_store_complete(store, state_db_path)
+        finally:
+            store.close()
+    except Exception:
+        logger.debug("skill associations: the healed store could not be checked", exc_info=True)
+    with _HEAL_LOCK:
+        _HEAL_STATE[store_path] = _HEAL_FINISHED
+    if complete:
+        note_store_complete(store_path)
 
 
 def _open_state_db(path: str) -> sqlite3.Connection:

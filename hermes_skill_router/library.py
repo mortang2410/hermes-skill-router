@@ -232,7 +232,10 @@ def shortlist(
     channels are fused with reciprocal rank fusion, the recency bump moves a candidate whose
     catalog path *resolver* resolves, and only then is the order cut to *limit*. A disabled channel
     and an absent one are the same input, so a missing term index or store leaves the remaining
-    channels routing.
+    channels routing. The learned store contributes only while it is complete: a missing,
+    unreadable, empty or stale store skips the association channel and the recency bump for this
+    turn and asks for one background heal (contract C4), so a fresh install routes from the
+    semantic and BM25 channels while history heals.
 
     ``mode: cosine`` returns the cosine order cut to *limit* without reading the term index, opening
     the store or applying the bump. ``mode: shadow`` computes and logs the diagnostics but returns
@@ -253,7 +256,7 @@ def shortlist(
         else:
             bm25_order = bm25.score_ranks(index.term_index, query_text, len(index.names))
 
-    store = _open_store(cfg)
+    store = _open_complete_store(cfg, index)
     association_order: Optional[List[str]] = None
     if settings.associations and store is not None:
         association_order = _association_ranks(store, index, query_text, now_ms)
@@ -478,6 +481,52 @@ def _open_store(cfg: Config) -> Optional[associations.AssociationStore]:
             "association channel contributes no ranks",
         )
         return None
+
+
+def _open_complete_store(
+    cfg: Config, index: Index
+) -> Optional[associations.AssociationStore]:
+    """Open the association store for one pass, and request the heal when it is incomplete.
+
+    Only a complete store contributes: missing, unreadable, empty and stale stores all skip the
+    association channel for this turn, which leaves the semantic and BM25 channels routing and the
+    request untouched. The first observation of an incomplete store asks for the background heal;
+    the request carries the catalog the pass already has, so the learned rows name skills the
+    router can actually suggest. Every failure here is contained, because a turn must never break
+    over learned history.
+    """
+    path = _association_path(cfg)
+    if path is None:
+        return None
+    store = _open_store(cfg)
+    if store is None:
+        _request_heal(path, index)
+        return None
+    try:
+        complete = associations.is_store_complete(store)
+    except Exception:  # the check never raises, but the pass must not depend on that
+        logger.debug("skill index: the store completeness check raised", exc_info=True)
+        complete = False
+    if not complete:
+        _close_store(store)
+        _request_heal(path, index)
+        return None
+    try:
+        associations.note_store_complete(path)
+    except Exception:  # bookkeeping only; a failure costs no rank
+        logger.debug("skill index: the heal bookkeeping raised", exc_info=True)
+    return store
+
+
+def _request_heal(path: str, index: Index) -> None:
+    """Ask for one background heal of *path*, never raising into the routing pass."""
+    try:
+        associations.request_heal(
+            path,
+            catalog=[associations.CatalogSkill(name) for name in index.names],
+        )
+    except Exception:  # the heal is best effort; the turn's channels do not wait for it
+        logger.debug("skill index: the heal request raised", exc_info=True)
 
 
 def _close_store(store: Optional[associations.AssociationStore]) -> None:

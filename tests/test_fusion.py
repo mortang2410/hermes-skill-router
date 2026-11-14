@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -44,6 +45,42 @@ from hermes_skill_router.library import Index, shortlist  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
+
+#: The newest session stamp every seeded store in this module is compared against.
+FIXTURE_NOW_MS = T0 + DAY
+
+#: The two tables the completeness check reads from the Hermes session store.
+HERMES_SESSIONS_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    last_activity_at REAL
+);
+"""
+
+
+@pytest.fixture(autouse=True)
+def _hermes_session_store(tmp_path, monkeypatch):
+    """Point the C4 completeness check at a fixture session store, never at the operator's history.
+
+    Contract C4 asks whether ``newest session stamp - META_LAST_SCAN_MS`` is at most 86400000 ms,
+    and reads the Hermes store at ``default_state_db_path``. This module's clock is fixed at
+    ``FIXTURE_NOW_MS``, so a fixture store with one session at that stamp keeps every seeded
+    association store complete without reading the live store.
+    """
+    path = tmp_path / "hermes-state.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(HERMES_SESSIONS_SCHEMA)
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, last_activity_at) VALUES (?, ?, ?, ?)",
+            ("fusion-session", "cli", FIXTURE_NOW_MS / 1000.0, FIXTURE_NOW_MS / 1000.0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(associations, "default_state_db_path", lambda home=None: str(path))
 
 
 def make_index(names=("alpha", "beta", "gamma", "delta")):
@@ -91,6 +128,9 @@ def seed_usage(path, now_ms, names):
                     f"{name}:one",
                 ),
             )
+        # A complete store is one whose scan watermark is inside C4's 24-hour window of the
+        # fixture session stamp, so the channel is actually consulted instead of skipped.
+        associations.write_meta(store, associations.META_LAST_SCAN_MS, str(now_ms))
     finally:
         store.close()
 
@@ -551,6 +591,7 @@ def test_seeded_association_rows_contribute_ranks_to_the_fused_order(tmp_path):
         associations.reconcile_catalog(store, [CatalogSkill(name) for name in names], now_ms)
         # beta gets term "zed" with support 3, so the association channel ranks it.
         _seed_association_rank(store, "beta", "zed", now_ms, prompts=3)
+        associations.write_meta(store, associations.META_LAST_SCAN_MS, str(now_ms))
     finally:
         store.close()
 
@@ -591,6 +632,7 @@ def test_association_rows_below_the_floor_contribute_no_rank_end_to_end(tmp_path
 
         associations.reconcile_catalog(store, [CatalogSkill(name) for name in names], now_ms)
         _seed_association_rank(store, "beta", "zed", now_ms, prompts=2)
+        associations.write_meta(store, associations.META_LAST_SCAN_MS, str(now_ms))
     finally:
         store.close()
 
