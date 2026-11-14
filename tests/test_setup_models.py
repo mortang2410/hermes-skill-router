@@ -526,6 +526,59 @@ def test_a_spaced_model_directory_verifies_with_no_invalid_assignment(tmp_path):
         )
 
 
+def _parse_systemd_env(line: str) -> str:
+    """Decode one systemd ``Environment="NAME=value"`` line as the runtime expands it.
+
+    A backslash escapes the next character literally, ``%%`` collapses to ``%``,
+    any other ``%`` specifier expands (here to a placeholder, so a literal ``%``
+    in a path is distinguishable), and ``$`` carries no special meaning.
+    """
+    _prefix, _sep, quoted = line.partition('="')
+    assert quoted.endswith('"'), line
+    raw = quoted[:-1]
+    out: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\" and index + 1 < len(raw):
+            out.append(raw[index + 1])
+            index += 2
+            continue
+        if char == "%" and index + 1 < len(raw):
+            following = raw[index + 1]
+            out.append("%" if following == "%" else f"<specifier {following}>")
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    value = "".join(out)
+    name, equals, assigned = value.partition("=")
+    assert equals == "=" and name == "HSR_MODEL_DIR", line
+    return assigned
+
+
+@pytest.mark.parametrize(
+    ("subdir", "expected_fragment"),
+    [
+        ("mo$dels", "mo$dels"),
+        ("models%h", "models%%h"),
+        ("mo$d%hels", "mo$d%%hels"),
+    ],
+)
+def test_the_environment_value_survives_dollar_and_specifier_characters(
+    tmp_path, subdir, expected_fragment
+):
+    """A ``$`` passes through untouched and a ``%`` is escaped as ``%%``."""
+    directory = tmp_path / subdir
+    line = next(
+        item
+        for item in setup._embed_unit_text(directory).splitlines()
+        if item.startswith('Environment="HSR_MODEL_DIR=')
+    )
+    assert line == f'Environment="HSR_MODEL_DIR={tmp_path}/{expected_fragment}/bge-m3"'
+    assert _parse_systemd_env(line) == str(directory / "bge-m3")
+
+
 def test_installing_the_unit_replaces_a_symlink_without_editing_its_target(clean_home, monkeypatch, tmp_path):
     home, xdg = clean_home
     unit_dir = xdg / "systemd" / "user"

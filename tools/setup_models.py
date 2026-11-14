@@ -327,10 +327,13 @@ def _quoted_env(name: str, value: str) -> str:
 
     Systemd splits an unquoted ``Environment=`` value on spaces, so a user-chosen
     model path with a space would truncate and warn. Quoting with double quotes
-    keeps the full path; a backslash, a double quote and a dollar sign are
-    escaped so systemd passes them through literally.
+    keeps the full path; a backslash and a double quote are escaped so systemd
+    passes them through literally. A percent sign is doubled, because systemd
+    expands ``%`` specifiers: ``%%`` passes through as one ``%``. A dollar sign
+    needs no escaping: ``Environment=`` never expands it, so doubling it would
+    hand the server a corrupted path.
     """
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     return f'Environment="{name}={escaped}"'
 
 

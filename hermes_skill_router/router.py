@@ -104,7 +104,7 @@ from .search import (
     remember_partition,
 )
 from .select import Suggestion, select
-from .setup_check import check_setup_state, setup_note
+from .setup_check import BUNDLED_BASES, check_setup_state, setup_note
 from .tools import skill_path
 
 logger = logging.getLogger(__name__)
@@ -292,7 +292,10 @@ def _compose(
     # One memo for the whole pass: the recency gate and the selection both resolve through the
     # same saved map, so a candidate is looked up at most once a pass and never again once known.
     resolve = path_resolver(cfg, index, skill_path)
-    ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve)
+    # The routing budget starts here, after the index is in hand; the failed-pass diagnostic
+    # below probes inside the same budget, so the check caps its own timeouts by what is left.
+    deadline = monotonic() + cfg.routing_timeout_ms / 1000.0
+    ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve, deadline=deadline)
     if ranked.reason:
         # A failed per-request call is a dead endpoint, and its line outranks the history
         # line; a budget expiry keeps no line and never consumes the pending heal note.
@@ -300,6 +303,7 @@ def _compose(
             note = _failure_note(
                 cfg,
                 uses_live=embed is default_embed and rerank is default_rerank,
+                deadline=deadline,
             )
         else:
             note = ""
@@ -555,13 +559,17 @@ def _history_note(cfg: Config) -> str:
 _SETUP_CACHE: Dict[tuple, tuple[float, bool, str]] = {}
 
 
-def _setup_note(cfg: Config) -> str:
+def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
     """Return contract C2's setup-needed line for *cfg*, or ``""`` when both endpoints are ready.
 
     The check runs only on a dead-endpoint turn with the live clients. A test that injects its
     own transport proves ranking without touching a socket, so it never probes and keeps the
     generic dead-endpoint line. The result is throttled by ``healthCheckMs`` per endpoint
     config, mirroring the clients' health gates.
+
+    *deadline* is the routing pass' deadline: when the budget a failed rank already spent has
+    run out, the probe is skipped (and nothing is cached), so the diagnostic never outlives
+    the budget it explains.
     """
     key = (
         cfg.embed_base_url,
@@ -572,6 +580,7 @@ def _setup_note(cfg: Config) -> str:
         cfg.rerank_model,
         cfg.embed_timeout_ms,
         cfg.rerank_timeout_ms,
+        cfg.health_check_ms,
     )
     window_s = cfg.health_check_ms / 1000.0
     now = monotonic()
@@ -579,27 +588,40 @@ def _setup_note(cfg: Config) -> str:
     if cached is not None and window_s > 0 and (now - cached[0]) < window_s:
         ready, failing = cached[1], cached[2]
     else:
+        if deadline is not None and deadline - now <= 0:
+            return ""
         try:
-            ready, failing = check_setup_state(cfg)
+            ready, failing = check_setup_state(cfg, deadline=deadline)
         except Exception:  # the check never raises, but the note must not depend on it
             logger.debug("skill router: the setup check raised", exc_info=True)
             return ""
         _SETUP_CACHE[key] = (now, ready, failing)
     if ready or not failing:
         return ""
-    return setup_note(failing)
+    return setup_note(failing, bundled=_is_bundled(cfg, failing))
 
 
-def _failure_note(cfg: Config, *, uses_live: bool) -> str:
+def _is_bundled(cfg: Config, failing: str) -> bool:
+    """Whether the failing base is one of the plugin defaults the setup script installs."""
+    if failing == "embedBaseUrl":
+        return cfg.embed_base_url.rstrip("/") == BUNDLED_BASES["embed"].rstrip("/")
+    if failing == "rerankBaseUrl":
+        return cfg.rerank_base_url.rstrip("/") == BUNDLED_BASES["rerank"].rstrip("/")
+    return True
+
+
+def _failure_note(
+    cfg: Config, *, uses_live: bool, deadline: Optional[float] = None
+) -> str:
     """Return the one line for a dead-endpoint turn, naming the failing setting when probed.
 
     With the live clients the setup-needed line names ``embedBaseUrl`` or
     ``rerankBaseUrl``; without them the generic dead-endpoint line is all a fake-transport
     failure can name. A ready check falls back to the generic line, so a budget or malformed
-    body never claims setup is needed.
+    body never claims setup is needed. *deadline* bounds the probe inside the routing budget.
     """
     if uses_live:
-        probed = _setup_note(cfg)
+        probed = _setup_note(cfg, deadline=deadline)
         if probed:
             return probed
     return ENDPOINT_NOTE

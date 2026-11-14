@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from time import monotonic
 from typing import Any, Mapping, Optional
 
 from .config import DEFAULTS, Config
@@ -66,6 +67,16 @@ def _json_request(url: str, *, body: Optional[Mapping[str, Any]], timeout: float
         return False, None
 
 
+def _probe_timeout(timeout: float, deadline: Optional[float]) -> Optional[float]:
+    """One probe's timeout capped by the routing deadline, or ``None`` when it is spent."""
+    if deadline is None:
+        return timeout
+    left = deadline - monotonic()
+    if left <= 0:
+        return None
+    return min(timeout, left)
+
+
 def _endpoint_ready(
     base: str,
     model: str,
@@ -73,20 +84,30 @@ def _endpoint_ready(
     payload: Mapping[str, Any],
     timeout: float,
     bundled_base: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> bool:
     """Whether *base* is ready: a live answer, and for a bundled base its health rule first."""
     root = base.rstrip("/")
     if root == bundled_base.rstrip("/"):
-        healthy, health = _json_request(root + "/health", body=None, timeout=timeout)
+        current = _probe_timeout(timeout, deadline)
+        if current is None:
+            return False
+        healthy, health = _json_request(root + "/health", body=None, timeout=current)
         if not healthy or not isinstance(health, dict):
             return False
         if health.get("status") != "ok" or health.get("model") != model:
             return False
-    answered, _body = _json_request(root + path, body=payload, timeout=timeout)
+    current = _probe_timeout(timeout, deadline)
+    if current is None:
+        return False
+    answered, _body = _json_request(root + path, body=payload, timeout=current)
     return answered
 
 
-def check_setup_state(config: Config) -> tuple[bool, str]:
+def check_setup_state(
+    config: Config, *, deadline: Optional[float] = None
+) -> tuple[bool, str]:
     """Return ``(True, "")`` when both configured endpoints answer, else the failing setting name.
 
     A custom endpoint needs only a correct answer to the plugin's real embeddings or rerank
@@ -95,6 +116,9 @@ def check_setup_state(config: Config) -> tuple[bool, str]:
     answer ``GET <base>/health`` with ``status == "ok"`` and the configured model, then answer the
     same tiny live request. Never raises; unready is a value. The failing name is the settings
     key (``embedBaseUrl`` or ``rerankBaseUrl``) the setup-needed line names.
+
+    *deadline* is the routing pass' absolute ``monotonic`` deadline: every probe's timeout is
+    capped by the time left, so the check cannot outlive the budget a failed rank already spent.
     """
     embed_base = config.embed_base_url
     if not _endpoint_ready(
@@ -104,6 +128,7 @@ def check_setup_state(config: Config) -> tuple[bool, str]:
         {"model": config.embed_model_id, "input": ["setup check"]},
         config.embed_timeout_ms / 1000.0,
         BUNDLED_BASES["embed"],
+        deadline=deadline,
     ):
         return False, "embedBaseUrl"
     rerank_base = config.rerank_base_url
@@ -119,16 +144,26 @@ def check_setup_state(config: Config) -> tuple[bool, str]:
         },
         config.rerank_timeout_ms / 1000.0,
         BUNDLED_BASES["rerank"],
+        deadline=deadline,
     ):
         return False, "rerankBaseUrl"
     return True, ""
 
 
-def setup_note(failing: str) -> str:
+def setup_note(failing: str, *, bundled: bool = True) -> str:
     """Return contract C2's one setup-needed line naming the failing settings key.
 
     *failing* is the settings key ``check_setup_state`` returned, ``embedBaseUrl`` or
     ``rerankBaseUrl``. The line rides on the display record only, with no provider token and no
     automatic setup.
+
+    A bundled base keeps the setup-script line: the script installs those servers. A custom
+    base never passes through the script (it writes no settings), so its line instead tells
+    the user to repair the service at the configured setting.
     """
-    return f"Model setup needed: {failing} is not ready; run the model setup script and reload."
+    if bundled:
+        return f"Model setup needed: {failing} is not ready; run the model setup script and reload."
+    return (
+        f"Model setup needed: {failing} is not ready; "
+        f"repair the service at the configured {failing} endpoint and reload."
+    )

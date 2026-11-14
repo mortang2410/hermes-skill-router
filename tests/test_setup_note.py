@@ -255,6 +255,156 @@ def test_an_unready_rerank_endpoint_names_the_setting_on_both_surfaces(tmp_path)
         rerank.close()
 
 
+def test_a_dead_endpoint_turn_stays_within_the_routing_budget(tmp_path):
+    """C1: the setup probe after a rank failure must not outlive the routing budget.
+
+    Both endpoints answer after 0.8 s and the embed one fails, so rank burns 0.8 s
+    of a 1.0 s budget. Pre-fix the probe then re-probes both endpoints at full
+    timeouts (1.6 s) and the turn takes ~2.4 s; post-fix the probe is capped by
+    the 0.2 s left and the turn stays under the budget plus a small slack.
+    """
+    import time
+
+    def embed_responder(request: Request) -> Response:
+        return Response(status=500, body={"error": "broken"}, delay=0.8)
+
+    def rerank_responder(request: Request) -> Response:
+        return Response(body={"results": []}, delay=0.8)
+
+    embed = FakeEndpoint(embed_responder)
+    rerank = FakeEndpoint(rerank_responder)
+    try:
+        cfg = _config(
+            tmp_path,
+            embed,
+            rerank,
+            embedTimeoutMs=5000,
+            rerankTimeoutMs=5000,
+            routingTimeoutMs=1000,
+        )
+        started = time.perf_counter()
+        result = _turn(cfg)
+        elapsed = time.perf_counter() - started
+        assert result is None, "a dead endpoint leaves the request unchanged"
+        assert read(cfg)["status"] == "inert"
+        assert elapsed >= 0.7, f"the delayed endpoints must actually delay: {elapsed:.3f}s"
+        assert elapsed < 1.5, (
+            "the turn must stay within the 1.0s routing budget plus slack, "
+            f"took {elapsed:.3f}s"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_a_custom_endpoint_failure_tells_the_user_to_repair_the_service(tmp_path):
+    embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
+    rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=True))
+    try:
+        cfg = _config(tmp_path, embed, rerank)
+        result = _turn(cfg)
+        assert result is None
+        note = read(cfg)["note"]
+        assert "rerankBaseUrl" in note
+        assert "repair" in note.lower(), (
+            f"the custom note must point at the configured service: {note!r}"
+        )
+        assert "setup script" not in note, (
+            f"the custom note must not send the user to the script: {note!r}"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_the_bundled_setup_note_keeps_the_setup_script_line():
+    from hermes_skill_router.setup_check import setup_note
+
+    assert setup_note("embedBaseUrl", bundled=True) == (
+        "Model setup needed: embedBaseUrl is not ready; run the model setup script and reload."
+    )
+    assert setup_note("rerankBaseUrl", bundled=True) == (
+        "Model setup needed: rerankBaseUrl is not ready; run the model setup script and reload."
+    )
+
+
+def test_a_bundled_endpoint_failure_keeps_the_setup_script_line(tmp_path, monkeypatch):
+    from hermes_skill_router import setup_check
+
+    embed_responder = _embed_responder("/custom/embeddings")
+    rerank_responder = _rerank_responder("/custom/rerank", fail=True)
+
+    def embed(request: Request) -> Response:
+        if request.path == "/health":
+            return Response(body={"status": "ok", "model": "my-embed"})
+        return embed_responder(request)
+
+    def rerank(request: Request) -> Response:
+        if request.path == "/health":
+            return Response(status=404, body={"error": "not found"})
+        return rerank_responder(request)
+
+    embed = FakeEndpoint(embed)
+    rerank = FakeEndpoint(rerank)
+    try:
+        monkeypatch.setitem(setup_check.BUNDLED_BASES, "embed", embed.base_url)
+        monkeypatch.setitem(setup_check.BUNDLED_BASES, "rerank", rerank.base_url)
+        cfg = _config(tmp_path, embed, rerank)
+        result = _turn(cfg)
+        assert result is None
+        note = read(cfg)["note"]
+        assert note == (
+            "Model setup needed: rerankBaseUrl is not ready; "
+            "run the model setup script and reload."
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_changing_the_health_window_reprobes_instead_of_serving_the_old_check(
+    tmp_path, monkeypatch
+):
+    """X2: healthCheckMs is part of the setup-check cache key."""
+    from hermes_skill_router import setup_check
+
+    embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
+    rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=True))
+    calls: list[int] = []
+    real_check = setup_check.check_setup_state
+
+    def counting(config, **kwargs):
+        calls.append(1)
+        return real_check(config, **kwargs)
+
+    monkeypatch.setattr(router_module, "check_setup_state", counting)
+
+    def turn(cfg, session: str):
+        return rewrite(
+            PAYLOAD,
+            cfg=cfg,
+            index=INDEX,
+            session_id=session,
+            turn_id=f"t-{session}",
+            notify=lambda _turn_id: None,
+        )
+
+    try:
+        cfg = _config(tmp_path, embed, rerank, healthCheckMs=60000)
+        assert turn(cfg, "s-1") is None
+        assert len(calls) == 1
+        # A fresh session per turn: each turn is the first failure in its window,
+        # so each reaches the failure-note probe instead of the dumped-window path.
+        assert turn(cfg, "s-2") is None
+        assert len(calls) == 1, "a second turn inside the window must serve the cache"
+        narrower = _config(tmp_path, embed, rerank, healthCheckMs=30000)
+        assert turn(narrower, "s-3") is None
+        assert len(calls) == 2, "changing the health window must reprobe"
+    finally:
+        embed.close()
+        rerank.close()
+
+
 def test_a_custom_path_endpoint_that_is_live_passes_the_wired_check(tmp_path):
     embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
     rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=False))
