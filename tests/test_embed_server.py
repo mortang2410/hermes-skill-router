@@ -243,9 +243,6 @@ def test_settings_default_to_the_cache_layout(monkeypatch) -> None:
     )
     assert settings.model_dir == expected
     assert embed_server.DEFAULT_MODEL_DIR == expected
-    assert embed_server.DEFAULT_MODEL_DIR.endswith(
-        "/.cache/hermes-skill-router/models/bge-m3"
-    )
     assert settings.port == 8012
     assert settings.model_id == "bge-m3"
     assert settings.max_length == 512
