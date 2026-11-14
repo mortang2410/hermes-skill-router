@@ -6,6 +6,8 @@ fake tokenizer, so the suite passes with no model directory and no network.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -232,12 +234,17 @@ def test_response_echoes_the_requested_model() -> None:
     assert fallback["model"] == MODEL_ID
 
 
-def test_settings_default_to_the_host_values(monkeypatch) -> None:
+def test_settings_default_to_the_cache_layout(monkeypatch) -> None:
     for key in ("HSR_MODEL_DIR", "HSR_PORT", "HSR_MODEL_ID", "HSR_MAX_LENGTH"):
         monkeypatch.delenv(key, raising=False)
     settings = embed_server.Settings.from_env()
-    assert settings.model_dir == (
-        "/home/wilder/git-repos/skill-router-and-jev/.scratch/hf_local/BAAI/bge-m3"
+    expected = os.path.join(
+        os.path.expanduser("~"), ".cache", "hermes-skill-router", "models", "bge-m3"
+    )
+    assert settings.model_dir == expected
+    assert embed_server.DEFAULT_MODEL_DIR == expected
+    assert embed_server.DEFAULT_MODEL_DIR.endswith(
+        "/.cache/hermes-skill-router/models/bge-m3"
     )
     assert settings.port == 8012
     assert settings.model_id == "bge-m3"

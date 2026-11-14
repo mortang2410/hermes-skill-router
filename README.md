@@ -63,19 +63,14 @@ current prompt's terms. A separate recency bump counts a skill once per session 
 it with a 14-day half-life, moving it up at most five shortlist positions. A missing database
 means the channel is off with one warning and the other two channels still route.
 
-To seed it from your history, let one routed turn write the index at `cachePath`, then run:
-
-```bash
-python3 -m hermes_skill_router.associations --catalog ~/.cache/hermes-skill-router/index.json
-```
-
-That reads `~/.hermes/state.db` read-only and writes
-`~/.cache/hermes-skill-router/associations.db`. The `--catalog` file is the index at `cachePath`,
-which defaults to `~/.cache/hermes-skill-router/index.json`; pass your configured path when you
-changed it. The command exits 1 with `cannot read catalog` when that file is absent. Add
-`--max-sessions N` for a bounded scan. The command is idempotent, so re-running it adds nothing.
-The backfill is the only writer: a routed turn opens the store read-only, so rerun the command
-after a batch of work whose loads you want the channel to learn from.
+The store fills itself from your history: the first routed turn that finds it
+missing or incomplete starts a background heal that reads `~/.hermes/state.db`
+read-only and writes `~/.cache/hermes-skill-router/associations.db`, so no
+manual step is needed. The turn opens the store read-only; the heal is the only
+writer. A manual one-shot fill stays available through the module's command,
+for example `python3 -m hermes_skill_router.associations --max-sessions 200`,
+which takes the same read-only boundary and is idempotent, so re-running it
+adds nothing.
 
 ### Pre-reranking
 

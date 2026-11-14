@@ -36,8 +36,8 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from tokenizers import Tokenizer
 
-DEFAULT_MODEL_DIR = (
-    "/home/wilder/git-repos/skill-router-and-jev/.scratch/hf_local/BAAI/bge-m3"
+DEFAULT_MODEL_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "hermes-skill-router", "models", "bge-m3"
 )
 DEFAULT_PORT = 8012
 DEFAULT_MODEL_ID = "bge-m3"

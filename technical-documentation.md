@@ -124,8 +124,13 @@ change beyond this key.
 
 ### The association backfill
 
-The association store is filled from the Hermes session store by the module's own backfill, run as a
-command from the repository root:
+The association store fills from the Hermes session store with no manual step: the
+first routed turn that finds the store missing or incomplete starts one background
+heal, which runs the module's backfill uncapped over the session store and writes a
+JSON report per pass. The turn opens the store read-only; the heal is the only writer,
+and a failed or slow heal cannot loop, because a finished attempt blocks a second launch
+until a pass sees the store complete. The backfill stays callable as a command for a
+manual one-shot fill:
 
 ```sh
 python3 -m hermes_skill_router.associations --max-sessions 200
@@ -137,12 +142,11 @@ different store file, `--state-db` a different session store, and `--catalog` an
 of catalog names (or an index file carrying a `names` list). It prints a JSON report with the
 session, prompt and load counts.
 
-Run it after the catalog has been indexed and after a batch of work that loaded skills you want the
-channel to learn from; it is safe to rerun because uniqueness in the store, not a check, is what
-makes a second run insert nothing. Until it has run, the store is missing or empty and the
-association channel contributes no ranks, so the fused order is the semantic and BM25 channels only.
-That costs no correctness: the channel is a ranking signal, not a precondition, and the turn logs
-one warning naming the store path.
+While the store is missing or empty, the association channel contributes no ranks, so the
+fused order is the semantic and BM25 channels only, and the turn carries the history-incomplete
+note. That costs no correctness: the channel is a ranking signal, not a precondition, and the turn
+logs one warning naming the store path. A rerun inserts nothing, because uniqueness in the store,
+not a check, is what makes the backfill idempotent.
 
 
 ## The request rewrite and the prompt block
@@ -624,8 +628,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now hermes-skill-router-embed.service
 ```
 
-The rerank endpoint is a separate service, and this repository does not ship one. The author's host
-runs one on `127.0.0.1:8010` with the `tasksource-decider-nano` model.
+The rerank endpoint is a separate service. This repository ships one at
+`service/decider_rerank_server.py`, backed by the `tasksource-decider-nano` model;
+the setup script starts it on `127.0.0.1:8010`.
 
 ## Point it at your own models
 
@@ -854,9 +859,9 @@ passed. Later turns load the cached index.
 
 ### The rerank endpoint is missing
 
-This repository ships no reranker. Until `rerankBaseUrl` answers the protocol in
-[Endpoint protocols](#endpoint-protocols), the rerank call fails, the request keeps its catalog and
-the plugin suggests nothing.
+Start the bundled reranker from `service/decider_rerank_server.py`. Until `rerankBaseUrl`
+answers the protocol in [Endpoint protocols](#endpoint-protocols), the rerank call fails,
+the request keeps its catalog and the plugin suggests nothing.
 
 ### The pane or the widget shows idle
 

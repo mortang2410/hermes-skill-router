@@ -349,6 +349,20 @@ def test_the_documentation_documents_the_channels_modes_and_backfill() -> None:
     assert "association channel contributes no ranks" in prose, (
         "the documentation does not say what an empty store costs"
     )
+    assert "starts one background heal" in prose, (
+        "the documentation does not say the routed turn starts the backfill automatically"
+    )
+    assert "service/decider_rerank_server.py" in prose, (
+        "the documentation does not name the bundled rerank server"
+    )
+    for stale in (
+        "this repository does not ship one",
+        "This repository ships no reranker",
+        "This repository does not ship a reranker",
+    ):
+        assert stale not in prose, (
+            f"the documentation restores the removed no-bundled-reranker claim: {stale!r}"
+        )
 
 
 def test_the_documentation_documents_the_base_url_query_and_fragment_rejection() -> None:
