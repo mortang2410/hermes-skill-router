@@ -1,0 +1,9 @@
+# Pin-warn digests for the two model files the bundled servers load.
+#
+# Format: <sha256>  <hugging-face repo>  <path inside the repo>
+# The digests are the repositories' LFS sha256 values, confirmed by hashing the
+# downloaded files while this file was written. A mismatch means a corrupted or
+# replaced download, or an upstream republish: tools/setup_models.py warns loudly
+# and asks the user before continuing.
+1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4  BAAI/bge-m3  onnx/model.onnx_data
+ef09f0a1f2490512e69e56af9870fecfbfe321bccf18fb46427e511193ec1c1b  tasksource/tasksource-decider-nano  model.safetensors
