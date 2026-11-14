@@ -55,7 +55,9 @@ names, or ``inert`` with no names. While the association store is incomplete, co
 note rides on that record, so the surfaces can say history is incomplete and healing is running, or
 report the one pending heal failure the C6 job handed the turn. When a per-request call fails,
 contract C7's one line rides on the inert record instead, so the surfaces can say the endpoints
-were unreachable and no suggestions were made; that line outranks both history lines, so a failed
+were unreachable and no suggestions were made; with the live clients the setup-needed line
+(:func:`hermes_skill_router.setup_check.setup_note`) refines that line to name the failing
+``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks both history lines, so a failed
 turn never consumes them. Either note never enters the payload, so it costs no token, and a
 complete store adds nothing. The record is written after the payload is built and never enters
 it, so the display costs no token. A written record is announced on the
@@ -79,6 +81,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from time import monotonic
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from . import associations
@@ -101,6 +104,7 @@ from .search import (
     remember_partition,
 )
 from .select import Suggestion, select
+from .setup_check import check_setup_state, setup_note
 from .tools import skill_path
 
 logger = logging.getLogger(__name__)
@@ -112,6 +116,7 @@ CHAT_COMPLETIONS = "chat_completions"
 HISTORY_NOTE = "History is incomplete and healing is running in the background."
 
 #: Contract C7's one line when a per-request call fails; it rides on the inert record only.
+#: With the live clients the setup-needed line refining this naming is setup_check.setup_note.
 ENDPOINT_NOTE = "Routing endpoints are unreachable; no suggestions were made this turn."
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
@@ -274,7 +279,10 @@ def _compose(
             logger.debug("skill router: index build raised", exc_info=True)
             index = None
         if index is None:
-            return _fail("index build failed", ENDPOINT_NOTE)
+            return _fail(
+                "index build failed",
+                _failure_note(cfg, uses_live=embed is default_embed),
+            )
     if not index.names:
         return _fail("the skill index carries no row")
     if dropped_before or dumped_before:
@@ -288,7 +296,13 @@ def _compose(
     if ranked.reason:
         # A failed per-request call is a dead endpoint, and its line outranks the history
         # line; a budget expiry keeps no line and never consumes the pending heal note.
-        note = ENDPOINT_NOTE if ranked.reason in (EMBED_FAILED, RERANK_FAILED) else ""
+        if ranked.reason in (EMBED_FAILED, RERANK_FAILED):
+            note = _failure_note(
+                cfg,
+                uses_live=embed is default_embed and rerank is default_rerank,
+            )
+        else:
+            note = ""
         return _fail(ranked.detail, note)
     # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
     # heal when it was incomplete. Contract C5's note is read once here, so every record this turn
@@ -534,6 +548,61 @@ def _history_note(cfg: Config) -> str:
     if path is None or _store_is_complete(path):
         return ""
     return associations.heal_failure_note(path) or HISTORY_NOTE
+
+
+#: The last setup check per endpoint config, so a dead-endpoint turn does not pay two more
+#: endpoint timeouts on every request inside the health window.
+_SETUP_CACHE: Dict[tuple, tuple[float, bool, str]] = {}
+
+
+def _setup_note(cfg: Config) -> str:
+    """Return contract C2's setup-needed line for *cfg*, or ``""`` when both endpoints are ready.
+
+    The check runs only on a dead-endpoint turn with the live clients. A test that injects its
+    own transport proves ranking without touching a socket, so it never probes and keeps the
+    generic dead-endpoint line. The result is throttled by ``healthCheckMs`` per endpoint
+    config, mirroring the clients' health gates.
+    """
+    key = (
+        cfg.embed_base_url,
+        cfg.embed_path,
+        cfg.embed_model_id,
+        cfg.rerank_base_url,
+        cfg.rerank_path,
+        cfg.rerank_model,
+        cfg.embed_timeout_ms,
+        cfg.rerank_timeout_ms,
+    )
+    window_s = cfg.health_check_ms / 1000.0
+    now = monotonic()
+    cached = _SETUP_CACHE.get(key)
+    if cached is not None and window_s > 0 and (now - cached[0]) < window_s:
+        ready, failing = cached[1], cached[2]
+    else:
+        try:
+            ready, failing = check_setup_state(cfg)
+        except Exception:  # the check never raises, but the note must not depend on it
+            logger.debug("skill router: the setup check raised", exc_info=True)
+            return ""
+        _SETUP_CACHE[key] = (now, ready, failing)
+    if ready or not failing:
+        return ""
+    return setup_note(failing)
+
+
+def _failure_note(cfg: Config, *, uses_live: bool) -> str:
+    """Return the one line for a dead-endpoint turn, naming the failing setting when probed.
+
+    With the live clients the setup-needed line names ``embedBaseUrl`` or
+    ``rerankBaseUrl``; without them the generic dead-endpoint line is all a fake-transport
+    failure can name. A ready check falls back to the generic line, so a budget or malformed
+    body never claims setup is needed.
+    """
+    if uses_live:
+        probed = _setup_note(cfg)
+        if probed:
+            return probed
+    return ENDPOINT_NOTE
 
 
 def _store_is_complete(path: str) -> bool:

@@ -285,7 +285,8 @@ Fields:
   recorded, so the display cannot present a pinned or deferred-excluded skill as a suggestion.
 - `note` is one line the plugin itself wrote for the turn, or an empty string when it has nothing to
   say: history is incomplete and healing is running, a background heal failed once, or the routing
-  endpoints were unreachable and no suggestions were made. When several of those are true at once
+  endpoints were unreachable and no suggestions were made. With the live clients the unreachable
+  line is the setup-needed line naming `embedBaseUrl` or `rerankBaseUrl`. When several of those are true at once
   the unreachable-endpoints line wins, then the heal-failure line, then the incomplete-history line.
   Both surfaces render the note under their state line when it is present and keep their own fixed
   line in its absence, and a record written before `note` existed reads with an empty note.
@@ -592,7 +593,8 @@ on the first failure in a compaction window, a later failure strips it and leave
 marker, and the once-per-window suggestion rule still applies. The endpoint is then not probed
 again for `healthCheckMs`, so a stopped service costs no per-request timeout on the next request.
 Each failure writes one warning to the host log naming the failed stage, once per process, and puts
-one line on the display record naming the unreachable endpoints. The surfaces render that line in
+one line on the display record naming the unreachable endpoints. With the live clients that line is
+the setup-needed line naming `embedBaseUrl` or `rerankBaseUrl`. The surfaces render that line in
 place of their fixed idle line, and it outranks both history lines, so a dead-endpoint turn never
 consumes a pending heal failure. These four defaults stay at their current values.
 

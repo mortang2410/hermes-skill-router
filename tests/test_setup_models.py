@@ -10,7 +10,9 @@ temporary HOME and config root, so no test writes a real unit, log or model.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -478,7 +480,7 @@ def test_linux_installs_and_starts_the_two_units(clean_home, monkeypatch, capsys
 
     unit_dir = xdg / "systemd" / "user"
     embed = (unit_dir / "hermes-skill-router-embed.service").read_text(encoding="utf-8")
-    assert f"Environment=HSR_MODEL_DIR={home / '.cache/hermes-skill-router/models/bge-m3'}" in embed
+    assert f'Environment="HSR_MODEL_DIR={home / ".cache/hermes-skill-router/models/bge-m3"}"' in embed
     assert f"WorkingDirectory={ROOT}" in embed
     assert f"ExecStart={sys.executable} -m service.embed_server" in embed
     for author_path in (
@@ -488,11 +490,40 @@ def test_linux_installs_and_starts_the_two_units(clean_home, monkeypatch, capsys
         assert author_path not in embed, "the bundled unit's author paths must be replaced"
     assert str(home / ".cache/hermes-skill-router/models/bge-m3") in embed
     decider = (unit_dir / "hermes-skill-router-decider.service").read_text(encoding="utf-8")
-    assert f"Environment=DECIDER_DIR={home / '.cache/hermes-skill-router/models/tasksource-decider-nano'}" in decider
+    assert f'Environment="DECIDER_DIR={home / ".cache/hermes-skill-router/models/tasksource-decider-nano"}"' in decider
     assert f"ExecStart={sys.executable} -m service.decider_rerank_server" in decider
     assert ["systemctl", "--user", "daemon-reload"] in commands
     assert ["systemctl", "--user", "enable", "--now", "hermes-skill-router-embed.service"] in commands
     assert ["systemctl", "--user", "enable", "--now", "hermes-skill-router-decider.service"] in commands
+
+
+def test_a_spaced_model_directory_verifies_with_no_invalid_assignment(tmp_path):
+    """A directory with a space must still give both units a full quoted path."""
+    spaced = tmp_path / "my models dir"
+    embed = setup._embed_unit_text(spaced)
+    decider = setup._decider_unit_text(spaced)
+    full_embed = str(spaced / "bge-m3")
+    full_decider = str(spaced / "tasksource-decider-nano")
+    assert f'Environment="HSR_MODEL_DIR={full_embed}"' in embed
+    assert f'Environment="DECIDER_DIR={full_decider}"' in decider
+    if shutil.which("systemd-analyze") is None:
+        pytest.skip("systemd-analyze is not on PATH")
+    for name, text in (
+        ("hermes-skill-router-embed.service", embed),
+        ("hermes-skill-router-decider.service", decider),
+    ):
+        unit = tmp_path / name
+        unit.write_text(text, encoding="utf-8")
+        result = subprocess.run(
+            ["systemd-analyze", "verify", str(unit)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        ours = [line for line in result.stderr.splitlines() if name in line]
+        assert not any("Invalid environment assignment" in line for line in ours), (
+            f"{name}: {ours}"
+        )
 
 
 def test_installing_the_unit_replaces_a_symlink_without_editing_its_target(clean_home, monkeypatch, tmp_path):
@@ -509,7 +540,7 @@ def test_installing_the_unit_replaces_a_symlink_without_editing_its_target(clean
         "the install must not write through a symlink into the repository"
     )
     assert not link.is_symlink()
-    assert "Environment=HSR_MODEL_DIR=" in link.read_text(encoding="utf-8")
+    assert 'Environment="HSR_MODEL_DIR=' in link.read_text(encoding="utf-8")
 
 
 def test_macos_starts_both_scripts_with_the_interpreter(clean_home, monkeypatch, capsys):

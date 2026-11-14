@@ -20,12 +20,9 @@ bundled server script with ``python3`` instead. Nothing in the plugin imports th
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -36,20 +33,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hermes_skill_router.config import DEFAULTS, Config  # noqa: E402
+from hermes_skill_router.setup_check import BUNDLED_BASES  # noqa: E402
+from hermes_skill_router.setup_check import check_setup_state as _shared_check_setup_state  # noqa: E402
 
 #: The two pinned files are keyed in this file; the checkout test pins its shape separately.
 PINS_PATH = REPO_ROOT / "service" / "model-digests.txt"
 
 #: The checked-in unit the Linux install is built from.
 EMBED_UNIT_PATH = REPO_ROOT / "service" / "hermes-skill-router-embed.service"
-
-#: The base URLs whose servers this repository bundles. A config pointing at one of these is
-#: checked with its health route and its model id; anything else is a custom endpoint and only
-#: owes a correct live answer.
-BUNDLED_BASES = {
-    "embed": DEFAULTS["embedBaseUrl"],
-    "rerank": DEFAULTS["rerankBaseUrl"],
-}
 
 #: How many CPU threads both bundled servers use, matching their own defaults.
 THREADS = "8"
@@ -119,105 +110,18 @@ class PinMismatch:
 
 
 # ---------------------------------------------------------------------------------------------
-# C2: is the installed configuration ready?
-
-
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow a redirect, so a probe never posts to a host it was not asked about."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - see class
-        return None
-
-
-#: One opener for every probe; the bundled clients use the same redirect policy.
-_OPENER = urllib.request.build_opener(_RefuseRedirect())
-
-
-def _json_request(url: str, *, body: Optional[Mapping[str, Any]], timeout: float) -> tuple[bool, Any]:
-    """Answer ``(True, decoded_json)`` for a parseable 2xx response, ``(False, None)`` otherwise.
-
-    Never raises: a closed port, a timeout, any non-2xx status (including a refused redirect),
-    and a body that is not JSON are all unready values.
-    """
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    method = "GET" if body is None else "POST"
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method=method,
-    )
-    try:
-        with _OPENER.open(request, timeout=timeout) as response:
-            raw = response.read()
-    except Exception:  # noqa: BLE001 - a probe failure is a readiness value, not an exception
-        return False, None
-    try:
-        return True, json.loads(raw)
-    except ValueError:
-        return False, None
-
-
-def _endpoint_ready(
-    base: str,
-    model: str,
-    path: str,
-    payload: Mapping[str, Any],
-    timeout: float,
-    bundled_base: str,
-) -> bool:
-    """Whether *base* is ready: a live answer, and for a bundled base its health rule first."""
-    root = base.rstrip("/")
-    if root == bundled_base.rstrip("/"):
-        healthy, health = _json_request(root + "/health", body=None, timeout=timeout)
-        if not healthy or not isinstance(health, dict):
-            return False
-        if health.get("status") != "ok" or health.get("model") != model:
-            return False
-    answered, _body = _json_request(root + path, body=payload, timeout=timeout)
-    return answered
+# C1: ask first, download, verify the pins, install and start
+# C2 lives in hermes_skill_router.setup_check, shared with the rewrite's setup-needed line.
 
 
 def check_setup_state(config: Config) -> tuple[bool, str]:
-    """Return ``(True, "")`` when both configured endpoints answer, else the failing setting name.
+    """Return whether both configured endpoints are ready, per contract C2.
 
-    A custom endpoint needs only a correct answer to the plugin's real embeddings or rerank
-    request: any parseable 2xx body passes, with no health route and no bundled model id. A
-    bundled endpoint (its base URL is one of the plugin defaults) must first answer
-    ``GET <base>/health`` with ``status == "ok"`` and the configured model, then answer the
-    same tiny live request. Never raises; unready is a value. The failing name is the settings
-    key (``embedBaseUrl`` or ``rerankBaseUrl``) the setup-needed line should name.
+    The readiness logic lives in :mod:`hermes_skill_router.setup_check` so the
+    rewrite can name its result through the display record; this thin wrapper
+    keeps the setup script's own surface stable.
     """
-    embed_base = config.embed_base_url
-    if not _endpoint_ready(
-        embed_base,
-        config.embed_model_id,
-        "/v1/embeddings",
-        {"model": config.embed_model_id, "input": ["setup check"]},
-        config.embed_timeout_ms / 1000.0,
-        BUNDLED_BASES["embed"],
-    ):
-        return False, "embedBaseUrl"
-    rerank_base = config.rerank_base_url
-    if not _endpoint_ready(
-        rerank_base,
-        config.rerank_model,
-        "/v1/rerank",
-        {
-            "model": config.rerank_model,
-            "query": "setup check",
-            "documents": ["setup check"],
-            "top_n": 1,
-        },
-        config.rerank_timeout_ms / 1000.0,
-        BUNDLED_BASES["rerank"],
-    ):
-        return False, "rerankBaseUrl"
-    return True, ""
-
-
-# ---------------------------------------------------------------------------------------------
-# C1: ask first, download, verify the pins, install and start
+    return _shared_check_setup_state(config)
 
 
 def _ask(prompt: str) -> str:
@@ -418,6 +322,18 @@ def _server_environment(model: ModelSpec, directory: Path) -> dict[str, str]:
     return environment
 
 
+def _quoted_env(name: str, value: str) -> str:
+    """One systemd ``Environment=`` line carrying *value* whole even when it has spaces.
+
+    Systemd splits an unquoted ``Environment=`` value on spaces, so a user-chosen
+    model path with a space would truncate and warn. Quoting with double quotes
+    keeps the full path; a backslash, a double quote and a dollar sign are
+    escaped so systemd passes them through literally.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$")
+    return f'Environment="{name}={escaped}"'
+
+
 def _replace_prefix(lines: Sequence[str], prefix: str, replacement: str) -> tuple[list[str], bool]:
     """Replace every line starting with *prefix*; report whether any line was found."""
     found = False
@@ -446,7 +362,7 @@ def _embed_unit_text(directory: Path) -> str:
     lines, has_model_dir = _replace_prefix(
         lines,
         "Environment=HSR_MODEL_DIR=",
-        f"Environment=HSR_MODEL_DIR={directory / 'bge-m3'}",
+        _quoted_env("HSR_MODEL_DIR", str(directory / "bge-m3")),
     )
     if not (has_workdir and has_exec and has_docs and has_model_dir):
         raise SetupError(
@@ -467,7 +383,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory={REPO_ROOT}
-Environment=DECIDER_DIR={directory / 'tasksource-decider-nano'}
+{_quoted_env("DECIDER_DIR", str(directory / "tasksource-decider-nano"))}
 Environment=DECIDER_THREADS={THREADS}
 Environment=CUDA_VISIBLE_DEVICES=
 Environment=HF_HUB_OFFLINE=1
