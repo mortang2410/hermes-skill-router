@@ -217,11 +217,11 @@ def test_the_readme_states_how_to_write_a_description_the_router_can_pick() -> N
         "the README does not name the two fields the router scores"
     )
     assert (
-        "The embedding and the term index read the name plus the description clipped at "
-        "`maxDescriptionChars` (default 400)" in readme
-    ), "the README does not state which text the embedding and the term index read"
-    assert "the reranker reads the name plus the full description" in readme, (
-        "the README does not state that the reranker reads the full description"
+        "plugin picks from the skill name plus the first 400 characters of the "
+        "description" in readme
+    ), "the README does not state that the plugin picks from the name and the first 400 characters"
+    assert "configurable with `maxDescriptionChars`" in readme, (
+        "the README does not state that the description cap is configurable"
     )
     assert "put the distinctive words first" in readme, (
         "the README does not state that the distinctive words belong first in a description"

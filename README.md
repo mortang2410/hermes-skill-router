@@ -20,10 +20,9 @@ This plugin does not replace periodic upkeep of your skill library, such as fold
 into references for a top-level skill. That upkeep is worth doing in plain Hermes too: clearer skills
 help the model find the right one without any router. With this plugin it pays more, because the
 router scores the name and the description when it picks a suggestion. Write the description in the
-words you would use to ask for the task, and put the distinctive words first. The embedding and the
-term index read the name plus the description clipped at `maxDescriptionChars` (default 400); the
-reranker reads the name plus the full description, so text past the cap still counts in the final
-ranking. The name is scored in both stages, so a vague name costs recall whatever the description says.
+words you would use to ask for the task, and put the distinctive words first. The plugin picks from
+the skill name plus the first 400 characters of the description, configurable with
+`maxDescriptionChars`, so use that cap when you maintain the library.
 
 Every setting, both endpoint protocols, the display record and the measurements are in
 [technical-documentation.md](technical-documentation.md).
