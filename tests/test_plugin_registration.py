@@ -345,12 +345,15 @@ def _host_paths(monkeypatch):
             monkeypatch.setattr(module, "skill_path", resolver)
 
 
-def test_register_records_one_middleware_one_search_tool_and_one_hook(plugin_module):
+def test_register_records_one_middleware_one_search_tool_and_two_hooks(plugin_module):
     ctx = RecordingContext()
     plugin_module.register(ctx)
 
     assert ctx.tools == ["skill_router_search"]
-    assert ctx.hooks == [("post_compaction", plugin_module.on_post_compaction)]
+    assert ctx.hooks == [
+        ("post_compaction", plugin_module.on_post_compaction),
+        ("on_session_end", plugin_module.on_session_end),
+    ]
     assert ctx.commands == []
     assert len(ctx.middleware) == 1
     kind, callback = ctx.middleware[0]
@@ -382,7 +385,7 @@ def test_plugin_yaml_parses_strictly_and_declares_the_capabilities():
     assert manifest["requires_hermes"] == ">=0.22.3"
     assert manifest["description"].strip()
     assert manifest["provides_tools"] == ["skill_router_search"]
-    assert manifest["provides_hooks"] == ["post_compaction"]
+    assert manifest["provides_hooks"] == ["post_compaction", "on_session_end"]
     # The catalog capability must be declared or `hermes plugins validate` rejects the plugin.
     # This build's manifest parser logs one unknown-field warning per load; that is expected.
     assert manifest["provides_middleware"] == ["llm_request"]

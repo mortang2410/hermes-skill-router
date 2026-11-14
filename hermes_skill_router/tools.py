@@ -102,8 +102,9 @@ def handle(
     """Answer one search call as JSON. Never raises: every failure becomes the degraded envelope.
 
     *args* carries the required ``query``; *settings* are the raw plugin settings, loaded here so the
-    tool and the middleware read one place. The dispatcher passes ``session_id`` and any other
-    accepted keyword, and the session id is what selects the parsed catalog record to rank.
+    tool and the middleware read one place. The dispatcher passes ``session_id`` and ``task_id``
+    beside it, and that identity is what selects the parsed catalog record to rank: a named session
+    by its id, an anonymous caller by its task id.
     """
     try:
         query = args.get("query") if isinstance(args, Mapping) else None
@@ -114,7 +115,9 @@ def handle(
         cfg = load(settings)
         if not cfg.enabled:
             return _degraded("disabled", "the hermes-skill-router switch is off")
-        rows = catalog_rows(cfg, str(session_id or ""))
+        rows = catalog_rows(
+            cfg, str(session_id or ""), task_id=str(kwargs.get("task_id") or "")
+        )
         if rows is None:
             return _degraded(
                 "no-catalog", "no skill catalog has been parsed for this session yet"

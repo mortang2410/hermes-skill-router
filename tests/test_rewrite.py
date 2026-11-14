@@ -859,10 +859,37 @@ def test_an_unbuildable_index_keeps_the_request_and_records_inert(tmp_path, capl
 
     assert result is None
     assert record_for(cfg)["status"] == "inert"
-    assert record_for(cfg)["note"] == router_module.ENDPOINT_NOTE, (
-        "an embeddings endpoint that fails the index build is a dead endpoint"
+    assert record_for(cfg)["note"] == "", (
+        "an index-build failure is a local fault, not a dead endpoint, so it carries no endpoint note"
     )
     assert any("index build failed" in message for message in caplog.messages)
+
+
+def test_a_local_index_build_failure_carries_no_endpoint_note_and_fires_no_setup_probe(
+    tmp_path, monkeypatch
+):
+    """Q7: an index-build failure is a local fault, so it names no endpoint and probes none.
+
+    Uses the live-client shape (no injected embedder, so ``uses_live`` is true) and a setup
+    check that would name a setting if it ran: the record must carry no endpoint line and the
+    check must never run.
+    """
+    cfg = make_config(tmp_path)
+    probed = []
+
+    def fake_check(config, deadline=None):
+        probed.append(config)
+        return (False, "embedBaseUrl")
+
+    monkeypatch.setattr(router_module, "check_setup_state", fake_check)
+    monkeypatch.setattr(router_module, "default_embed", FakeEmbedder(result=None))
+
+    result = rewrite(_payload(), cfg=cfg, rerank=FakeReranker())
+
+    assert result is None
+    assert record_for(cfg)["status"] == "inert"
+    assert record_for(cfg)["note"] == "", "a local index fault must not claim the endpoints are down"
+    assert probed == [], "a local index fault must not fire a setup probe"
 
 
 def test_no_user_message_returns_none_and_records_inert(tmp_path, caplog):
@@ -1849,7 +1876,7 @@ def test_the_registered_hook_opens_the_window_the_rewrite_reads(tmp_path, plugin
 
     assert ctx.tools == ["skill_router_search"]
     assert len(ctx.middleware) == 1
-    assert [name for name, _callback in ctx.hooks] == ["post_compaction"]
+    assert [name for name, _callback in ctx.hooks] == ["post_compaction", "on_session_end"]
     callback = ctx.hooks[0][1]
 
     cfg = make_config(tmp_path)

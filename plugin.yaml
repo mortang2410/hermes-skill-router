@@ -7,7 +7,7 @@ description: >-
   injects a short reranked shortlist of skill names and descriptions instead.
 requires_hermes: ">=0.22.3"
 provides_tools: [skill_router_search]
-provides_hooks: [post_compaction]
+provides_hooks: [post_compaction, on_session_end]
 # Catalog capability, required by `hermes plugins validate` for the middleware register() adds.
 # This build's manifest parser does not know the key and logs one unknown-field warning per load.
 provides_middleware: ["llm_request"]

@@ -79,6 +79,11 @@ class HealthGate:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._failed_at: dict[str, float] = {}
+        # Monotonic per-endpoint count of failed embed attempts, including gate
+        # refusals. It never decreases, so a caller can snapshot it before a
+        # build and tell whether *that* build's embed attempt failed, rather
+        # than reading the process-wide historical state in :meth:`failed`.
+        self._failure_seq: dict[str, int] = {}
 
     def ready(self, endpoint: str, window_ms: int) -> bool:
         """Return whether *endpoint* may be called now."""
@@ -88,10 +93,43 @@ class HealthGate:
             return True
         return (monotonic() - failed_at) * 1000.0 >= window_ms
 
+    def failed(self, endpoint: str) -> bool:
+        """Return whether *endpoint* is in a failed state: it failed and none succeeded since.
+
+        Unlike :meth:`ready`, this peek has no window: it answers "the endpoint's last attempt
+        failed". It is a process-wide historical bit, so it cannot attribute a
+        failure to one build: a later local fault would inherit an earlier
+        unrelated failure. Callers that need per-build attribution snapshot
+        :meth:`failure_seq` before the build instead.
+        """
+        with self._lock:
+            return endpoint in self._failed_at
+
+    def failure_seq(self, endpoint: str) -> int:
+        """Return how many failed attempts *endpoint* has recorded so far.
+
+        The count only ever rises (a success or a reset does not lower it), so
+        comparing a snapshot taken before a build with the value after it
+        tells whether that build's own embed attempt failed.
+        """
+        with self._lock:
+            return self._failure_seq.get(endpoint, 0)
+
     def failure(self, endpoint: str) -> None:
         """Record that *endpoint* just failed, starting its window."""
         with self._lock:
             self._failed_at[endpoint] = monotonic()
+            self._failure_seq[endpoint] = self._failure_seq.get(endpoint, 0) + 1
+
+    def refused(self, endpoint: str) -> None:
+        """Record that a call was refused inside the health window.
+
+        A refusal returns ``None`` exactly like a fresh failure, so it bumps
+        the failure count for per-build attribution, but it does not move the
+        window: the window still runs from the failure that closed the gate.
+        """
+        with self._lock:
+            self._failure_seq[endpoint] = self._failure_seq.get(endpoint, 0) + 1
 
     def success(self, endpoint: str) -> None:
         """Forget a recorded failure, so the next call goes straight through."""
@@ -118,6 +156,7 @@ def embed_texts(cfg: Config, texts: Sequence[str]) -> Optional[List[List[float]]
         return []
     endpoint = cfg.embed_base_url + cfg.embed_path
     if not HEALTH.ready(endpoint, cfg.health_check_ms):
+        HEALTH.refused(endpoint)
         logger.debug("embeddings endpoint %s is inside its health window; not calling it", endpoint)
         return None
     body = json.dumps({"model": cfg.embed_model_id, "input": list(texts)}).encode("utf-8")

@@ -7,6 +7,7 @@ endpoint, and they compare it with the names a real turn injects for the same pa
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import time
 from pathlib import Path
@@ -44,6 +45,24 @@ def _host_paths(monkeypatch):
     """A host lookup that resolves every name, and no dump record, so tests never leak into each other."""
     search_module.clear_dumps()
     monkeypatch.setattr(router_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
+
+
+def _load_plugin_module():
+    """Load the repository's plugin entry point as a bare module, as a test collector does."""
+    name = "hermes_skill_router_plugin_under_test"
+    spec = importlib.util.spec_from_file_location(name, ROOT / "__init__.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = ""
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def plugin_module():
+    """A freshly loaded plugin entry point, so each test registers into its own fake context."""
+    return _load_plugin_module()
 QUERY_VECTOR = [0.0, 1.0, 0.0]
 
 ROWS = (("alpha", "Alpha skill"), ("beta", "Beta skill"), ("gamma", "Gamma skill"))
@@ -152,6 +171,192 @@ def test_the_record_is_the_routed_half_in_catalog_order(tmp_path):
         forget_session("session-1")
 
     assert [(row.name, row.description) for row in rows] == list(ROWS)
+
+
+def test_a_single_anonymous_caller_stays_searchable(tmp_path):
+    """M4 R4 (filed fallback, within one turn): one caller that omits session_id keeps its
+    partition and window for that turn's key.
+
+    Named paths keep R4 across turns: the turn-end hook drops only the partition, never the
+    dump mark, so a named session's compaction window survives. Anonymous multi-turn is
+    deliberately per-turn instead: each turn presents its own task key, so the next turn
+    starts with no searchable catalog and a fresh dump window (dump-per-turn replaces
+    dump-per-window), and the turn-end hook expires the task key's dump mark so no
+    stale mark accumulates. Within one key the ""
+    bucket still answers that caller's own rows and its dump strips its own later failure,
+    so the within-turn path is restored, not dropped.
+    """
+    cfg = make_config(tmp_path)
+    forget_session("")
+    remember_partition("", partition())
+    try:
+        assert [row.name for row in catalog_rows(cfg, "")] == [name for name, _d in ROWS]
+        search_module.remember_dump("")
+        assert search_module.dumped(""), "the single anonymous caller dumps its own window"
+    finally:
+        forget_session("")
+        search_module.expire_dump("")
+
+
+def test_on_session_end_drops_the_partition_but_keeps_the_named_dump_mark(
+    tmp_path, plugin_module
+):
+    """M4 cleanup: the turn-end hook drops the turn's partition, never a named dump window.
+
+    A named session and an anonymous task key each lose their searchable partition when
+    their turn ends, so a later search answers ``no-catalog`` until a catalog parses
+    again. The named session keeps its dump mark, so its compaction window survives
+    the turn boundary; the anonymous task key's mark is expired with its turn.
+    """
+    cfg = make_config(tmp_path)
+    remember_partition("session-1", partition())
+    remember_partition("", partition(), task_id="task-a")
+    search_module.remember_dump("session-1")
+    search_module.remember_dump("", task_id="task-a")
+    try:
+        assert (
+            plugin_module.on_session_end(
+                session_id="session-1",
+                task_id="",
+                turn_id="turn-1",
+                completed=True,
+                failed=False,
+                interrupted=False,
+                turn_exit_reason="completed",
+                model="m",
+                platform="cli",
+            )
+            is None
+        )
+        assert plugin_module.on_session_end(session_id="", task_id="task-a") is None
+
+        assert catalog_rows(cfg, "session-1") is None, "the named partition is dropped at turn end"
+        assert catalog_rows(cfg, "", task_id="task-a") is None, "the anonymous partition is dropped"
+        assert search_module.dumped("session-1"), "a named dump window survives the turn boundary"
+        assert not search_module.dumped("", task_id="task-a"), (
+            "an anonymous task dump mark is expired at turn end, not kept"
+        )
+    finally:
+        forget_session("session-1")
+        forget_session("", task_id="task-a")
+        search_module.expire_dump("session-1")
+        search_module.expire_dump("", task_id="task-a")
+
+
+def test_on_session_end_expires_the_anonymous_dump_but_keeps_the_named_one(
+    tmp_path, plugin_module
+):
+    """M4 dump retention: an anonymous task key's dump mark ends with its turn.
+
+    A named session's dump mark survives turn end until compaction, because its
+    window spans turns. An anonymous caller is per-turn by design and each
+    turn presents a fresh task key that no later event can address, so its
+    mark is expired at session end instead of accumulating one stale key per
+    anonymous turn.
+    """
+    search_module.remember_dump("session-1")
+    search_module.remember_dump("", task_id="task-anon")
+    try:
+        assert plugin_module.on_session_end(session_id="session-1", task_id="") is None
+        assert plugin_module.on_session_end(session_id="", task_id="task-anon") is None
+
+        assert search_module.dumped("session-1"), "a named dump window survives turn end"
+        assert not search_module.dumped("", task_id="task-anon"), (
+            "an anonymous task dump mark must be gone after session end"
+        )
+        assert "task-anon" not in search_module._DUMPED
+    finally:
+        search_module.expire_dump("session-1")
+        search_module.expire_dump("", task_id="task-anon")
+
+
+def test_on_session_end_for_one_task_key_leaves_the_other_untouched(tmp_path, plugin_module):
+    """M4 cleanup, isolation: ending task A's turn drops only task A's partition.
+
+    Task B keeps its partition and its dump mark, and a non-string id is nothing to do:
+    the callback never raises and returns ``None``.
+    """
+    cfg = make_config(tmp_path)
+    remember_partition("", partition(), task_id="task-a")
+    remember_partition("", partition(routed=(("gamma", "Gamma skill"),)), task_id="task-b")
+    search_module.remember_dump("", task_id="task-b")
+    try:
+        assert plugin_module.on_session_end(session_id="", task_id="task-a") is None
+        assert plugin_module.on_session_end(session_id=None, task_id=7) is None
+        assert plugin_module.on_session_end() is None
+
+        assert catalog_rows(cfg, "", task_id="task-a") is None
+        assert [row.name for row in catalog_rows(cfg, "", task_id="task-b")] == ["gamma"]
+        assert search_module.dumped("", task_id="task-b")
+    finally:
+        forget_session("", task_id="task-b")
+        search_module.expire_dump("", task_id="task-b")
+
+
+def test_two_anonymous_callers_with_distinct_task_ids_share_neither_state(tmp_path):
+    """M4 R1/R3: two anonymous callers keyed by distinct task_id must not collide.
+
+    Production passes task_id alongside session_id in both the tool dispatch and the middleware
+    dispatch, so an anonymous caller is keyed by its task_id: B's partition must not answer for
+    A (R1) and A's dump must not strip B's first failure (R3). A named session still keys by
+    its session id alone, so the fallback does not degrade it.
+    """
+    cfg = make_config(tmp_path)
+    forget_session("")
+    remember_partition("", partition(), task_id="task-a")
+    remember_partition("", partition(routed=(("gamma", "Gamma skill"),)), task_id="task-b")
+    try:
+        assert [row.name for row in catalog_rows(cfg, "", task_id="task-a")] == [
+            name for name, _d in ROWS
+        ], "A's search must rank A's rows, never B's partition"
+        assert [row.name for row in catalog_rows(cfg, "", task_id="task-b")] == ["gamma"]
+
+        search_module.remember_dump("", task_id="task-a")
+        assert search_module.dumped("", task_id="task-a")
+        assert not search_module.dumped("", task_id="task-b"), (
+            "A's dump must not strip B's first failure"
+        )
+
+        remember_partition("session-1", partition())
+        try:
+            assert [row.name for row in catalog_rows(cfg, "session-1", task_id="task-b")] == [
+                name for name, _d in ROWS
+            ], "a named session keys by its session id, not by task_id"
+        finally:
+            forget_session("session-1")
+    finally:
+        forget_session("", task_id="task-a")
+        forget_session("", task_id="task-b")
+        search_module.expire_dump("", task_id="task-a")
+
+
+def test_the_tool_keys_an_anonymous_search_by_task_id(tmp_path, monkeypatch):
+    """M4 end-to-end: the dispatcher hands task_id beside session_id, so the tool reads it.
+
+    Two anonymous callers searched through ``handle`` with distinct task ids must each rank
+    their own partition, exactly as the middleware keyed them.
+    """
+    import json
+
+    monkeypatch.setattr(tools_module, "EMBED", FakeEmbedder())
+    monkeypatch.setattr(tools_module, "RERANK", FakeReranker())
+    monkeypatch.setattr(tools_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
+    settings = {"cachePath": "", "suggestionsPath": str(tmp_path / "anon.json")}
+    remember_partition("", partition(), task_id="task-a")
+    remember_partition("", partition(routed=(("gamma", "Gamma skill"),)), task_id="task-b")
+    try:
+        answer_a = json.loads(
+            tools_module.handle({"query": QUERY}, settings=settings, task_id="task-a")
+        )
+        answer_b = json.loads(
+            tools_module.handle({"query": QUERY}, settings=settings, task_id="task-b")
+        )
+    finally:
+        forget_session("", task_id="task-a")
+        forget_session("", task_id="task-b")
+
+    assert sorted(row["name"] for row in answer_a["skills"]) == ["alpha", "beta", "gamma"]
+    assert [row["name"] for row in answer_b["skills"]] == ["gamma"]
 
 
 def test_an_empty_parsed_partition_reads_as_an_empty_sequence(tmp_path):

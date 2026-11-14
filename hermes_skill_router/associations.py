@@ -1991,15 +1991,15 @@ def request_heal(
         if _HEAL_RUNNING in _HEAL_STATE.values():
             return False
         _HEAL_STATE[store_path] = _HEAL_RUNNING
-    thread = threading.Thread(
-        target=_run_heal,
-        args=(entry, store_path, state_db_path, tuple(catalog), now_ms),
-        name="hermes-skill-router-heal",
-        daemon=True,
-    )
     try:
+        thread = threading.Thread(
+            target=_run_heal,
+            args=(entry, store_path, state_db_path, tuple(catalog), now_ms),
+            name="hermes-skill-router-heal",
+            daemon=True,
+        )
         thread.start()
-    except RuntimeError as exc:  # no thread can be started; never carry the failure into a turn
+    except Exception as exc:  # no thread can be started; never carry the failure into a turn
         logger.warning(
             "skill associations: cannot start the background heal of %s: %s", store_path, exc
         )

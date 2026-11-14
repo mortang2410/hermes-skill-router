@@ -621,3 +621,87 @@ def test_a_fake_transport_failure_stays_generic_and_touches_no_socket(tmp_path, 
     assert result is None
     assert read(cfg)["note"] == router_module.ENDPOINT_NOTE
     assert real_check is not None
+
+
+def test_a_cold_build_embed_http_failure_carries_the_endpoint_note(tmp_path):
+    """Q7 split, endpoint arm: a dead embed endpoint during the cold build names its setting.
+
+    The positive controls elsewhere pass a prebuilt index, so their embed failure is the
+    query embed. This turn passes no index: the cold ``load_or_build`` embeds the routed
+    rows, the endpoint answers 500, ``embed_texts`` marks its health gate, and the
+    rewrite must take the endpoint-note path (the setup probe names ``embedBaseUrl``)
+    instead of the bare local-fault failure. The rerank endpoint is healthy throughout,
+    so the only failing setting is the embed one.
+    """
+    embed = FakeEndpoint(_embed_responder("/custom/embeddings", fail=True))
+    rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=False))
+    try:
+        cfg = _config(tmp_path, embed, rerank)
+        result = rewrite(
+            PAYLOAD,
+            cfg=cfg,
+            session_id="session-cold",
+            turn_id="turn-cold",
+            notify=lambda _turn_id: None,
+        )
+        assert result is None, "a cold-build embed failure leaves the request unchanged"
+        stored = read(cfg)
+        assert stored["status"] == "inert"
+        note = stored["note"]
+        assert "embedBaseUrl" in note, f"the cold-build outage must name its setting, got {note!r}"
+        assert "rerankBaseUrl" not in note
+        assert note != router_module.ENDPOINT_NOTE, (
+            "the live setup probe refines the generic line, so the probe must have run"
+        )
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_a_local_build_fault_after_an_earlier_failure_carries_no_endpoint_note(
+    tmp_path, monkeypatch
+):
+    """Q7 stale-health regression: an earlier failure must not colour a later local fault.
+
+    Seed the embed health gate with a prior failure, then make the cold build
+    raise locally without ever calling the embedder, and stub the setup check
+    as ready. The turn must carry no endpoint note and fire no probe: the
+    endpoint note belongs only to a build whose own embed attempt failed.
+    """
+    embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
+    rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=False))
+    try:
+        cfg = _config(tmp_path, embed, rerank)
+        embed_module.HEALTH.failure(cfg.embed_base_url + cfg.embed_path)
+        assert embed_module.HEALTH.failed(cfg.embed_base_url + cfg.embed_path)
+
+        def local_build(config, rows, embedder):
+            raise RuntimeError("local index fault")
+
+        probed = []
+
+        def ready_check(config, deadline=None):
+            probed.append(config)
+            return (True, "")
+
+        monkeypatch.setattr(router_module, "load_or_build", local_build)
+        monkeypatch.setattr(router_module, "check_setup_state", ready_check)
+
+        result = rewrite(
+            PAYLOAD,
+            cfg=cfg,
+            session_id="session-stale",
+            turn_id="turn-stale",
+            notify=lambda _turn_id: None,
+        )
+        assert result is None, "a local build fault leaves the request unchanged"
+        stored = read(cfg)
+        assert stored["status"] == "inert"
+        assert stored["note"] == "", (
+            f"a local fault after an earlier failure must not claim the endpoints are down, "
+            f"got {stored['note']!r}"
+        )
+        assert probed == [], "a local fault must not fire a setup probe"
+    finally:
+        embed.close()
+        rerank.close()

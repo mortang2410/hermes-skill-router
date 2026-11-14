@@ -429,6 +429,47 @@ def test_a_failure_on_a_store_another_writer_completed_surfaces_no_note(
     )
 
 
+def test_a_launch_failure_beyond_start_runtime_error_settles_failed_with_a_note(
+    tmp_path, caplog, monkeypatch
+):
+    """J5b: any launch failure, not just start()'s RuntimeError, settles failed with a note.
+
+    Covers the Thread constructor raising and start() raising a non-RuntimeError: both must
+    leave the store finished (not stale running) with contract C5's note pending, so a later
+    request is not blocked forever.
+    """
+
+    class ConstructorBoomThread:
+        def __init__(self, *args, **kwargs):
+            raise ValueError("no thread object")
+
+    class StartOSErrorThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise OSError("cannot start thread")
+
+    for store_name, thread_cls in (
+        ("ctor.db", ConstructorBoomThread),
+        ("start.db", StartOSErrorThread),
+    ):
+        store_path = str(tmp_path / store_name)
+        monkeypatch.setattr(
+            associations_module, "threading", SimpleNamespace(Thread=thread_cls)
+        )
+        with caplog.at_level(logging.WARNING, logger="hermes_skill_router.associations"):
+            assert associations_module.request_heal(store_path) is False
+        assert associations_module.heal_failure_note(store_path) == (
+            associations_module.HEAL_FAILURE_NOTE
+        ), f"{store_name}: a launch failure recorded no failure note"
+        with associations_module._HEAL_LOCK:
+            state = associations_module._HEAL_STATE.get(store_path)
+        assert state == associations_module._HEAL_FINISHED, (
+            f"{store_name}: a launch failure left the attempt running"
+        )
+
+
 def test_a_launch_that_cannot_start_a_thread_is_a_failed_heal(tmp_path, caplog, monkeypatch):
     """A thread that cannot start warns once and hands C5 the same one-line note."""
     store_path = str(tmp_path / "unstartable.db")

@@ -88,6 +88,7 @@ from . import associations
 from .catalog import strip_catalog
 from .config import Config
 from .display import INERT, ROUTED, record
+from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
@@ -158,6 +159,7 @@ def rewrite(
     api_mode: str = CHAT_COMPLETIONS,
     session_id: str = "",
     turn_id: str = "",
+    task_id: str = "",
     notify: Optional[Notify] = None,
 ) -> Optional[Mapping[str, Any]]:
     """Return ``{"request": <rewritten payload>}``, or ``None`` when the request must stay as it is.
@@ -168,7 +170,9 @@ def rewrite(
     the HTTP clients, and exist so tests and callers can supply their own transport. *api_mode*
     defaults to ``chat_completions``; a payload carrying its own ``api_mode`` wins. *session_id*
     and *turn_id* are recorded for the display, and *notify* receives the turn id after a record
-    write (the default broadcasts the plugin event).
+    write (the default broadcasts the plugin event). *task_id* is the dispatcher's task identity
+    beside *session_id*: an anonymous caller (no session id) is keyed by it, so two anonymous
+    callers never share a searchable record or a dump window.
 
     Returns ``None`` for a non-Chat-Completions mode, a disabled plugin, a payload without the
     catalog, no user text, an empty index or block, a last message that already carries the block,
@@ -179,7 +183,7 @@ def rewrite(
     call can never rank rows from an earlier prompt (D10).
     """
     try:
-        forget_session(session_id)
+        forget_session(session_id, task_id=task_id)
         return _compose(
             payload,
             cfg=cfg,
@@ -189,6 +193,7 @@ def rewrite(
             api_mode=api_mode,
             session_id=session_id,
             turn_id=turn_id,
+            task_id=task_id,
             notify=notify,
         )
     except Exception:  # a plugin bug must never abort the model call
@@ -206,6 +211,7 @@ def _compose(
     api_mode: str,
     session_id: str,
     turn_id: str,
+    task_id: str,
     notify: Optional[Notify],
 ) -> Optional[Mapping[str, Any]]:
     """Run the pipeline once and return the middleware result, or ``None`` for no change."""
@@ -228,7 +234,7 @@ def _compose(
     # The dump record says whether a failed pass in this session's current window already sent the
     # whole catalog. The host's post_compaction event expires that mark when a compaction commits,
     # so no message text is inspected for a summary: a paste can neither open nor keep a window.
-    dumped_before = dumped(session_id)
+    dumped_before = dumped(session_id, task_id=task_id)
     if dumped_before:
         dropped_before = True
     stripped, partition = strip_catalog(
@@ -240,7 +246,7 @@ def _compose(
         return None
     # The tool ranks the routed half of this partition, so it remembers the rows this prompt
     # showed before any later stage can fail and leave the request as it arrived.
-    remember_partition(session_id, partition)
+    remember_partition(session_id, partition, task_id=task_id)
     def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass.
 
@@ -254,7 +260,7 @@ def _compose(
         _log_once(reason)
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if not previous and not dropped_before and not dumped_before:
-            remember_dump(session_id)
+            remember_dump(session_id, task_id=task_id)
             return None
         return {
             "request": {
@@ -273,16 +279,32 @@ def _compose(
         # All-eager config: no pass can select anything. First pass is the allowed dump.
         return _fail("no routed skill to suggest")
     if index is None:
+        # Snapshot the embed gate's failure count before the build, so the
+        # note below is attributed to this build's own embed attempt only.
+        endpoint = cfg.embed_base_url + cfg.embed_path
+        failures_before = EMBED_HEALTH.failure_seq(endpoint)
         try:
             index = load_or_build(cfg, partition.routed, embed)
         except Exception:
             logger.debug("skill router: index build raised", exc_info=True)
             index = None
         if index is None:
-            return _fail(
-                "index build failed",
-                _failure_note(cfg, uses_live=embed is default_embed),
-            )
+            # A cold build fails for two different reasons, and only one names an endpoint.
+            # The embed client owns the endpoint fact: embed_texts bumps its health
+            # gate's failure count on every HTTP/service failure and on every gate
+            # refusal inside the health window, so a count that rose during this
+            # build means this build's embed attempt failed and the endpoint note
+            # path (setup probe included) runs for it. A local fault (empty
+            # catalog, unusable vectors, a raised build) never bumps the count
+            # during this build, so it keeps no endpoint note and fires no probe,
+            # even when an earlier unrelated failure is still marked in the gate.
+            note = ""
+            if EMBED_HEALTH.failure_seq(endpoint) != failures_before:
+                note = _failure_note(
+                    cfg,
+                    uses_live=embed is default_embed and rerank is default_rerank,
+                )
+            return _fail("index build failed", note)
     if not index.names:
         return _fail("the skill index carries no row")
     if dropped_before or dumped_before:

@@ -106,6 +106,8 @@ class Ranked:
 
 
 #: The newest parsed partition per session. The middleware writes it; a search only reads it.
+#: Keyed by :func:`_key`: a named session by its id, an anonymous caller (no session_id) by the
+#: task_id the dispatcher passes alongside it, and only a caller with neither by "".
 _PARTITIONS: Dict[str, Partition] = {}
 #: The sessions whose current compaction window already sent the whole catalog. A session is in the
 #: set until the host commits a compaction, which the plugin's ``post_compaction`` callback expires;
@@ -119,30 +121,47 @@ _DUMPED: set[str] = set()
 _PARTITIONS_LOCK = threading.Lock()
 
 
-def remember_dump(session_id: str) -> None:
-    """Record that the whole catalog went out in *session_id*'s current compaction window."""
+def _key(session_id: str, task_id: str = "") -> str:
+    """Return the state key for one caller: its session id, else its task id, else "".
+
+    *task_id* is the keyword the dispatcher passes beside *session_id* on both the tool and the
+    middleware dispatch, so an anonymous caller (no session id) is still distinguishable from
+    another anonymous caller. A named session keys by its id alone, and a caller with neither id
+    keeps the "" bucket, which is the single-anonymous fallback.
+    """
+    return session_id or task_id or ""
+
+
+def remember_dump(session_id: str, *, task_id: str = "") -> None:
+    """Record that the whole catalog went out in this caller's current compaction window.
+
+    Keyed by :func:`_key`, so one anonymous caller's dump marks its own task key and never
+    strips another anonymous caller's first failure.
+    """
     with _PARTITIONS_LOCK:
-        _DUMPED.add(session_id)
+        _DUMPED.add(_key(session_id, task_id))
 
 
-def dumped(session_id: str) -> bool:
-    """Return whether the whole catalog already went out in this session's current window.
+def dumped(session_id: str, *, task_id: str = "") -> bool:
+    """Return whether the whole catalog already went out in this caller's current window.
 
     A pure read: only :func:`remember_dump` marks and only :func:`expire_dump` clears, so a probe
     or a second turn cannot open a window by reading the record.
     """
     with _PARTITIONS_LOCK:
-        return session_id in _DUMPED
+        return _key(session_id, task_id) in _DUMPED
 
 
-def expire_dump(session_id: str) -> None:
-    """Open a new window for *session_id*; removing an absent mark is a no-op.
+def expire_dump(session_id: str, *, task_id: str = "") -> None:
+    """Open a new window for this caller; removing an absent mark is a no-op.
 
     The plugin's ``post_compaction`` callback calls this when the host commits a compaction, so the
-    next failed pass may send the whole catalog once more.
+    next failed pass may send the whole catalog once more; it names only session ids, so it never
+    expires an anonymous task key. The turn-end callback expires that key instead, because the
+    task key ends with the turn and no later event can address it.
     """
     with _PARTITIONS_LOCK:
-        _DUMPED.discard(session_id)
+        _DUMPED.discard(_key(session_id, task_id))
 
 
 def clear_dumps() -> None:
@@ -151,20 +170,25 @@ def clear_dumps() -> None:
         _DUMPED.clear()
 
 
-def remember_partition(session_id: str, partition: Partition) -> None:
-    """Replace the session's searchable record with *partition*: the rows this request showed."""
+def remember_partition(session_id: str, partition: Partition, *, task_id: str = "") -> None:
+    """Replace this caller's searchable record with *partition*: the rows this request showed.
+
+    Keyed by :func:`_key`, so a second anonymous caller neither overwrites the first's partition
+    nor reads it: each task key answers its own rows, and a caller with neither id keeps the ""
+    bucket a single anonymous caller reads back.
+    """
     with _PARTITIONS_LOCK:
-        _PARTITIONS[session_id] = partition
+        _PARTITIONS[_key(session_id, task_id)] = partition
 
 
-def forget_session(session_id: str) -> None:
-    """Drop the session's record, so a later search answers ``no-catalog`` until a catalog parses."""
+def forget_session(session_id: str, *, task_id: str = "") -> None:
+    """Drop this caller's record, so a later search answers ``no-catalog`` until a catalog parses."""
     with _PARTITIONS_LOCK:
-        _PARTITIONS.pop(session_id, None)
+        _PARTITIONS.pop(_key(session_id, task_id), None)
 
 
-def catalog_rows(cfg: Config, session_id: str) -> Optional[Sequence[SearchRow]]:
-    """Return the routed rows of the session's parsed partition, or ``None`` when it has none.
+def catalog_rows(cfg: Config, session_id: str, *, task_id: str = "") -> Optional[Sequence[SearchRow]]:
+    """Return the routed rows of this caller's parsed partition, or ``None`` when it has none.
 
     One row per routed skill, in catalog order, with the name and description the prompt showed.
     Kept rows, names-only rows and anything the prompt filtered out are absent. An empty sequence is
@@ -173,10 +197,11 @@ def catalog_rows(cfg: Config, session_id: str) -> Optional[Sequence[SearchRow]]:
 
     Reads the record the middleware wrote; never touches the filesystem and writes nothing. ``cfg``
     is the loaded config, accepted so this call has the same shape as :func:`select_rows`; no setting
-    changes which rows a parsed prompt showed.
+    changes which rows a parsed prompt showed. Keyed by :func:`_key`, so an anonymous search reads
+    its own task key's rows and never another anonymous caller's.
     """
     with _PARTITIONS_LOCK:
-        partition = _PARTITIONS.get(session_id)
+        partition = _PARTITIONS.get(_key(session_id, task_id))
     if partition is None:
         return None
     return tuple(

@@ -1,17 +1,19 @@
 """Hermes plugin entry point for hermes-skill-router.
 
-The plugin registers one ``llm_request`` middleware, one tool, ``skill_router_search``, and one
-``post_compaction`` hook from the same ``register(ctx)`` call, which is the normal standalone load
-path: the manifest declares the tool and nothing imports the tool module by itself. The tool is
-registered at load and cannot be removed by a settings change, so with the switch off it answers
-``disabled`` instead of disappearing (D7).
+The plugin registers one ``llm_request`` middleware, one tool, ``skill_router_search``, and two
+hooks, ``post_compaction`` and ``on_session_end``, from the same ``register(ctx)`` call, which is
+the normal standalone load path: the manifest declares the tool and nothing imports the tool
+module by itself. The tool is registered at load and cannot be removed by a settings change, so
+with the switch off it answers ``disabled`` instead of disappearing (D7).
 
 The ``post_compaction`` callback expires the session's dump record when the host commits a
 compaction, which is what opens a new catalog window: the record is read by the middleware and no
-message text is scanned for a summary. The host calls hook callbacks with the event's fields as
-keywords plus a telemetry schema version and hands everything to a var-keyword callback, so the
-callback declares the two ids it uses and ``**kwargs``. It never raises: an id that is missing,
-empty or not a string is nothing to do, so a compaction can never abort a turn.
+message text is scanned for a summary. The ``on_session_end`` callback drops the turn's searchable
+partition at turn end, keeps a named session's dump mark so its window survives, and expires an
+anonymous task key's dump mark since that key ends with the turn. The host calls hook callbacks with the event's fields as keywords
+plus a telemetry schema version and hands everything to a var-keyword callback, so each callback
+declares the ids it uses and ``**kwargs``. Neither ever raises: an id that is missing, empty or
+not a string is nothing to do, so a compaction or a turn end can never abort on cleanup.
 
 The middleware callback is declared ``def on_llm_request(request, **kwargs)`` on purpose: the
 dispatcher calls every callback as ``cb(**kwargs)`` after filtering the keyword set to the names the
@@ -20,8 +22,9 @@ middleware too), passing ``request`` plus ``task_id``, ``turn_id``, ``api_reques
 ``platform``, ``model``, ``provider``, ``base_url``, ``api_mode`` and ``api_call_count``. A narrower
 signature is still called, but only with the keywords it declares, so the ids below would never reach
 the rewrite and the display record would stay empty for every turn.
-``session_id``, ``turn_id`` and ``api_mode`` from that keyword set are forwarded to the rewrite:
-the ids land in the display record, and the mode gates the rewrite (D8). A missing id stays an
+``session_id``, ``turn_id``, ``task_id`` and ``api_mode`` from that keyword set are forwarded to
+the rewrite: the ids land in the display record (``task_id`` keys the searchable record only when
+no session id names the caller), and the mode gates the rewrite (D8). A missing id stays an
 empty string, and a missing mode falls back to ``chat_completions``.
 
 Settings are read with ``ctx.get_config`` from ``plugins.entries.hermes-skill-router.settings``. The
@@ -38,12 +41,12 @@ from typing import Any, Mapping
 if __package__:
     from .hermes_skill_router.config import load, read_settings
     from .hermes_skill_router.router import rewrite
-    from .hermes_skill_router.search import expire_dump
+    from .hermes_skill_router.search import expire_dump, forget_session
     from .hermes_skill_router.tools import register_tools
 else:  # imported as a bare module, e.g. by a test collector walking this repository
     from hermes_skill_router.config import load, read_settings
     from hermes_skill_router.router import rewrite
-    from hermes_skill_router.search import expire_dump
+    from hermes_skill_router.search import expire_dump, forget_session
     from hermes_skill_router.tools import register_tools
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,34 @@ def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs:
             expire_dump(named)
 
 
+def on_session_end(session_id: str = "", task_id: str = "", **kwargs: Any) -> None:
+    """Drop the searchable partition for this turn's caller key.
+
+    The host fires this at every turn finalization (``agent/turn_finalizer.py``) with the
+    canonical ``session_id``/``task_id``/``turn_id`` set, so the partition the middleware
+    remembered for ``_key(session_id, task_id)`` is dropped at turn end instead of living
+    until the next request for that key. A named session's next turn re-parses its own
+    partition, so nothing observable changes there. An anonymous caller is deliberately
+    per-turn: each turn presents its own task key, so the next turn starts with no
+    searchable catalog even though it presents no session id.
+
+    A named session keeps its dump mark here: taking it would collapse every
+    named session's compaction window to a per-turn window, and the first
+    failed pass of every turn would dump the whole catalog again. An anonymous
+    caller instead expires its task key's dump mark at turn end: each turn
+    presents a fresh task key that no later event (``post_compaction`` names
+    only session ids) can ever address, so keeping the mark would accumulate
+    one stale key per anonymous turn. A missing, empty or non-string id is
+    nothing to do, and the callback returns ``None`` and never raises, so a
+    turn can never abort on cleanup.
+    """
+    named = session_id if isinstance(session_id, str) else ""
+    task = task_id if isinstance(task_id, str) else ""
+    forget_session(named, task_id=task)
+    if not named and task:
+        expire_dump(named, task_id=task)
+
+
 def register(ctx: Any) -> None:
     """Register the plugin's middleware, search tool and compaction hook with *ctx*."""
 
@@ -74,6 +105,7 @@ def register(ctx: Any) -> None:
                 request,
                 session_id=kwargs.get("session_id") or "",
                 turn_id=kwargs.get("turn_id") or "",
+                task_id=kwargs.get("task_id") or "",
                 api_mode=kwargs.get("api_mode") or "chat_completions",
             )
         except Exception:  # a plugin bug must never abort a model call
@@ -86,6 +118,7 @@ def register(ctx: Any) -> None:
     ctx.register_middleware("llm_request", on_llm_request)
     register_tools(ctx)
     ctx.register_hook("post_compaction", on_post_compaction)
+    ctx.register_hook("on_session_end", on_session_end)
 
 
 def _route(
@@ -94,6 +127,7 @@ def _route(
     *,
     session_id: str = "",
     turn_id: str = "",
+    task_id: str = "",
     api_mode: str = "chat_completions",
 ) -> Any:
     """Validate the config, then hand the request to the rewrite. Returns ``None`` for no change.
@@ -108,5 +142,5 @@ def _route(
     if not cfg.enabled:
         return None
     return rewrite(
-        request, cfg=cfg, session_id=session_id, turn_id=turn_id, api_mode=api_mode
+        request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
     )
