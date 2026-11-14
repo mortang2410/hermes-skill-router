@@ -11,9 +11,9 @@ display:
   ``tui/skill-router.mjs`` the same way;
 * the dashboard entry module the loader injects is comment-only, parses, and imports without
   registering anything or touching a global;
-* neither surface reads or shows anything but the record's names and identifiers — a record that
-  carries a request message or a ``text`` key renders nothing from it, and no route answer holds a
-  key outside the seven-field schema.
+* neither surface reads or shows anything but the record's names, its C5 note and its
+  identifiers — a record that carries a request message or a ``text`` key renders nothing from it,
+  and no route answer holds a key outside the eight-field schema.
 
 Both surfaces are runtimes this test cannot host (a React renderer, an Ink app), so the JS halves
 are loaded in Node with stub modules on ``node_modules`` and a stub SDK/context. That exercises the
@@ -73,6 +73,9 @@ CAPTION_TIME = (
     datetime.fromisoformat(CAPTION_STAMP.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
 )
 CAPTION = f"turn turn-1 · {CAPTION_TIME}"
+
+#: Contract C5's one line, as the router writes it on a turn whose store is incomplete.
+NOTE_TEXT = "History is incomplete and healing is running in the background."
 
 
 def write_record(path: Path, **overrides) -> Path:
@@ -163,6 +166,7 @@ def test_the_route_answers_the_record_it_reads(tmp_path, plugin_api):
         "status": "routed",
         "origin": "turn",
         "names": ["alpha", "beta", "gamma"],
+        "note": "",
     }
 
 
@@ -223,6 +227,7 @@ def test_the_route_passes_the_inert_status_through(tmp_path, plugin_api):
         "status": "inert",
         "origin": "turn",
         "names": [],
+        "note": "",
     }
 
 
@@ -257,6 +262,14 @@ def test_the_route_returns_no_request_content_even_from_a_tampered_record(tmp_pa
     assert list(answer) == list(FIELDS)
     assert "text" not in answer and "messages" not in answer and "system" not in answer
     assert REQUEST_TEXT not in body
+
+
+def test_the_route_carries_the_writers_note(tmp_path, plugin_api):
+    """The record's C5 line reaches the desktop pane through the same route body."""
+    note = "History is incomplete and healing is running in the background."
+    path = write_record(tmp_path / "suggestions.json", note=note)
+
+    assert plugin_api.answer(path)["note"] == note
 
 
 def test_the_route_never_writes_the_record(tmp_path, plugin_api):
@@ -491,6 +504,20 @@ out.summary = {
   })
 }
 
+// Contract C5: the writer's one line reaches the pane, and a routed turn without one stays silent.
+const NOTE = 'History is incomplete and healing is running in the background.'
+out.note = {
+  empty: summary({ at: STAMP, names: [], note: NOTE, status: 'routed', turn_id: 'turn-1' }),
+  inert: summary({
+    at: STAMP,
+    names: [],
+    note: 'the endpoint stopped answering',
+    status: 'inert',
+    turn_id: 'turn-1'
+  }),
+  routed: summary({ at: STAMP, names: NAMES, note: NOTE, status: 'routed', turn_id: 'turn-1' })
+}
+
 // The caption is built from the record's identifiers only, and drops a half it cannot read.
 out.captions = {
   badAt: captionFor({ at: 'not-a-date', names: NAMES, status: 'routed', turn_id: 'turn-1' }),
@@ -582,6 +609,12 @@ globalThis.__t8Result = { data: { at: STAMP, names: [], status: 'inert', turn_id
 out.inert = { text: text(render()) }
 globalThis.__t8Result = { data: { status: 'idle', names: [] } }
 out.idle = { text: text(render()) }
+
+// A routed record carrying C5's note paints one muted line, names still in the heading.
+globalThis.__t8Result = {
+  data: { at: STAMP, names: NAMES, note: NOTE, status: 'routed', turn_id: 'turn-1' }
+}
+out.notePane = { text: text(render()) }
 
 console.log(JSON.stringify(out))
 """
@@ -701,6 +734,18 @@ out.routed = {
   dialogType: routed.type
 }
 out.summary = summary(readRecord('routed.json'))
+
+// Contract C5: a record's note adds one muted line, and the names accordion stays.
+const NOTE = 'History is incomplete and healing is running in the background.'
+dump('note.json', record({ note: NOTE }))
+const noted = render('note.json')
+out.note = {
+  body: text(bodyOf(noted)),
+  caption: captionOf(noted),
+  childrenType: Array.isArray(bodyOf(noted)) ? 'list' : bodyOf(noted).type,
+  record: readRecord('note.json'),
+  summary: summary(readRecord('note.json'))
+}
 
 // The caption is built from the record's identifiers only, and drops a half it cannot read.
 out.captions = {
@@ -907,6 +952,26 @@ def test_the_desktop_pane_labels_each_record_state(desktop):
     assert summary["tampered"]["names"] == ["alpha"]
 
 
+def test_the_desktop_pane_paints_the_record_note_with_the_names(desktop):
+    """Contract C5: one muted line rides beside the names; a note replaces a fixed state line."""
+    assert desktop["note"]["routed"]["note"] == NOTE_TEXT
+    assert desktop["note"]["routed"]["names"] == ["alpha", "beta", "gamma"]
+    assert desktop["note"]["empty"]["note"] == NOTE_TEXT, (
+        "an empty routed turn still carries the line"
+    )
+    assert desktop["note"]["inert"]["note"] == "the endpoint stopped answering", (
+        "the writer's note wins over the fixed inert line"
+    )
+    assert NOTE_TEXT in desktop["notePane"]["text"]
+    assert "Skills routed (3)" in desktop["notePane"]["text"]
+    assert NOTE_TEXT not in desktop["collapsed"]["text"], (
+        "a routed turn with no note paints no extra line"
+    )
+    assert desktop["summary"]["routed"]["note"] == "", (
+        "a complete store's routed turn paints no line"
+    )
+
+
 def test_the_desktop_pane_paints_one_muted_turn_caption(desktop):
     captions = desktop["captions"]
     times = desktop["times"]
@@ -1011,6 +1076,22 @@ def test_the_tui_widget_renders_a_dialog_with_a_collapsed_accordion(tui):
         assert name in tui["routed"]["body"]
 
 
+def test_the_tui_widget_paints_the_record_note_with_the_names(tui):
+    """Contract C5: the note and the names accordion render together, and the caption survives."""
+    assert tui["note"]["summary"]["note"] == NOTE_TEXT
+    assert tui["note"]["summary"]["names"] == ["alpha", "beta", "gamma"]
+    assert tui["note"]["record"]["note"] == NOTE_TEXT
+    assert tui["note"]["caption"] == CAPTION
+    assert tui["note"]["childrenType"] == "list", (
+        "the card must carry the names accordion and the note line as two children"
+    )
+    assert NOTE_TEXT in tui["note"]["body"]
+    for name in ("alpha", "beta", "gamma"):
+        assert name in tui["note"]["body"]
+    assert NOTE_TEXT not in tui["routed"]["body"], "a routed turn with no note paints no line"
+    assert tui["summary"]["note"] == "", "a complete store's routed turn paints no line"
+
+
 def test_the_tui_widget_paints_one_muted_turn_caption(tui):
     captions = tui["captions"]
 
@@ -1058,14 +1139,29 @@ def test_the_tui_widget_shows_one_line_for_the_states_without_names(tui):
     assert tui["corrupt"]["bodyType"] == "Text"
     assert "no suggestions recorded yet" in tui["corrupt"]["body"]
     assert tui["corrupt"]["caption"] == ""
-    assert tui["missing"]["record"] == {"at": "", "names": [], "origin": "", "status": "idle", "turn_id": ""}
-    assert tui["corrupt"]["record"] == {"at": "", "names": [], "origin": "", "status": "idle", "turn_id": ""}
+    assert tui["missing"]["record"] == {
+        "at": "",
+        "names": [],
+        "note": "",
+        "origin": "",
+        "status": "idle",
+        "turn_id": "",
+    }
+    assert tui["corrupt"]["record"] == {
+        "at": "",
+        "names": [],
+        "note": "",
+        "origin": "",
+        "status": "idle",
+        "turn_id": "",
+    }
 
 
 def test_the_tui_widget_shows_no_request_text(tui):
     assert tui["tampered"]["projection"] == {
         "at": "2026-11-10T07:20:31Z",
         "names": ["alpha", "beta", "gamma"],
+        "note": "",
         "origin": "turn",
         "status": "routed",
         "turn_id": "turn-1",

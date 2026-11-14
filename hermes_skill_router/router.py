@@ -51,9 +51,12 @@ request clears the previous one first, so a search never ranks rows from an earl
 
 On every request that carried the catalog on Chat Completions the same decision is written to the
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
-names, or ``inert`` with no names. The record is written after the payload is built and never
-enters it, so the display costs no token. A written record is announced on the plugin event
-``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
+names, or ``inert`` with no names. While the association store is incomplete, contract C5's one
+note rides on that record, so the surfaces can say history is incomplete and healing is running, or
+report the one pending heal failure the C6 job handed the turn; the note never enters the payload,
+so it costs no token, and a complete store adds nothing. The record is written after the payload is
+built and never enters it, so the display costs no token. A written record is announced on the
+plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
 
 A completed pass also writes one info line to the plugin log, beginning ``skill router: query=``.
 The line carries the query as a JSON string, every shortlisted candidate with the score the selector
@@ -72,12 +75,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from . import associations
 from .catalog import strip_catalog
 from .config import Config
 from .display import INERT, ROUTED, record
 from .embed import embed_texts as default_embed
+from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
 from .library import Index, PathResolver, load_or_build, path_resolver
 from .rerank import rerank as default_rerank
@@ -89,6 +95,9 @@ logger = logging.getLogger(__name__)
 
 #: The only ``api_mode`` this rewrite understands; every other mode returns the request untouched.
 CHAT_COMPLETIONS = "chat_completions"
+
+#: Contract C5's one line while the association store is incomplete; it rides on the record only.
+HISTORY_NOTE = "History is incomplete and healing is running in the background."
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
@@ -263,6 +272,10 @@ def _compose(
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve)
     if ranked.reason:
         return _fail(ranked.detail)
+    # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
+    # heal when it was incomplete. Contract C5's note is read once here, so every record this turn
+    # writes carries the same line, and a more urgent note from a later ticket replaces it.
+    note = _history_note(cfg)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
@@ -291,7 +304,7 @@ def _compose(
     if not block:
         # No selected suggestion and no kept row: stripping without a replacement would lose the
         # catalog for nothing, so the whole request is returned untouched.
-        inert()
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         return None
     rewritten = {
         **dict(payload),
@@ -300,7 +313,15 @@ def _compose(
             {"role": "system", "content": block},
         ],
     }
-    _recorder(cfg, ROUTED, [name for name, _score in selected], session_id, turn_id, notify)()
+    _recorder(
+        cfg,
+        ROUTED,
+        [name for name, _score in selected],
+        session_id,
+        turn_id,
+        notify,
+        note=note,
+    )()
     return {"request": rewritten}
 
 
@@ -439,6 +460,88 @@ def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str
     return paths
 
 
+def _store_in_play(cfg: Config) -> bool:
+    """Return whether this turn's pass opens the association store, so a heal can have been asked.
+
+    ``library.shortlist`` returns the cosine order before opening the store when the fusion mode is
+    the cosine rollback or every channel is off, so that state skips nothing and heals nothing;
+    C5's line would claim a heal that does not exist, and no note is written.
+    """
+    settings = resolve_fusion_config(
+        {
+            "mode": cfg.fusion_mode,
+            "channels": {
+                "semantic": cfg.channels_semantic,
+                "bm25": cfg.channels_bm25,
+                "associations": cfg.channels_associations,
+            },
+        }
+    )
+    return settings.mode != "cosine" and settings.enabled
+
+
+def _configured_store_path(cfg: Config) -> Optional[str]:
+    """Return the association store path the library pass opens, or ``None`` when it is off.
+
+    This repeats the two-line path rule ``library._open_store`` applies, because M2's helper is
+    private and the note must name the store the turn actually read. A configured
+    ``associationDbPath`` wins; otherwise the store sits beside the index cache.
+    """
+    raw = (cfg.association_db_path or "").strip()
+    if raw:
+        return os.path.expanduser(raw)
+    cache = (cfg.cache_path or "").strip()
+    if not cache:
+        return None
+    return associations.association_db_path_for(cache)
+
+
+def _history_note(cfg: Config) -> str:
+    """Return the turn's one note for an incomplete history, or ``""`` when the store is complete.
+
+    C6's completeness rule answers whether there is a line at all, over the same configured store
+    path and the same Hermes session store the library pass reads. A missing, empty or unreadable
+    store is incomplete by that rule, so the four store states C4 skips all carry a line.
+
+    While the store is incomplete, C6's pending heal-failure note wins over the generic
+    "healing is running" line: a failed heal is not running, so the generic line would claim work
+    that stopped, and the failure is the state the user needs to see. The accessor is one-shot, so
+    it is read only after the turn is known to carry a history note - a turn that shows contract
+    C7's dead-endpoint note never reaches this chooser, and a complete store never consumes it.
+    """
+    if not _store_in_play(cfg):
+        return ""
+    path = _configured_store_path(cfg)
+    if path is None or _store_is_complete(path):
+        return ""
+    return associations.heal_failure_note(path) or HISTORY_NOTE
+
+
+def _store_is_complete(path: str) -> bool:
+    """Return whether the association store at *path* is complete, by contract C6's rule.
+
+    A store that cannot be opened or read answers "incomplete", which is the same answer the
+    detector gives: no evidence of coverage is not coverage. The note must never cost the turn, so
+    every failure here is swallowed after one debug line.
+    """
+    store: Optional[associations.AssociationStore]
+    try:
+        store = associations.open_store(path, read_only=True)
+    except Exception:  # a missing, empty or unreadable file is no evidence of coverage
+        logger.debug("skill router: the store could not be opened for the C5 note", exc_info=True)
+        return False
+    try:
+        return bool(associations.is_store_complete(store))
+    except Exception:  # the detector never raises, but the note must not depend on that
+        logger.debug("skill router: the store completeness check raised", exc_info=True)
+        return False
+    finally:
+        try:
+            store.close()
+        except Exception:  # a close failure must not cost the turn
+            logger.debug("skill router: the association store close raised", exc_info=True)
+
+
 def _recorder(
     cfg: Config,
     status: str,
@@ -446,17 +549,24 @@ def _recorder(
     session_id: str,
     turn_id: str,
     notify: Optional[Notify],
+    note: str = "",
 ) -> Callable[[], None]:
     """Return a thunk that writes one display record and announces it when a write happened.
 
-    The thunk never raises: the payload the caller is about to return must not depend on the
-    display, so a record or broadcast failure is swallowed here rather than reaching the pipeline.
+    *note* is contract C5's one line for this turn, or ``""``. The thunk never raises: the payload
+    the caller is about to return must not depend on the display, so a record or broadcast failure
+    is swallowed here rather than reaching the pipeline.
     """
 
     def _record() -> None:
         try:
             written = record(
-                cfg, status=status, names=names, session_id=session_id, turn_id=turn_id
+                cfg,
+                status=status,
+                names=names,
+                session_id=session_id,
+                turn_id=turn_id,
+                note=note,
             )
         except Exception:
             logger.debug("skill router: the display record failed", exc_info=True)

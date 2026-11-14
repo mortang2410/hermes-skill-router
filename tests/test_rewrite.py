@@ -1312,6 +1312,7 @@ GOLDEN_RECORD = {
     "status": "routed",
     "origin": "turn",
     "names": ["beta", "delta", "alpha", "gamma"],
+    "note": "",
 }
 
 

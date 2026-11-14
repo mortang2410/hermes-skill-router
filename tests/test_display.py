@@ -573,3 +573,77 @@ def test_the_next_routed_turn_replaces_a_search_record(tmp_path):
     assert stored["origin"] == TURN
     assert stored["turn_id"] == "turn-1"
     assert stored["names"] == ["beta"]
+
+
+# ---------------------------------------------------------------------------
+# The note: contract C5's one line, stored beside the names and out of every request.
+# ---------------------------------------------------------------------------
+
+
+def test_the_record_carries_the_note_and_reads_it_back(tmp_path):
+    cfg = make_config(tmp_path)
+    note = "History is incomplete and healing is running in the background."
+
+    written = record(cfg, status=ROUTED, names=["alpha"], note=note)
+
+    assert written is not None
+    assert written["note"] == note
+    assert read_file(cfg.suggestions_path)["note"] == note
+    assert read(cfg)["note"] == note
+    assert set(read(cfg)) == set(FIELDS)
+
+
+def test_the_note_defaults_to_empty(tmp_path):
+    cfg = make_config(tmp_path)
+
+    record(cfg, status=ROUTED, names=["alpha"])
+
+    assert read_file(cfg.suggestions_path)["note"] == ""
+
+
+def test_the_note_is_flattened_to_one_line(tmp_path):
+    cfg = make_config(tmp_path)
+
+    record(cfg, status=ROUTED, names=["alpha"], note=" history\nis  incomplete ")
+
+    assert read(cfg)["note"] == "history is incomplete"
+
+
+def test_a_note_change_alone_rewrites_the_record(tmp_path):
+    cfg = make_config(tmp_path)
+    assert record(cfg, status=ROUTED, names=["alpha"]) is not None
+
+    second = record(cfg, status=ROUTED, names=["alpha"], note="History is incomplete")
+
+    assert second is not None, "the note is part of the record's identity"
+    assert read_file(cfg.suggestions_path)["note"] == "History is incomplete"
+
+
+def test_the_same_decision_with_the_same_note_is_not_rewritten(tmp_path):
+    cfg = make_config(tmp_path)
+    record(cfg, status=ROUTED, names=["alpha"], note="a line")
+    before = Path(cfg.suggestions_path).read_text(encoding="utf-8")
+
+    assert record(cfg, status=ROUTED, names=["alpha"], note="a line") is None
+    assert Path(cfg.suggestions_path).read_text(encoding="utf-8") == before
+
+
+def test_an_older_record_without_a_note_reads_as_no_note(tmp_path):
+    """The note was added without a version bump, so an older schema 2 file still reads."""
+    cfg = make_config(tmp_path)
+    Path(cfg.suggestions_path).write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "at": "2026-11-10T00:00:00Z",
+                "session_id": "s",
+                "turn_id": "t",
+                "status": "routed",
+                "origin": "turn",
+                "names": ["alpha"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert read(cfg)["note"] == ""

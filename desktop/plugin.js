@@ -8,7 +8,10 @@
  * the router suggested on the last turn — never a kept row, never text from a request. Under the
  * heading sits one muted caption naming the turn and its local clock time, built from the record's
  * own `turn_id` and `at`; when the record says a model search produced the names, the caption
- * paints the model-search marker instead, because a lookup belongs to no turn.
+ * paints the model-search marker instead, because a lookup belongs to no turn. Below the caption,
+ * a record carrying a `note` paints that one muted line — contract C5's line for an incomplete
+ * history that is healing — and with no note the pane keeps its fixed state lines and stays silent
+ * on a routed turn.
  *
  * The data comes from the plugin's own backend route, `GET /suggestions` (dashboard/plugin_api.py,
  * mounted at `/api/plugins/hermes-skill-router/`), through `ctx.rest`, so the desktop half never
@@ -130,10 +133,12 @@ export function captionFor(record) {
 /**
  * The labels one pane render needs, derived from a route body alone.
  *
- * Names only: `names` is the record's own list (already capped by `maxDisplayNames` when the
- * writer stored it) and every other key of the body is ignored, so a request message, a system
- * prompt or any other text in the record can never reach the pane. A missing record, a corrupt
- * one and an idle answer all collapse to the idle line.
+ * Names only, plus the writer's one-line note: `names` is the record's own list (already capped by
+ * `maxDisplayNames` when the writer stored it) and `note` is the C5 line the plugin wrote, never
+ * request text. Every other key of the body is ignored, so a request message or a system prompt
+ * in the record can never reach the pane. When the record carries no note, the state falls back
+ * to the fixed line the pane always painted. A missing record, a corrupt one and an idle answer
+ * all collapse to the idle line.
  */
 export function summary(record) {
   const status =
@@ -144,6 +149,8 @@ export function summary(record) {
       : []
   const heading = `${PANE_TITLE} (${names.length})`
   const caption = captionFor(record)
+  const carried =
+    record && typeof record === 'object' && typeof record.note === 'string' ? record.note.trim() : ''
 
   if (status === 'inert') {
     return {
@@ -151,7 +158,7 @@ export function summary(record) {
       count: 0,
       heading: `${PANE_TITLE} (0)`,
       names: [],
-      note: INERT_LINE,
+      note: carried || INERT_LINE,
       status: 'inert'
     }
   }
@@ -162,7 +169,7 @@ export function summary(record) {
       count: 0,
       heading: `${PANE_TITLE} (0)`,
       names: [],
-      note: IDLE_LINE,
+      note: carried || IDLE_LINE,
       status: 'idle'
     }
   }
@@ -172,7 +179,7 @@ export function summary(record) {
     count: names.length,
     heading,
     names,
-    note: names.length ? '' : EMPTY_LINE,
+    note: carried || (names.length ? '' : EMPTY_LINE),
     status: 'routed'
   }
 }
@@ -225,9 +232,7 @@ export default {
                 className: 'flex flex-col gap-1 overflow-y-auto'
               })
             : null,
-          names.length || !note
-            ? null
-            : jsx('p', { children: note, className: 'text-xs text-muted-foreground' })
+          note ? jsx('p', { children: note, className: 'text-xs text-muted-foreground' }) : null
         ],
         className: 'flex h-full flex-col gap-1 p-3 text-sm'
       })

@@ -11,11 +11,13 @@
  *
  * It shows the skill names the router suggested on the last turn, names only, with one muted caption
  * naming the turn — or the model search, when the record says a model called the search tool — and
- * its local clock time from the record's own identifiers. The record's seven fields are projected
- * down to status, origin, names, timestamp and turn id, so text from a request can
- * never reach the card. It re-reads the file every 500 ms and lands each update through
- * `sdk.updateWidget`, which no-ops once the widget is closed, and the dock's own launch toggle
- * collapses it on a second `/skills-routed`. A missing, corrupt or `idle` record paints one line.
+ * its local clock time from the record's own identifiers. Its other muted line is the record's own
+ * `note`: contract C5's one line for an incomplete history that is healing, which the plugin wrote
+ * and a request never carried. The record's eight fields are projected down to status, origin,
+ * names, note, timestamp and turn id, so text from a request can never reach the card. It re-reads
+ * the file every 500 ms and lands each update through `sdk.updateWidget`, which no-ops once the
+ * widget is closed, and the dock's own launch toggle collapses it on a second `/skills-routed`. A
+ * missing, corrupt or `idle` record paints one line.
  */
 
 import { readFileSync } from 'node:fs'
@@ -57,17 +59,18 @@ const EMPTY_LINE = 'the last routed turn suggested nothing'
 
 /** The idle answer for a record that is absent, unreadable or not a record. */
 export function idleRecord() {
-  return { at: '', names: [], origin: '', status: 'idle', turn_id: '' }
+  return { at: '', names: [], note: '', origin: '', status: 'idle', turn_id: '' }
 }
 
 /**
- * Read one record file into `{status, names, at, turn_id, origin}`; never throws.
+ * Read one record file into `{status, names, at, turn_id, origin, note}`; never throws.
  *
  * Absent, unreadable, non-JSON, wrong-schema or wrong-shaped files all return :func:`idleRecord`,
  * so the widget has exactly one shape to render. A schema 1 file still reads, with origin `turn`,
- * so an installed older writer does not blank a newer card. Only those five fields leave this
- * function: the names are the record's own suggestion names (a kept row is never in the file), and
- * no message, prompt or any other text is read out of it.
+ * so an installed older writer does not blank a newer card. Only those six fields leave this
+ * function: the names are the record's own suggestion names (a kept row is never in the file), the
+ * note is the one line the plugin wrote for C5, and no message, prompt or any other text is read
+ * out of it.
  */
 export function readRecord(file) {
   let data
@@ -99,6 +102,7 @@ export function readRecord(file) {
   return {
     at: typeof data.at === 'string' ? data.at : '',
     names: data.status === 'routed' ? data.names.filter(name => name.trim() !== '') : [],
+    note: typeof data.note === 'string' ? data.note.trim() : '',
     origin,
     status: data.status,
     turn_id: typeof data.turn_id === 'string' ? data.turn_id : ''
@@ -152,25 +156,47 @@ export function captionFor(record) {
 /**
  * The labels one render needs, derived from a record: the section title, its count, the names to
  * list one per line, the turn caption, and the single line a state without names paints.
+ *
+ * `note` is the record's own C5 line when the writer supplied one, and otherwise the fixed line
+ * this state has always painted: an inert turn, an idle widget or a routed turn that picked
+ * nothing. A routed turn that picked names carries no line unless a note says history is healing,
+ * so the card gains one line while the association store is incomplete and stays silent once it
+ * is complete.
  */
 export function summary(record) {
   const status = record && STATUSES.includes(record.status) ? record.status : 'idle'
   const names = status === 'routed' && Array.isArray(record.names) ? record.names : []
   const caption = captionFor(record)
+  const note =
+    record && typeof record === 'object' && typeof record.note === 'string' ? record.note.trim() : ''
 
   if (status === 'inert') {
-    return { caption, count: 0, names: [], note: INERT_LINE, status: 'inert', title: ACCORDION_TITLE }
+    return {
+      caption,
+      count: 0,
+      names: [],
+      note: note || INERT_LINE,
+      status: 'inert',
+      title: ACCORDION_TITLE
+    }
   }
 
   if (status !== 'routed') {
-    return { caption, count: 0, names: [], note: IDLE_LINE, status: 'idle', title: ACCORDION_TITLE }
+    return {
+      caption,
+      count: 0,
+      names: [],
+      note: note || IDLE_LINE,
+      status: 'idle',
+      title: ACCORDION_TITLE
+    }
   }
 
   return {
     caption,
     count: names.length,
     names,
-    note: names.length ? '' : EMPTY_LINE,
+    note: note || (names.length ? '' : EMPTY_LINE),
     status: 'routed',
     title: ACCORDION_TITLE
   }
@@ -202,11 +228,11 @@ export default function register(sdk) {
   let app = null
   let timer = null
 
-  /** Paint the card: a title, the collapsible name list, or the one line a state without names. */
+  /** Paint the card: a title, the collapsible name list and C5's note line when there is one. */
   function face(state, t) {
     const model = summary(state.record)
     const caption = model.caption ? sdk.h(sdk.Text, { color: t.color.muted }, model.caption) : null
-    const body = model.names.length
+    const list = model.names.length
       ? sdk.h(
           sdk.Accordion,
           { count: model.count, defaultOpen: false, t, title: model.title },
@@ -214,9 +240,16 @@ export default function register(sdk) {
             return sdk.h(sdk.Text, { color: t.color.label, key: `${index}:${name}` }, name)
           })
         )
-      : sdk.h(sdk.Text, { color: t.color.muted }, model.note)
+      : null
+    const note = model.note ? sdk.h(sdk.Text, { color: t.color.muted }, model.note) : null
+    const body = [list, note].filter(Boolean)
 
-    return sdk.h(sdk.Dialog, { title: TITLE, width: WIDTH }, caption, body)
+    return sdk.h(
+      sdk.Dialog,
+      { title: TITLE, width: WIDTH },
+      caption,
+      body.length === 1 ? body[0] : body
+    )
   }
 
   app = sdk.defineWidgetApp({

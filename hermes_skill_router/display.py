@@ -4,13 +4,17 @@ The record is the whole display contract. It is one small JSON file at
 ``cfg.suggestions_path`` holding the decision for the newest routed turn or model search::
 
     {"schema": 2, "at": "2026-11-10T07:20:31Z", "session_id": "…", "turn_id": "…",
-     "status": "routed" | "inert", "origin": "turn" | "search", "names": ["…", …]}
+     "status": "routed" | "inert", "origin": "turn" | "search", "names": ["…", …],
+     "note": "" | "one line the plugin wrote"}
 
 ``names`` are the selected suggestion names only. A kept row is listed in the injected block but
 never recorded, so the pane and the TUI widget can never present a pinned or deferred-excluded
-skill as something the router picked. No request text is stored: the record is names plus the
-identifiers of the decision that produced it. ``origin`` says who asked: ``turn`` for the automatic
-pre-request pass, ``search`` for a model call to the search tool, so the surfaces can mark a lookup.
+skill as something the router picked. No request text is stored: the record is names, an optional
+one-line note the plugin itself wrote, and the identifiers of the decision that produced it.
+``origin`` says who asked: ``turn`` for the automatic pre-request pass, ``search`` for a model call
+to the search tool, so the surfaces can mark a lookup. ``note`` is contract C5's one line for a
+turn whose state the user should see, such as an incomplete history that is healing; an empty note
+means the surfaces fall back to their own state lines.
 
 Rules that exist because a display must not cost a token or a crash:
 
@@ -44,7 +48,8 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
-#: Record file schema. Bumped when the file's shape changes; a schema 1 file still reads.
+#: Record file schema. Bumped when an existing field changes meaning. A field added later, such as
+#: ``note``, reads as the empty string in an older file, so it needs no new version.
 SCHEMA = 2
 
 #: The schema a pre-origin writer produced, read as an origin of :data:`TURN`.
@@ -61,7 +66,7 @@ SEARCH = "search"
 ORIGINS = (TURN, SEARCH)
 
 #: The keys a record carries, in the order it is written.
-FIELDS = ("schema", "at", "session_id", "turn_id", "status", "origin", "names")
+FIELDS = ("schema", "at", "session_id", "turn_id", "status", "origin", "names", "note")
 
 #: A reader argument: the plugin config, whose ``suggestions_path`` is used, or that path itself.
 Target = Union[Config, str, "os.PathLike[str]"]
@@ -97,6 +102,7 @@ def record(
     names: Sequence[str] = (),
     session_id: str = "",
     turn_id: str = "",
+    note: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Write the newest decision and return the record, or ``None`` when nothing was written.
 
@@ -105,8 +111,11 @@ def record(
     and defaults to ``"turn"`` so the existing turn call sites that pass no origin keep working.
     A search record carries no turn id, so *turn_id* is stored as ``""`` whatever a caller passes.
     *names* are the selected suggestion names; anything past ``cfg.max_display_names`` is dropped,
-    duplicates keep their first place, and blanks are ignored. With ``cfg.show_suggestions`` false
-    an existing record is removed and nothing is written, for either origin.
+    duplicates keep their first place, and blanks are ignored. *note* is one optional line the
+    plugin writes for the user, flattened to a single trimmed line; it is stored as ``""`` when no
+    caller supplies one, so an older reader and an untouched record are the same thing. With
+    ``cfg.show_suggestions`` false an existing record is removed and nothing is written, for either
+    origin.
 
     Returns ``None`` for a skip (an identical record, a disabled or empty path, a write failure) so
     a caller can tell a real write, which is worth broadcasting, from a no-op.
@@ -134,6 +143,7 @@ def record(
         "origin": origin,
         # An inert decision suggested nothing, so names are dropped even if a caller passes some.
         "names": [] if status == INERT else _names(names, cfg.max_display_names),
+        "note": _line(note),
     }
     previous = read(cfg)
     if previous is not None and _same(previous, entry):
@@ -149,7 +159,8 @@ def read(target: Target) -> Optional[Dict[str, Any]]:
     Only the known fields are returned, and a file whose schema, status, origin or name list is
     wrong reads as idle rather than as a partial record, so both display surfaces see one shape or
     nothing. A schema 1 file still reads, with origin :data:`TURN`, so an installed older writer
-    does not blank a newer pane.
+    does not blank a newer pane. A file written before ``note`` existed reads with an empty note,
+    which the surfaces treat as "no line", exactly like a record the plugin wrote without one.
 
     With a :class:`Config` whose ``show_suggestions`` is false this answers ``None`` before touching
     the file: the setting is authoritative for the route and the desktop pane, so a leftover record
@@ -195,6 +206,7 @@ def read(target: Target) -> Optional[Dict[str, Any]]:
         "status": status,
         "origin": origin,
         "names": list(names),
+        "note": _line(data.get("note")),
     }
 
 
@@ -240,6 +252,7 @@ def _clear(cfg: Config) -> str:
         "status": INERT,
         "origin": TURN,
         "names": [],
+        "note": "",
     }
     if not _write(path, replacement):
         _log_once(
@@ -305,10 +318,15 @@ def _names(names: Sequence[str], limit: int) -> List[str]:
 
 def _same(previous: Dict[str, Any], entry: Dict[str, Any]) -> bool:
     """Return whether *entry* says what *previous* already says; ``at`` is deliberately ignored."""
-    for key in ("schema", "session_id", "turn_id", "status", "origin", "names"):
+    for key in ("schema", "session_id", "turn_id", "status", "origin", "names", "note"):
         if previous.get(key) != entry.get(key):
             return False
     return True
+
+
+def _line(value: Any) -> str:
+    """Return *value* as one trimmed line of text, and the empty string for anything else."""
+    return " ".join(_text(value).split())
 
 
 def _text(value: Any) -> str:
