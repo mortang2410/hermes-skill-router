@@ -429,26 +429,171 @@ def test_disabled_unsupported_modes_preserve_payload_and_defer_warning(
 def test_no_catalog_first_then_supported_still_delivers_warning(
     plugin_module, endpoints, tmp_path
 ):
-    """Round 3 P1: a no-catalog request must not permanently suppress delivery."""
+    """Round 4 P1: the first no-catalog supported turn must deliver the warning.
+
+    Supersedes the pin that expected ``None`` here: a supported request that
+    produces no rewrite still has a valid messages channel, so the pending
+    warnings ride on the original request and the first supported turn
+    delivers; only unsupported or malformed requests defer.
+    """
     settings = settings_for(endpoints, tmp_path / "suggestions.json")
     settings["showSuggestions"] = False
     settings["cachePath"] = str(tmp_path / "index.json")
     callback = _callback_for(plugin_module, settings)
 
     no_catalog = {"messages": [{"role": "user", "content": "hi"}], "model": "test-model"}
-    assert callback(request=no_catalog, **DISPATCH_KWARGS) is None
+    first = callback(request=no_catalog, **DISPATCH_KWARGS)
+    assert first is not None, "the first supported turn must deliver, not return None"
+    assert set(first) == {"request"}
+    messages = first["request"]["messages"]
+    assert messages[0] == {"role": "user", "content": "hi"}, "the original request stays intact"
+    assert messages[-1]["role"] == "system"
+    assert "showSuggestions" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
 
     result = callback(request=chat_payload(), **DISPATCH_KWARGS)
     assert result is not None
     messages = result["request"]["messages"]
-    assert any(
+    assert not any(
         "showSuggestions" in message.get("content", "") and " is off; " in message.get("content", "")
         for message in messages
         if isinstance(message, dict)
-    ), "the supported request after a no-catalog request must still deliver"
+    ), "delivery was acknowledged on the first supported turn"
     # Repeat supported turns are suppressed after first delivery: the routed
     # block is already injected, so the callback returns None.
     assert callback(request=result["request"], **DISPATCH_KWARGS) is None
+
+
+def _warning_messages(result):
+    """Return the switch-warning messages carried by a middleware result."""
+    if not isinstance(result, dict):
+        return []
+    request = result.get("request")
+    if not isinstance(request, dict):
+        return []
+    return [
+        message
+        for message in request.get("messages", [])
+        if isinstance(message, dict)
+        and " is off; " in message.get("content", "")
+        and message.get("content", "").startswith(("enabled: ", "showSuggestions: "))
+    ]
+
+
+def test_every_no_rewrite_path_delivers_on_the_first_supported_turn(
+    plugin_module, endpoints, tmp_path, monkeypatch
+):
+    """Round 4 P1: every no-rewrite path delivers pending warnings at most once.
+
+    The rewrite returns ``None`` for no catalog, an already-injected block, a
+    first failure, unsupported modes, and internal exceptions. Each first
+    supported turn delivers once (unsupported and malformed requests defer
+    instead), and every later turn is suppressed after that delivery.
+    """
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    callback = _callback_for(plugin_module, settings)
+
+    def fresh_cache():
+        for name in ("index.json", "config-switches.json", "suggestions.json"):
+            path = tmp_path / name
+            if path.exists():
+                path.unlink()
+        # The plugin module's own search instance (the autouse fixture clears
+        # only the `hermes_skill_router.search` instance), so a first-failure
+        # dump mark from one scenario cannot leak into the next or the next test.
+        prefix = plugin_module.__name__ + "."
+        for name, module in list(sys.modules.items()):
+            if (
+                name.startswith(prefix)
+                and name.endswith(".search")
+                and hasattr(module, "clear_dumps")
+            ):
+                module.clear_dumps()
+        return callback
+
+    # No catalog (first request carries no catalog section).
+    fresh_cache()
+    no_catalog = {"messages": [{"role": "user", "content": "hi"}], "model": "test-model"}
+    first = callback(request=no_catalog, **DISPATCH_KWARGS)
+    assert _warning_messages(first), "no-catalog first turn must deliver"
+    assert callback(request=first["request"], **DISPATCH_KWARGS) is None
+
+    # Already injected (the last message already carries the block): the
+    # warning goes before the trailing block, which stays last.
+    fresh_cache()
+    injected = chat_payload()
+    first = callback(request=injected, **DISPATCH_KWARGS)
+    block = first["request"]["messages"][-1]
+    assert block["content"].startswith("Skills routed for this request")
+    assert _warning_messages(first), "first routed turn must deliver"
+    already = {**injected, "messages": first["request"]["messages"]}
+    assert callback(request=already, **DISPATCH_KWARGS) is None
+
+    # First failure (no user text): the rewrite returns None and the warning
+    # rides on the original request, which keeps its catalog untouched.
+    fresh_cache()
+    no_user_text = {
+        "model": "test-model",
+        "messages": [message for message in chat_payload()["messages"] if message["role"] != "user"],
+    }
+    first = callback(request=no_user_text, **DISPATCH_KWARGS)
+    assert _warning_messages(first), "first-failure turn must deliver"
+    assert first["request"]["messages"][0]["content"] == chat_payload()["messages"][0]["content"]
+    # The delivered warning suppresses the next turn even on this path: a
+    # request that already carries it gets no second copy (a dropped-marker
+    # rewrite may carry the input's message through, never append a new one),
+    # and a fresh payload gets none either.
+    second = callback(request=first["request"], **DISPATCH_KWARGS)
+    assert len(_warning_messages(second)) <= len(_warning_messages(first)), (
+        "the delivered warning must not be delivered twice on this path"
+    )
+    fresh = {
+        "model": "test-model",
+        "messages": [m for m in chat_payload()["messages"] if m["role"] != "user"],
+    }
+    fresh_result = callback(request=fresh, **DISPATCH_KWARGS)
+    assert not _warning_messages(fresh_result), "a fresh turn after delivery stays suppressed"
+
+    # Unsupported modes defer: the payload is preserved and delivery stays pending.
+    fresh_cache()
+    for mode in ("anthropic_messages", "codex_responses"):
+        payload = chat_payload()
+        payload["api_mode"] = mode
+        assert callback(
+            request=payload,
+            api_mode=mode,
+            **{k: v for k, v in DISPATCH_KWARGS.items() if k != "api_mode"},
+        ) is None, f"unsupported mode {mode} must not deliver"
+    supported = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert _warning_messages(supported), "the first supported turn after deferral delivers"
+    assert callback(request=supported["request"], **DISPATCH_KWARGS) is None
+
+    # Malformed requests (no messages list) defer the same way.
+    fresh_cache()
+    assert callback(request={"model": "test-model"}, **DISPATCH_KWARGS) is None
+    assert callback(
+        request={"model": "test-model", "messages": "not-a-list"}, **DISPATCH_KWARGS
+    ) is None
+    first = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert _warning_messages(first), "malformed turns defer; the next supported turn delivers"
+
+    # Internal exception: the rewrite's own guard (router.py) returns None
+    # when anything inside the pipeline raises; the first supported turn
+    # still delivers on the original request, never a lost call.
+    fresh_cache()
+    router_globals = plugin_module.rewrite.__globals__
+    real_forget = router_globals["forget_session"]
+
+    def _raising_forget(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(router_globals, "forget_session", _raising_forget)
+    first = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert _warning_messages(first), "an internal failure must still deliver"
+    monkeypatch.setitem(router_globals, "forget_session", real_forget)
+    recovered = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert not _warning_messages(recovered), "recovery turn carries no second warning"
 
 
 def test_tool_first_load_then_supported_still_delivers_warning(
@@ -491,6 +636,32 @@ def test_hidden_suggestions_inject_the_switch_warning_with_the_block(
     assert warning["role"] == "system"
     assert "showSuggestions" in warning["content"] and " is off; " in warning["content"]
     assert not (tmp_path / "suggestions.json").exists()
+
+
+def test_both_empty_paths_deliver_the_warning_through_the_middleware(
+    plugin_module, endpoints, tmp_path, monkeypatch
+):
+    """Round 4 gap: both paths empty still delivers through the middleware, not just at load.
+
+    With ``suggestionsPath`` and ``cachePath`` both empty, the switch warning must
+    reach the model on the first supported request and stay suppressed after
+    that delivery; the persisted set lives beside the index cache, independent
+    of the disabled display.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["suggestionsPath"] = ""
+    settings["cachePath"] = ""
+    callback = _callback_for(plugin_module, settings)
+
+    first = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert _warning_messages(first), "the first supported request delivers"
+    assert (tmp_path / ".cache" / "hermes-skill-router" / "config-switches.json").exists()
+    assert callback(request=first["request"], **DISPATCH_KWARGS) is None, (
+        "after delivery the same both-empty request stays suppressed"
+    )
 
 
 def test_a_payload_without_user_text_comes_out_unchanged_through_the_callback(

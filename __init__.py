@@ -151,11 +151,13 @@ def _route(
     Pending no-record switch warnings ride on the outgoing request as standalone system
     messages, before the disabled early return and after a rewrite alike, so the one channel
     that reaches the model carries the warning that the terminal and the host logger already
-    showed. A request without a messages list, a rewrite that returns ``None`` (no catalog,
-    unsupported mode, first failure, already injected), or an unsupported api mode on the
-    disabled path has no supported channel to carry them: the payload stays untouched and
-    the delivered fingerprint is not consumed, so a later supported request still delivers.
-    Only an outgoing request that actually carries the messages acknowledges delivery.
+    showed. When the rewrite returns ``None`` (no catalog, unsupported mode, first failure,
+    already injected, an exception) the warnings ride on the original request instead, under
+    the same supported-channel gate as the disabled path below, so the first supported turn
+    still delivers. A request without a messages list or with an unsupported api mode has no
+    supported channel to carry them: the payload stays untouched and the delivered
+    fingerprint is not consumed, so a later supported request still delivers. Only an
+    outgoing request that actually carries the messages acknowledges delivery.
     """
     cfg = load(read_settings(ctx))
     switch_messages = switch_warning_messages(cfg)
@@ -170,8 +172,18 @@ def _route(
         request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
     )
     if not isinstance(result, Mapping):
-        # No catalog, unsupported mode, first failure, or already injected:
-        # nothing was delivered, so the injected fingerprint stays pending.
+        # No catalog, first failure, already injected, or an exception inside the
+        # rewrite: the original request is still a supported channel (chat mode
+        # with a messages list), so the first supported turn delivers there and
+        # the delivered fingerprint is consumed only when that delivery lands.
+        # Unsupported or malformed requests keep their payload untouched and
+        # leave delivery pending for the next supported request.
+        delivered = _with_switch_messages(request, switch_messages, api_mode=api_mode)
+        if delivered is not None:
+            acknowledge_switch_deliveries(
+                [message["content"] for message in switch_messages], cfg.cache_path
+            )
+            return delivered
         return result
     rewritten = result.get("request")
     if not switch_messages or not isinstance(rewritten, Mapping):
@@ -190,11 +202,14 @@ def _route(
 def _with_switch_messages(request: Any, switch_messages: Any, api_mode: str = "chat_completions") -> Any:
     """Return *request* with *switch_messages* appended, or ``None`` when there is no channel.
 
-    Used on the disabled path, where the rewrite never runs: the switch warning still reaches
-    the provider request even though routing and the display record are off. Unsupported
-    modes (Anthropic Messages, Responses) have no system-message channel in ``messages``,
-    so the payload is preserved untouched and the warning is deferred until a supported
-    channel exists; delivery is not acknowledged on this path.
+    Used on the disabled path, where the rewrite never runs, and on the enabled path when
+    the rewrite returns ``None``: the switch warning still reaches the provider request
+    even though routing and the display record are off or the rewrite left the request
+    unchanged. Unsupported modes (Anthropic Messages, Responses) have no system-message
+    channel in ``messages``, so the payload is preserved untouched and the warning is
+    deferred until a supported channel exists; delivery is not acknowledged on this path.
+    A trailing suggestion block stays last (see :func:`_carrying_switch_messages`), so the
+    rewrite's replay guard still recognises the request as already injected next turn.
     """
     if not switch_messages or not isinstance(request, Mapping):
         return None
@@ -204,7 +219,7 @@ def _with_switch_messages(request: Any, switch_messages: Any, api_mode: str = "c
     messages = request.get("messages")
     if not isinstance(messages, list):
         return None
-    return {"request": {**dict(request), "messages": [*list(messages), *switch_messages]}}
+    return {"request": {**dict(request), "messages": _carrying_switch_messages(messages, switch_messages)}}
 
 
 def _carrying_switch_messages(messages: Any, switch_messages: Any) -> list:

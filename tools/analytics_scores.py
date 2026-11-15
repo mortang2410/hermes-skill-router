@@ -499,14 +499,20 @@ def embed_texts(
     *model* and *timeout_s* are the run's own ``embedModelId`` and
     ``embedTimeoutMs`` (as seconds): the replay must use the same vector
     space and the same bound the router used. Both are optional CLI
-    inputs defaulting to the run config's values (``config.embed_model_id``
-    / ``cfg.embed_timeout_ms`` through ``load({})``), so the documented
-    invocation works unchanged and still replays in the same space. The
-    request reuses the router embed client's
-    redirect-refusing opener; the response is used only when it carries
-    exactly one non-empty vector per input at one common width. An
-    unreachable endpoint and an unusable body both fail with the named embed
-    error, never a partial result, and nothing is retried.
+    inputs defaulting to the workspace config's values (the
+    ``plugins.entries.hermes-skill-router.settings`` entry in
+    ``$HERMES_HOME/config.yaml``, default ``~/.hermes/config.yaml``),
+    falling back to the builtin defaults where no custom config exists,
+    so the documented invocation works unchanged and still replays in
+    the same space. The explicit flags always override the workspace
+    config. The workspace file is read as data only: no ``config.load``
+    runs in this process, so a read-only analytics run never writes the
+    router's warning-suppression state. The request reuses the router
+    embed client's redirect-refusing opener; the response is used only
+    when it carries exactly one non-empty vector per input at one
+    common width. An unreachable endpoint and an unusable body both
+    fail with the named embed error, never a partial result, and
+    nothing is retried.
     """
     vectors: List[List[float]] = []
     for start in range(0, len(texts), BATCH_TEXTS):
@@ -689,14 +695,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--embed-model",
         default=None,
         help="the embedModelId value the logged run used (the replay must stay in that "
-        "vector space); defaults to the run config's embed_model_id when omitted",
+        "vector space); defaults to the workspace config's embedModelId, then the "
+        "builtin default where no custom config exists, when omitted",
     )
     parser.add_argument(
         "--embed-timeout-ms",
         default=None,
         type=int,
         help="the embedTimeoutMs value the logged run used (100..60000); defaults to "
-        "the run config's embed_timeout_ms when omitted",
+        "the workspace config's embedTimeoutMs, then the builtin default where no "
+        "custom config exists, when omitted",
     )
     parser.add_argument(
         "--max-description-chars",
@@ -717,6 +725,98 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _workspace_config_path() -> Path:
+    """Return the workspace config path the router's plugin settings live in."""
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return Path(os.path.expanduser(home)) / "config.yaml"
+
+
+def _resolve_embed_defaults() -> Tuple[str, int]:
+    """Return ``(embed model, timeout ms)`` from the workspace config or the builtins.
+
+    The workspace config is the same file the router reads through the plugin
+    settings surface: ``plugins.entries.hermes-skill-router.settings`` in
+    ``$HERMES_HOME/config.yaml`` (default ``~/.hermes/config.yaml``). A missing
+    file, or a file naming no settings entry, means no custom config exists and
+    the builtin defaults apply. A file that cannot be read or parsed, or that
+    names an unusable ``embedModelId`` / ``embedTimeoutMs``, fails closed with
+    :class:`AnalyticsError` naming the problem. No ``config.load`` runs here:
+    ``load()`` persists the router's warning-suppression state, and a read-only
+    analytics run must never write it.
+    """
+    from hermes_skill_router.config import BOUNDS, DEFAULTS
+
+    default_model = str(DEFAULTS["embedModelId"])
+    default_timeout = int(DEFAULTS["embedTimeoutMs"])
+    timeout_min, timeout_max = (int(bound) for bound in BOUNDS["embedTimeoutMs"])
+    path = _workspace_config_path()
+    if not path.exists():
+        return default_model, default_timeout
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AnalyticsError(
+            f"analytics error: cannot read workspace config {path}: {exc}"
+        ) from exc
+    try:
+        import yaml
+    except ImportError as exc:
+        raise AnalyticsError(
+            f"analytics error: PyYAML is required to read workspace config {path}"
+        ) from exc
+    try:
+        data = yaml.safe_load(text)
+    except Exception as exc:  # malformed YAML: a named failure, never a silent default
+        raise AnalyticsError(
+            f"analytics error: cannot parse workspace config {path}: {exc}"
+        ) from exc
+    if data is None:
+        return default_model, default_timeout
+    if not isinstance(data, dict):
+        raise AnalyticsError(
+            f"analytics error: workspace config {path} must be a mapping, "
+            f"not {type(data).__name__}"
+        )
+
+    def _mapping(value: Any, where: str) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise AnalyticsError(
+                f"analytics error: workspace config {path}: {where} must be a "
+                f"mapping, not {type(value).__name__}"
+            )
+        return value
+
+    plugins = _mapping(data.get("plugins"), "plugins")
+    entries = _mapping(plugins.get("entries"), "plugins.entries")
+    entry = _mapping(entries.get("hermes-skill-router"), "plugins.entries.hermes-skill-router")
+    settings = _mapping(entry.get("settings"), "plugins.entries.hermes-skill-router.settings")
+    model = default_model
+    if "embedModelId" in settings:
+        named = settings["embedModelId"]
+        if not isinstance(named, str) or not named.strip():
+            raise AnalyticsError(
+                f"analytics error: workspace config {path}: embedModelId must name "
+                f"a non-empty model, not {named!r}"
+            )
+        model = named
+    timeout = default_timeout
+    if "embedTimeoutMs" in settings:
+        named_timeout = settings["embedTimeoutMs"]
+        if (
+            not isinstance(named_timeout, int)
+            or isinstance(named_timeout, bool)
+            or not timeout_min <= named_timeout <= timeout_max
+        ):
+            raise AnalyticsError(
+                f"analytics error: workspace config {path}: embedTimeoutMs must be "
+                f"between {timeout_min} and {timeout_max}, not {named_timeout!r}"
+            )
+        timeout = int(named_timeout)
+    return model, timeout
+
+
 def run(args: argparse.Namespace) -> List[str]:
     """Run the analysis and return the report lines to print."""
     if not 3 <= args.max_description_chars <= 4000:
@@ -724,18 +824,16 @@ def run(args: argparse.Namespace) -> List[str]:
             "analytics error: --max-description-chars must be between 3 and 4000, "
             f"not {args.max_description_chars}"
         )
-    # Resolve the run's embed model/timeout from the run config when the
-    # documented invocation omits them (config.embed_model_id /
-    # cfg.embed_timeout_ms defaults), so the documented command works
-    # unchanged and still replays in the same vector space.
+    # Resolve the run's embed model/timeout from the workspace config when the
+    # documented invocation omits them, so the documented command works
+    # unchanged and still replays in the same vector space as the logged run.
+    # The explicit flags always override the workspace config.
     if args.embed_model is None or args.embed_timeout_ms is None:
-        from hermes_skill_router.config import load as _load_config
-
-        cfg = _load_config({})
+        workspace_model, workspace_timeout = _resolve_embed_defaults()
         if args.embed_model is None:
-            args.embed_model = cfg.embed_model_id
+            args.embed_model = workspace_model
         if args.embed_timeout_ms is None:
-            args.embed_timeout_ms = cfg.embed_timeout_ms
+            args.embed_timeout_ms = workspace_timeout
     if not 100 <= args.embed_timeout_ms <= 60000:
         raise AnalyticsError(
             "analytics error: --embed-timeout-ms must be between 100 and 60000, "

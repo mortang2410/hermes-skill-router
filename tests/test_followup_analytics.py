@@ -416,6 +416,198 @@ def test_documented_invocation_verbatim_without_embed_flags(endpoint, tmp_path):
     assert result.stdout == explicit.stdout
 
 
+CUSTOM_MODEL = "custom-embed-model"
+CUSTOM_TIMEOUT_MS = 12345
+
+
+def _hermes_home(tmp_path, *, model=CUSTOM_MODEL, timeout_ms=CUSTOM_TIMEOUT_MS):
+    """Write a workspace config naming a nondefault embed model and timeout."""
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-skill-router:\n      settings:\n"
+        f"        embedModelId: {model}\n        embedTimeoutMs: {timeout_ms}\n",
+        encoding="utf-8",
+    )
+    return home
+
+
+def _multi_model_endpoint(model=CUSTOM_MODEL):
+    """An endpoint that only accepts *model* and records what it receives."""
+    received: List[str] = []
+
+    def responder(request):
+        payload = request.json()
+        received.append(str(payload.get("model")))
+        if str(payload.get("model")) != model:
+            return Response(body={"error": "wrong model space"}, status=400)
+        vectors = [embed_vector(text) for text in payload["input"]]
+        return Response(body={"data": [{"embedding": vector} for vector in vectors]})
+
+    server = FakeEndpoint(responder)
+    return server, received
+
+
+def _documented_command(endpoint, paths, *, model_flag=None, timeout_flag=None):
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--store", str(paths["store"]),
+        "--log", str(paths["log"]),
+        "--catalog", str(paths["catalog"]),
+        "--embed-url", f"{endpoint.base_url}/v1/embeddings",
+    ]
+    if model_flag is not None:
+        command += ["--embed-model", model_flag]
+    if timeout_flag is not None:
+        command += ["--embed-timeout-ms", str(timeout_flag)]
+    command += [
+        "--max-description-chars", "400",
+        "--state-db", str(paths["state"]),
+        "--assert-complete-source-history",
+    ]
+    return command
+
+
+def test_custom_workspace_model_replays_in_its_own_space(tmp_path, monkeypatch):
+    """Round 4 P2: the documented invocation replays in the run's own space.
+
+    The workspace config names a nondefault embed model and timeout; with no
+    embed flags, the script resolves them from the workspace config and an
+    endpoint that only knows the custom model accepts the run. The builtin
+    default model would be rejected by that endpoint (see the override test).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(_hermes_home(tmp_path)))
+    endpoint, received = _multi_model_endpoint()
+    try:
+        paths = make_case(tmp_path)
+        result = subprocess.run(
+            _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr
+        assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+        assert received and all(model == CUSTOM_MODEL for model in received), received
+    finally:
+        endpoint.close()
+
+
+def test_explicit_flags_override_the_workspace_config(tmp_path, monkeypatch):
+    """Round 4 P2: the explicit flags stay the override.
+
+    With the same custom workspace config, an explicit builtin model flag
+    replays in the builtin space, which the custom-only endpoint rejects.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(_hermes_home(tmp_path)))
+    endpoint, _received = _multi_model_endpoint()
+    try:
+        paths = make_case(tmp_path)
+        result = subprocess.run(
+            _documented_command(endpoint, paths, model_flag="bge-m3", timeout_flag=6000),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode != 0
+        assert "analytics embed error" in result.stderr, result.stderr
+    finally:
+        endpoint.close()
+
+
+def test_default_only_invocation_without_custom_config(endpoint, tmp_path, monkeypatch):
+    """Round 4 P2: with no custom config, the documented invocation uses the builtins."""
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hermes-skill-router\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    paths = make_case(tmp_path)
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+
+
+def test_unreadable_or_unusable_workspace_config_fails_closed(endpoint, tmp_path, monkeypatch):
+    """Round 4 P2: a bad workspace config is a named nonzero exit, never a silent default."""
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    paths = make_case(tmp_path)
+
+    (home / "config.yaml").write_text("plugins: [unclosed\n", encoding="utf-8")
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode != 0
+    assert "workspace config" in result.stderr, result.stderr
+
+    (home / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-skill-router:\n      settings:\n"
+        "        embedModelId: ''\n        embedTimeoutMs: 6000\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode != 0
+    assert "embedModelId" in result.stderr, result.stderr
+
+    (home / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-skill-router:\n      settings:\n"
+        "        embedModelId: bge-m3\n        embedTimeoutMs: 99\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode != 0
+    assert "embedTimeoutMs" in result.stderr, result.stderr
+
+
+def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypatch):
+    """Round 4 concern: the analytics process writes no persisted warning state.
+
+    Initialize and acknowledge a disabled-switch warning under an isolated
+    HOME, run the documented analytics command (no embed flags), then reload
+    disabled: the warning stays suppressed instead of recurring.
+    """
+    import logging
+
+    from hermes_skill_router.config import (
+        acknowledge_switch_deliveries,
+        load,
+        switch_warning_messages,
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_HOME", str(_hermes_home(tmp_path)))
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    settings = {"enabled": False, "cachePath": "", "suggestionsPath": ""}
+    cfg = load(settings)
+    notes = [
+        note
+        for note in cfg.notes
+        if note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
+    ]
+    assert len(notes) == 1
+    acknowledge_switch_deliveries(notes, "")
+    assert switch_warning_messages(load(settings)) == ()
+
+    env = {**__import__("os").environ, "HOME": str(tmp_path / "home"),
+           "HERMES_HOME": str(tmp_path / "hermes-home")}
+    paths = make_case(tmp_path)
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120, env=env
+    )
+    assert result.returncode == 0, result.stderr
+
+    reloaded = load(settings)
+    assert [n for n in reloaded.notes if " is off; " in n] == []
+    assert switch_warning_messages(reloaded) == ()
+
+
 def test_top5_prompts_per_skill_in_divergence_order(endpoint, tmp_path):
     """Top-5 is the five highest divergences, ties by query JSON ascending.
 

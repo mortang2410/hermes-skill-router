@@ -760,7 +760,13 @@ def acknowledge_switch_deliveries(notes: Sequence[str], cache_path: Any) -> None
     supported channel carries the messages. A load that never reached
     delivery (tool-first, no-catalog, first failure, unsupported mode)
     never calls this, so its fingerprints stay pending for the next
-    supported request.
+    supported request. An acknowledgment whose pending note is no longer
+    in the seen set for that switch is stale: a fix since the pending
+    note was produced cleared that switch's seen set, so the ack is
+    rejected (Deliver requires a prior Load, per the WarnSuppression
+    model) and a later re-break of the same value warns and delivers
+    again instead of being silently suppressed by the stale ack. The
+    seen set is re-read here, at ack time, so the check sees the fix.
     """
     if not notes:
         return
@@ -770,7 +776,11 @@ def acknowledge_switch_deliveries(notes: Sequence[str], cache_path: Any) -> None
             return
         seen_before, delivered_before = _read_switch_sets(path)
         union = delivered_before | {
-            _trap_key(note) for note in notes if isinstance(note, str) and _is_switch_note(note)
+            pair
+            for pair in (
+                _trap_key(note) for note in notes if isinstance(note, str) and _is_switch_note(note)
+            )
+            if pair in seen_before
         }
         if union != delivered_before:
             _write_switch_seen(path, seen_before, union)
