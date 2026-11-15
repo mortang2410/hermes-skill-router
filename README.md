@@ -131,8 +131,7 @@ no endpoint setting:
 
 ## Use
 
-A routed turn ends with one extra system message. The sample below carries suggestion rows first,
-then the pinned rows:
+A routed turn adds one system message. Suggestions come first, then pinned skills:
 
 ```
 Suggestions:
@@ -146,22 +145,19 @@ Pinned skills:
   path: <absolute path>
 ```
 
-Every suggestion and pinned row carries its name, its description and the path the host's skill lookup
-resolved, which is the file `skill_view` opens. Suggestions are best first, capped at
-`maxSuggestions`, where `0` means no cap. Pinned rows appear in the opening block, the block of a
-request whose messages carry no earlier router block; a request whose messages carry an earlier block
-carries the suggestions only, and a request whose earlier block a compaction removed is the opening
-block again and lists the pinned rows. Rows that `deferredSkills` leaves listed stay under an `Also
-listed:` marker on every turn and are never suggested. The model can open any row with `skill_view`,
-and `skills_list` still lists the whole catalog. When the shortlist misses, it can search by hand:
-`skill_router_search` takes any `query` in the model's own words and returns ranked names,
-descriptions and skill paths.
+Each row gives the skill's name, its description, and the path `skill_view` opens. Suggestions are
+best first. Pinned skills appear only in the first block of a conversation, or again after compaction
+removes an earlier block.
 
-The last decision also appears on screen, and neither place costs a token. The desktop app gets a
-`Skills routed` pane on the right rail, collapsed by default, with the names and one caption line. In
-`hermes --tui`, run `/skills-routed` to dock the widget, which reads the same record and shows the
-same names. Both show their caption only for a routed record. The record holds names only and never
-request text.
+Skills you keep listed with `deferredSkills` appear under `Also listed:`. If you do not set
+`deferredSkills`, that section never appears.
+
+The model can open any row with `skill_view`. `skills_list` still lists the whole catalog. If the
+shortlist misses, the model can search by hand with `skill_router_search`, using its own words.
+
+You also see the last decision on screen, at no token cost. The desktop app shows a `Skills routed`
+pane on the right rail, collapsed by default. In `hermes --tui`, run `/skills-routed` to dock the
+same names. The record holds names only, never your request text.
 
 ## Configuration
 
