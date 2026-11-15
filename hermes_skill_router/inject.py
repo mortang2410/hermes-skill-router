@@ -126,6 +126,7 @@ def render(
     one_shot: bool = False,
     opening: bool = False,
     paths: Optional[Dict[str, str]] = None,
+    note: str = "",
 ) -> str:
     """Return the block for *rows*, *kept* and *cfg*, or ``""`` when it would carry no row.
 
@@ -136,9 +137,14 @@ def render(
     in the same compaction window omits them. *paths* maps a name to the absolute read path the host
     lookup resolved, for both suggestions and pinned rows. *index* supplies the descriptions of
     suggested rows and may be ``None``, in which case they are listed by name only.
+    *note* is the turn's stored degraded line, or ``""`` when healthy: the same one line the
+    display record carries, so this block, the desktop pane and the TUI widget all show one state.
 
     A suggestion row with no absolute path is not rendered. A pinned row with no absolute path is
     omitted with one warning per process. The cap is not applied here: the selector applied it.
+    The note is appended as one final paragraph after the last section. It never starts with
+    ``- `` and never matches a section marker, so :func:`suggested_names` reads the same names
+    with or without it.
     """
     resolved = paths or {}
     descriptions = _descriptions(index)
@@ -183,6 +189,8 @@ def render(
         parts.append(PINNED + "\n" + "\n".join(pinned))
     if listed:
         parts.append(ALSO_LISTED + "\n" + "\n".join(listed))
+    if isinstance(note, str) and note.strip():
+        parts.append(note.strip())
     return "\n\n".join(parts)
 
 

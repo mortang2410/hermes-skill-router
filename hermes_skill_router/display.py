@@ -30,9 +30,10 @@ Rules that exist because a display must not cost a token or a crash:
 * Every failure is swallowed and logged once per process: the rewrite return value never depends on
   the display, and an unreadable file reads as ``None`` (idle) rather than raising in a reader.
 
-The record never appears in a provider request. :class:`~hermes_skill_router.router.rewrite` calls
-:func:`record` after it has built the payload it returns, so the display cannot add a message, a
-system-prompt section or a token.
+The record file never appears in a provider request, but its one degraded line does: the injected
+skills block carries the same note, so the model and every surface see one state. :class:`~hermes_skill_router.router.rewrite` calls
+:func:`record` after it has built the payload it returns, so the display file adds no message, a
+system-prompt section or token beyond that one line.
 """
 
 from __future__ import annotations

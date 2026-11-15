@@ -54,17 +54,21 @@ display record through :mod:`hermes_skill_router.display`: ``routed`` with the s
 names, or ``inert`` with no names. One degraded line rides on that record whenever routing is
 degraded: history incomplete with its skip state and heal outcome, missing BM25,
 fusion off, cache persistence off, budget expiry, dead endpoint, or a newly-seen
-config trap. Two states stay log-only and never ride that line until the
-follow-up grill board settles them: the dropped-catalog compaction window and the
-saved-index partial view (``library`` already logs the partial view). When a
+config trap. The dropped-catalog compaction window rides the failure tier whenever
+the turn is rejected because the catalog was already dumped in this window and no
+build failure pre-empts it; the saved-index partial view rides the degraded tier
+whenever the build refused a truncated catalog. A cold index build announces
+itself with a temporary build-in-progress record before ``load_or_build`` blocks.
+When a
 per-request call fails, contract C7's one line rides on the inert record instead,
 so the surfaces can say the endpoints were unreachable and no suggestions were made; with the live
 clients the setup-needed line
 (:func:`hermes_skill_router.setup_check.setup_note`), probed fresh every dead-endpoint turn,
 refines that line to name the failing ``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks
-the degraded chooser, so a failed turn never consumes the heal note. The note never enters the
-payload, so it costs no token, and a healthy turn adds nothing. The record is written after the
-payload is built and never enters it, so the display costs no token. A written record is announced
+the degraded chooser, so a failed turn never consumes the heal note. The note rides on the record
+and on the injected block, so every surface shows the same line, and a healthy turn adds nothing.
+The record file itself is written after the payload is built, so the display file costs no token
+beyond the one degraded line the block carries. A written record is announced
 on the plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
 
 A completed pass also writes one info line to the plugin log, beginning ``skill router: query=``.
@@ -96,7 +100,7 @@ from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
-from .library import Index, PathResolver, load_or_build, path_resolver
+from .library import Index, PathResolver, is_partial_view, load_or_build, path_resolver, will_embed
 from .rerank import rerank as default_rerank
 from .search import (
     BUDGET_EXPIRED,
@@ -132,6 +136,24 @@ BUDGET_NOTE = (
     "Routing budget exhausted; raise routingTimeoutMs or check server load. "
     "No suggestions were made this turn."
 )
+
+#: The catalog already went out in this compaction window (failure tier): the loss is that no
+#: suggestions were made, and the fix is the list tool, the same fix the dropped marker names.
+DROPPED_NOTE = (
+    "Skill catalog was already shown earlier in this compaction window, so no suggestions were "
+    "made this turn. Call skills_list to see every skill available."
+)
+
+#: The saved-index fallback (degraded tier): the loss may be stale suggestions, and the fix is
+#: removing the saved index so the next build replaces it.
+SAVED_INDEX_NOTE = (
+    "Catalog read was a partial view; routing fell back to the saved index, so suggestions may "
+    "be stale. Remove the saved index to force a rebuild."
+)
+
+#: The temporary cold-build announcement: written to the display record and broadcast before
+#: ``load_or_build`` blocks, and replaced by the settled record when the build finishes.
+BUILD_NOTE = "Building the skill index; suggestions will appear once the build finishes."
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
@@ -291,7 +313,14 @@ def _compose(
     if not partition.routed.names:
         # All-eager config: no pass can select anything. First pass is the allowed dump.
         return _fail("no routed skill to suggest")
+    built_index = index is None
     if index is None:
+        # A cold build announces itself before it blocks: the temporary
+        # build-in-progress record is written and broadcast now, so the desktop
+        # pane and the TUI show it while ``load_or_build`` embeds. The settled
+        # record below replaces it, so it never claims the build is still running.
+        if will_embed(cfg, partition.routed):
+            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=BUILD_NOTE)()
         # Snapshot the embed gate's failure count before the build, so the
         # note below is attributed to this build's own embed attempt only.
         endpoint = cfg.embed_base_url + cfg.embed_path
@@ -322,9 +351,10 @@ def _compose(
         return _fail("the skill index carries no row")
     if dropped_before or dumped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
-        # for the rest of the window even when ranking would succeed now. Log-only: the
-        # visible-line placement of this state is unsettled, so no note rides the record.
-        return _fail("catalog already dumped in this window")
+        # for the rest of the window even when ranking would succeed now. The dropped-window
+        # part rides this failed turn: every build failure above pre-empts this check, so this
+        # point is reached only when no build failure happened.
+        return _fail("catalog already dumped in this window", DROPPED_NOTE)
     # One memo for the whole pass: the recency gate and the selection both resolve through the
     # same saved map, so a candidate is looked up at most once a pass and never again once known.
     resolve = path_resolver(cfg, index, skill_path)
@@ -349,7 +379,11 @@ def _compose(
     # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
     # heal when it was incomplete. The degraded line is read once here, so every record this turn
     # writes carries the same line, and a failed pass never reaches here, so the dead-endpoint line outranks it.
-    note = _degraded_note(cfg, index=index)
+    note = _degraded_note(
+        cfg,
+        index=index,
+        partial_view=built_index and is_partial_view(cfg, partition.routed),
+    )
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
@@ -374,6 +408,7 @@ def _compose(
         partition.one_shot,
         opening=not previous,
         paths=paths,
+        note=note,
     )
     if not block:
         # No selected suggestion and no kept row: stripping without a replacement would lose the
