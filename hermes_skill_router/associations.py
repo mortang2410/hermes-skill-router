@@ -54,6 +54,7 @@ bit-identical: both apply the same recurrence to the same events in ``load_event
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -70,7 +71,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 logger = logging.getLogger(__name__)
 
 #: The schema version this build writes and the only one it opens.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: The pre-v2 schema version a writable open migrates to :data:`SCHEMA_VERSION`.
+SCHEMA_VERSION_V1 = 1
 
 #: The harness this store is for. A file that says anything else is refused.
 HARNESS = "hermes"
@@ -107,6 +111,30 @@ META_HARNESS = "harness"
 META_SCHEMA_VERSION = "schema_version"
 META_LAST_SCAN_MS = "last_scan_ms"
 META_CATALOG_FINGERPRINT = "catalog_fingerprint"
+
+#: The heal finished flag (C2): set when an uncapped backfill settles against a
+#: writable store and the write commits; absent otherwise. A restart reads it so
+#: no second heal starts while it is finished.
+META_HEAL_FINISHED = "heal_finished"
+
+#: The value the finished flag carries when it is set.
+HEAL_FINISHED_VALUE = "finished"
+
+#: Provenance that a destructive path erased load-event history. Written inside
+#: the destructive path's own transaction; its presence fails analytics replay
+#: coverage whatever the value. Migrated stores carry it from the stamp phase;
+#: fresh v2 stores carry none until a destructive path writes it.
+META_LAST_HISTORY_LOSS_MS = "last_history_loss_ms"
+
+#: Fresh-creation provenance, persisted by phase zero before any other DDL.
+#: Reads ``fresh`` for a store created under the v2 contract; never reset.
+META_CREATION_ORIGIN = "creation_origin"
+
+#: The value of :data:`META_CREATION_ORIGIN` for a store created fresh under v2.
+CREATION_ORIGIN_FRESH = "fresh"
+
+#: How long a writable opener waits for the migration lock before refusing.
+MIGRATION_LOCK_TIMEOUT_MS = 5000
 
 #: The evidence kinds the ``load_event`` schema admits.
 LOAD_EVIDENCE_KINDS: Tuple[str, ...] = ("tool", "slash", "skill_md_read")
@@ -234,6 +262,24 @@ CREATE TABLE IF NOT EXISTS association (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS association_term ON association (term);
+"""
+
+#: The v2 tables phase one of the v1 to v2 migration creates. ``scan_ledger``
+#: is the per-session source-finality proof the analytics replay coverage
+#: reads; ``seen_sessions`` retains session identities after source deletion.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS scan_ledger (
+  session_id           TEXT PRIMARY KEY,
+  scanned_max_row_id   INTEGER,
+  pending_calls        INTEGER NOT NULL,
+  unreadable_results   INTEGER NOT NULL,
+  unreadable_calls     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seen_sessions (
+  session_id    TEXT PRIMARY KEY,
+  started_at_ms INTEGER
+);
 """
 
 
@@ -712,12 +758,22 @@ def open_store(
     read_only: bool = False,
     busy_timeout_ms: int = BUSY_TIMEOUT_MS,
 ) -> AssociationStore:
-    """Open the association store, creating the schema on a fresh file.
+    """Open the association store, creating or migrating the schema when writable.
 
-    Raises :class:`AssociationStoreError` when the file belongs to another harness, when it is not a
-    version-1 database, when it was written by a newer schema, or when it is not a SQLite database at
-    all. Those are the four cases where writing would mix or destroy evidence, so none of them is
-    repaired silently.
+    A writable open creates a fresh v2 store (phase zero persists the
+    ``creation_origin`` provenance before any other DDL) or migrates a v1 store
+    to v2 in two phases; a half-migrated file resumes idempotently. A read-only
+    open never writes: it opens only a stamped v2 store and refuses a store
+    that needs migration by name.
+
+    Raises :class:`AssociationStoreError` with a named cause when the file
+    belongs to another harness (``harness``), is corrupt or not a database
+    (``corrupt``), cannot be written (``not-writable``), is locked by another
+    opener (``locked``), needs migration on a read-only open (``migration``),
+    is a malformed partial file with no valid provenance (``malformed``),
+    is stamped v2 but fails the v2 table self-check (``self-check``), was
+    written by a newer schema (``newer``), or is otherwise not a version-2
+    database. Every refusal leaves the file unmodified.
     """
     if harness != HARNESS:
         raise AssociationStoreError(
@@ -726,30 +782,156 @@ def open_store(
     try:
         conn = _connect(path, read_only, busy_timeout_ms)
     except sqlite3.Error as error:
-        raise AssociationStoreError(f"associations: cannot open {path}: {error}") from error
+        raise AssociationStoreError(
+            f"associations: cannot open {path}: {_open_cause(error)}"
+        ) from error
     try:
-        _configure(conn, path, read_only, busy_timeout_ms)
-        tables = _count_tables(conn)
-        if tables == 0:
-            if read_only:
-                raise AssociationStoreError(f"associations: {path} is not a version-1 database yet")
-            _migrate(conn, harness)
-        else:
-            _require_compatible(conn, harness)
-            version = _read_user_version(conn)
-            if version < SCHEMA_VERSION:
-                if read_only:
-                    raise AssociationStoreError(
-                        f"associations: {path} needs a migration this read-only open cannot apply"
-                    )
-                _migrate(conn, harness)
+        _configure_head(conn, busy_timeout_ms)
+        if read_only:
+            conn.execute("PRAGMA query_only = ON")
+        _open_schema(conn, path, harness, read_only)
+        if not read_only:
+            _configure_writable(conn, path)
     except AssociationStoreError:
         _close_quietly(conn)
         raise
     except sqlite3.Error as error:
         _close_quietly(conn)
-        raise AssociationStoreError(f"associations: {path} cannot be used: {error}") from error
+        raise AssociationStoreError(
+            f"associations: {path} {_open_cause(error)}"
+        ) from error
     return AssociationStore(conn=conn, path=path, harness=harness, read_only=read_only)
+
+
+def _open_cause(error: sqlite3.Error) -> str:
+    """Return the named open cause for one SQLite failure, never a bare message."""
+    message = str(error).lower()
+    if "not a database" in message or "file is encrypted" in message:
+        return f"is corrupt or not a database: {error}"
+    if "locked" in message or "busy" in message:
+        return f"is locked: {error}"
+    if (
+        "unable to open" in message
+        or "readonly" in message
+        or "read-only" in message
+    ):
+        return f"is not writable: {error}"
+    return f"cannot be used: {error}"
+
+
+def _open_schema(
+    conn: sqlite3.Connection, path: str, harness: str, read_only: bool
+) -> None:
+    """Create, migrate or open the schema for *conn* according to the file's state."""
+    try:
+        tables = _count_tables(conn)
+    except sqlite3.DatabaseError as error:
+        raise AssociationStoreError(
+            f"associations: {path} is corrupt or not a database: {error}"
+        ) from error
+    if tables == 0:
+        # No tables yet: either a fresh file or a zero-byte file. A garbage
+        # file never reaches here because _count_tables already failed.
+        if read_only:
+            raise AssociationStoreError(
+                f"associations: {path} is not a version-2 database yet"
+            )
+        _with_migration_lock(path, lambda: _create_locked(conn, harness, path))
+        return
+    meta = _read_meta_table(conn)
+    if meta is None:
+        raise AssociationStoreError(
+            "associations: the file is not a version-2 database (no meta table)"
+        )
+    version = _read_user_version(conn)
+    try:
+        declared = int(meta.get(META_SCHEMA_VERSION, str(version)))
+    except (TypeError, ValueError):
+        raise AssociationStoreError(
+            "associations: the file is not a version-2 database "
+            "(meta.schema_version is not a number)"
+        ) from None
+    if version == 0:
+        # A file no build ever stamped: fresh creation persists its provenance
+        # before the harness stamp, so an unstamped file resumes only when that
+        # key is valid; anything else is a malformed preexisting partial file.
+        # This check runs before the harness stamp check because a mid-creation
+        # file carries the provenance but not yet the harness row.
+        if meta.get(META_CREATION_ORIGIN) == CREATION_ORIGIN_FRESH:
+            if read_only:
+                raise AssociationStoreError(
+                    f"associations: {path} needs a migration this read-only open cannot apply"
+                )
+            _with_migration_lock(path, lambda: _create_locked(conn, harness, path))
+            return
+        raise AssociationStoreError(
+            f"associations: {path} is a malformed partial file with no valid provenance "
+            f"(user_version {version}, schema_version {declared})"
+        )
+    stored = meta.get(META_HARNESS)
+    if stored is None:
+        raise AssociationStoreError(
+            "associations: the file is not a version-2 database (no meta.harness)"
+        )
+    if stored != harness:
+        raise AssociationStoreError(
+            f"associations: the file belongs to the {stored} harness, so the {harness} router "
+            "refuses to write it"
+        )
+    if version > SCHEMA_VERSION:
+        raise AssociationStoreError(
+            f"associations: schema version {version} is newer than this build's {SCHEMA_VERSION}"
+        )
+    if version == SCHEMA_VERSION and declared == SCHEMA_VERSION:
+        _self_check_v2(conn, path)
+        return
+    if version == SCHEMA_VERSION or declared == SCHEMA_VERSION:
+        # Exactly one of the two stamps says v2 while the other does not, or a
+        # mismatched pair below v2: the stamp is not evidence, so refuse.
+        if version == SCHEMA_VERSION or declared != version:
+            raise AssociationStoreError(
+                f"associations: schema version {declared} in meta does not match "
+                f"user_version {version}"
+            )
+    if declared < 0 or declared > SCHEMA_VERSION or version < 0:
+        raise AssociationStoreError("associations: the file is not a version-2 database")
+    if version == SCHEMA_VERSION_V1 and declared == SCHEMA_VERSION_V1:
+        # A v1 store, or a half-migrated file whose phase two never committed.
+        if read_only:
+            raise AssociationStoreError(
+                f"associations: {path} needs a migration this read-only open cannot apply"
+            )
+        _with_migration_lock(path, lambda: _migrate_locked(conn, harness, path))
+        return
+    raise AssociationStoreError(
+        f"associations: {path} is a malformed partial file with no valid provenance "
+        f"(user_version {version}, schema_version {declared})"
+    )
+
+
+def _self_check_v2(conn: sqlite3.Connection, path: str) -> None:
+    """Refuse a v2-stamped store missing ``scan_ledger``/``seen_sessions`` or a column."""
+    required = {
+        "scan_ledger": (
+            "session_id",
+            "scanned_max_row_id",
+            "pending_calls",
+            "unreadable_results",
+            "unreadable_calls",
+        ),
+        "seen_sessions": ("session_id", "started_at_ms"),
+    }
+    for table, columns in required.items():
+        present = {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        missing = [column for column in columns if column not in present]
+        if missing:
+            raise AssociationStoreError(
+                f"associations: {path} failed the v2 self-check: table {table} "
+                f"is missing columns {', '.join(missing)}"
+            )
 
 
 def _connect(path: str, read_only: bool, busy_timeout_ms: int) -> sqlite3.Connection:
@@ -763,14 +945,29 @@ def _connect(path: str, read_only: bool, busy_timeout_ms: int) -> sqlite3.Connec
     )
 
 
-def _configure(conn: sqlite3.Connection, path: str, read_only: bool, busy_timeout_ms: int) -> None:
-    """Apply the pragmas one writer and its readers share."""
+def _configure_head(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
+    """Apply the pragmas that never modify the file (row shape, timeouts).
+
+    Classification (``_open_schema``) runs under these pragmas so a refused
+    open leaves the file byte-identical: WAL is configured only after the
+    schema is accepted.
+    """
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {max(0, int(busy_timeout_ms))}")
+
+
+def _configure(conn: sqlite3.Connection, path: str, read_only: bool, busy_timeout_ms: int) -> None:
+    """Apply the pragmas one writer and its readers share."""
+    _configure_head(conn, busy_timeout_ms)
     if read_only:
         conn.execute("PRAGMA query_only = ON")
         return
+    _configure_writable(conn, path)
+
+
+def _configure_writable(conn: sqlite3.Connection, path: str) -> None:
+    """Switch the accepted writable store to WAL."""
     row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
     mode = None if row is None else row[0]
     if str(mode).lower() != "wal":
@@ -799,23 +996,153 @@ def _require_writable(store: AssociationStore) -> None:
         raise AssociationStoreError("associations: this store is open read-only")
 
 
-def _migrate(conn: sqlite3.Connection, harness: str) -> None:
-    """Create schema version 1 on a fresh file and stamp its meta rows and user_version.
+def _migration_lock_path(path: str) -> str:
+    """Return the OS-level migration lock file beside the store at *path*."""
+    return os.path.expanduser(path) + ".migration.lock"
 
-    ``executescript`` commits any open transaction before it runs, so the schema is created first
-    and the stamp is written in one immediate transaction afterwards. A half-created schema
-    therefore never carries a version stamp.
+
+def _acquire_migration_lock(path: str) -> Any:
+    """Acquire the store's migration lock, waiting at most the bounded timeout.
+
+    The lock is an OS-level file lock, not a SQLite transaction lock, because it
+    must survive the phase-one DDL autocommit boundary. Raises
+    :class:`AssociationStoreError` naming ``locked`` when the timeout expires.
     """
+    lock_path = _migration_lock_path(path)
     try:
-        conn.executescript(SCHEMA_V1)
+        handle = open(lock_path, "a+")
+    except OSError as error:
+        raise AssociationStoreError(
+            f"associations: cannot open {path}: migration lock {lock_path}: {error}"
+        ) from error
+    deadline = time.monotonic() + max(0, MIGRATION_LOCK_TIMEOUT_MS) / 1000.0
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise AssociationStoreError(
+                    f"associations: {path} is locked: another opener holds the "
+                    "migration lock"
+                ) from None
+            time.sleep(0.01)
+
+
+def _with_migration_lock(path: str, work: Callable[[], None]) -> None:
+    """Run *work* while holding the migration lock for *path*, releasing it after."""
+    handle = _acquire_migration_lock(path)
+    try:
+        work()
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def _create_locked(conn: sqlite3.Connection, harness: str, path: str) -> None:
+    """Run fresh creation (or resume it) under the migration lock.
+
+    Phase zero persists the ``creation_origin`` provenance together with the
+    ``meta`` table in one transaction before any other DDL; phase one creates
+    every table; phase two stamps. A store a contender already stamped is
+    opened without re-creating anything.
+    """
+    if _is_stamped_v2(conn, harness):
+        return
+    _phase_zero_fresh(conn)
+    _phase_one_fresh_ddl(conn)
+    _phase_two_stamp(conn, harness, fresh=True, path=path)
+
+
+def _migrate_locked(conn: sqlite3.Connection, harness: str, path: str) -> None:
+    """Run the v1 to v2 migration under the migration lock, or open the result.
+
+    A contender that waited for the winner rechecks the schema here: if the
+    winner already stamped v2, it opens without migrating or reseeding.
+    """
+    if _is_stamped_v2(conn, harness):
+        return
+    _phase_one_v2_ddl(conn)
+    _phase_two_stamp(conn, harness, fresh=False, path=path)
+
+
+def _is_stamped_v2(conn: sqlite3.Connection, harness: str) -> bool:
+    """Return whether *conn* already reads as a stamped, compatible v2 store."""
+    try:
+        meta = _read_meta_table(conn)
+    except sqlite3.Error:
+        return False
+    if meta is None or meta.get(META_HARNESS) != harness:
+        return False
+    if _read_user_version(conn) != SCHEMA_VERSION:
+        return False
+    try:
+        return int(meta.get(META_SCHEMA_VERSION, "0")) == SCHEMA_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def _phase_zero_fresh(conn: sqlite3.Connection) -> None:
+    """Phase zero: create ``meta`` and persist ``creation_origin=fresh`` in one transaction."""
+    _stamp_transaction(
+        conn,
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        ((META_CREATION_ORIGIN, CREATION_ORIGIN_FRESH),),
+    )
+
+
+def _phase_one_fresh_ddl(conn: sqlite3.Connection) -> None:
+    """Phase one for fresh creation: every table, in one autocommitted script."""
+    try:
+        conn.executescript(SCHEMA_V1 + SCHEMA_V2)
+    except sqlite3.Error as error:
+        raise AssociationStoreError(
+            f"associations: schema migration {SCHEMA_VERSION} failed: {error}"
+        ) from error
+
+
+def _phase_one_v2_ddl(conn: sqlite3.Connection) -> None:
+    """Phase one for a migration: the v2 tables, in one autocommitted script."""
+    try:
+        conn.executescript(SCHEMA_V2)
+    except sqlite3.Error as error:
+        raise AssociationStoreError(
+            f"associations: schema migration {SCHEMA_VERSION} failed: {error}"
+        ) from error
+
+
+def _phase_two_stamp(
+    conn: sqlite3.Connection, harness: str, *, fresh: bool, path: str
+) -> None:
+    """Phase two: stamp version and (for migrated stores) seed the loss marker.
+
+    One ``BEGIN IMMEDIATE`` transaction stamps ``user_version``,
+    ``meta.schema_version`` and, only for a migrated origin, seeds
+    ``meta.last_history_loss_ms`` with the migration timestamp. Fresh creation
+    leaves the provenance key in place and seeds no marker.
+    """
+    rows = [
+        (META_HARNESS, harness),
+        (META_SCHEMA_VERSION, str(SCHEMA_VERSION)),
+    ]
+    defaults = [
+        (META_LAST_SCAN_MS, "0"),
+        (META_CATALOG_FINGERPRINT, ""),
+    ]
+    if not fresh:
+        rows.append((META_LAST_HISTORY_LOSS_MS, str(_now())))
+    try:
         conn.execute("BEGIN IMMEDIATE")
-        for key, value in (
-            (META_HARNESS, harness),
-            (META_SCHEMA_VERSION, str(SCHEMA_VERSION)),
-            (META_LAST_SCAN_MS, "0"),
-            (META_CATALOG_FINGERPRINT, ""),
-        ):
+        for key, value in rows:
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+        # Defaults are insert-or-ignore so a migrated store keeps its v1
+        # watermark and fingerprint; a fresh store gets its initial values.
+        for key, value in defaults:
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)", (key, value))
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.execute("COMMIT")
     except sqlite3.Error as error:
@@ -828,17 +1155,41 @@ def _migrate(conn: sqlite3.Connection, harness: str) -> None:
         ) from error
 
 
+def _stamp_transaction(
+    conn: sqlite3.Connection, ddl: str, rows: Sequence[Tuple[str, str]]
+) -> None:
+    """Run one DDL statement and stamp *rows* in a single immediate transaction."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(ddl)
+        for key, value in rows:
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+        conn.execute("COMMIT")
+    except sqlite3.Error as error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise AssociationStoreError(
+            f"associations: schema migration {SCHEMA_VERSION} failed: {error}"
+        ) from error
+
+
 def _require_compatible(conn: sqlite3.Connection, harness: str) -> None:
-    """Refuse a file that another harness owns, or that this build cannot read as version 1."""
+    """Refuse a file that another harness owns, or that this build cannot write.
+
+    Kept as the steady-v2 gate: a stamped v2 store with the right harness and
+    matching stamps passes (and carries the v2 tables); anything else raises.
+    """
     meta = _read_meta_table(conn)
     if meta is None:
         raise AssociationStoreError(
-            "associations: the file is not a version-1 database (no meta table)"
+            "associations: the file is not a version-2 database (no meta table)"
         )
     stored = meta.get(META_HARNESS)
     if stored is None:
         raise AssociationStoreError(
-            "associations: the file is not a version-1 database (no meta.harness)"
+            "associations: the file is not a version-2 database (no meta.harness)"
         )
     if stored != harness:
         raise AssociationStoreError(
@@ -850,10 +1201,8 @@ def _require_compatible(conn: sqlite3.Connection, harness: str) -> None:
         declared = int(meta.get(META_SCHEMA_VERSION, str(version)))
     except (TypeError, ValueError):
         raise AssociationStoreError(
-            "associations: the file is not a version-1 database (meta.schema_version is not a number)"
+            "associations: the file is not a version-2 database (meta.schema_version is not a number)"
         ) from None
-    if declared < 1:
-        raise AssociationStoreError("associations: the file is not a version-1 database")
     if declared != version:
         raise AssociationStoreError(
             f"associations: schema version {declared} in meta does not match user_version {version}"
@@ -861,6 +1210,10 @@ def _require_compatible(conn: sqlite3.Connection, harness: str) -> None:
     if version > SCHEMA_VERSION:
         raise AssociationStoreError(
             f"associations: schema version {version} is newer than this build's {SCHEMA_VERSION}"
+        )
+    if version != SCHEMA_VERSION:
+        raise AssociationStoreError(
+            f"associations: the file is not a version-2 database (user_version {version})"
         )
 
 
@@ -906,6 +1259,81 @@ def _meta_int(store: AssociationStore, key: str, default: int = 0) -> int:
         return int(raw) if raw is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def heal_finished(store: AssociationStore) -> bool:
+    """Return whether *store*'s persisted heal finished flag is set.
+
+    Read-only and never raises: a missing or unreadable flag reads as unset,
+    so a restart may retry rather than assume suppression.
+    """
+    try:
+        return read_meta(store, META_HEAL_FINISHED) == HEAL_FINISHED_VALUE
+    except Exception:
+        return False
+
+
+def _write_heal_finished(store: AssociationStore) -> None:
+    """Persist the heal finished flag in one committed transaction.
+
+    Raises when the write does not commit; the caller settles the attempt in
+    memory only and claims no cross-restart suppression.
+    """
+    _require_writable(store)
+
+    def work() -> None:
+        store.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (META_HEAL_FINISHED, HEAL_FINISHED_VALUE),
+        )
+
+    _transaction(store, work)
+
+
+def _clear_heal_finished(store: AssociationStore) -> None:
+    """Clear the heal finished flag in one committed transaction, when it is set."""
+    _require_writable(store)
+
+    def work() -> None:
+        store.conn.execute("DELETE FROM meta WHERE key = ?", (META_HEAL_FINISHED,))
+
+    _transaction(store, work)
+
+
+def _clear_persisted_heal_finished(store_path: str) -> None:
+    """Clear the persisted flag at *store_path* when one is set. Never raises.
+
+    Opens the store writable; a file that cannot be opened has no flag this
+    observation can clear (it is missing, unreadable, or mid-migration), so
+    the failure is silent. Callers on the turn path must never fail over it.
+    """
+    try:
+        store = open_store(store_path)
+    except Exception:
+        return
+    try:
+        if heal_finished(store):
+            _clear_heal_finished(store)
+    except Exception:
+        pass
+    finally:
+        store.close()
+
+
+def _heal_finished_persisted(store_path: str) -> bool:
+    """Return whether the file at *store_path* carries a finished heal flag.
+
+    Read-only and never raises: any open or read failure reads as unset, so a
+    launch the thread's writable open will judge is never suppressed wrongly.
+    """
+    try:
+        store = open_store(store_path, read_only=True)
+    except Exception:
+        return False
+    try:
+        return heal_finished(store)
+    finally:
+        store.close()
 
 
 def _skill_row(row: sqlite3.Row) -> SkillRow:
@@ -1147,11 +1575,22 @@ def upsert_prompts(store: AssociationStore, prompts: Sequence[PromptEventInput])
 
     def work() -> None:
         nonlocal count
-        for prompt in prompts:
-            _id, inserted = _insert_prompt(store, prompt)
-            count += 1 if inserted else 0
+        count = _insert_prompts(store, prompts)
 
     _transaction(store, work)
+    return count
+
+
+def _insert_prompts(store: AssociationStore, prompts: Sequence[PromptEventInput]) -> int:
+    """Insert *prompts* without opening a transaction; the caller owns it.
+
+    Returns how many were new. Shared by :func:`upsert_prompts` and the
+    single-transaction session writer.
+    """
+    count = 0
+    for prompt in prompts:
+        _id, inserted = _insert_prompt(store, prompt)
+        count += 1 if inserted else 0
     return count
 
 
@@ -1169,6 +1608,21 @@ def upsert_events(store: AssociationStore, events: Sequence[AssociationEvent]) -
     result = {"prompts": 0, "loads": 0, "duplicates": 0}
 
     def work() -> None:
+        _insert_events(store, events, result)
+
+    _transaction(store, work)
+    return UpsertReport(**result)
+
+
+def _insert_events(
+    store: AssociationStore, events: Sequence[AssociationEvent], result: Dict[str, int]
+) -> None:
+    """Insert *events* without opening a transaction; the caller owns it.
+
+    Accumulates the prompt/load/duplicate tally into *result*. Shared by
+    :func:`upsert_events` and the single-transaction session writer.
+    """
+    if True:
         for event in events:
             prompt_id, inserted = _insert_prompt(
                 store,
@@ -1213,9 +1667,6 @@ def upsert_events(store: AssociationStore, events: Sequence[AssociationEvent]) -
                 continue
             result["loads"] += 1
             _apply_load(store, skill.id, terms, event.strength, event.observed_ms, first_for_prompt)
-
-    _transaction(store, work)
-    return UpsertReport(**result)
 
 
 def _dedup_key(
@@ -1526,6 +1977,12 @@ def maintenance(
             "DELETE FROM prompt_event WHERE observed_ms < ?", (stamp - PROMPT_RETENTION_MS,)
         )
         counts["prompts"] = int(prompts.rowcount)
+        if counts["deleted"] or counts["prompts"]:
+            # A destructive purge records the loss in its own transaction.
+            store.conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (META_LAST_HISTORY_LOSS_MS, str(stamp)),
+            )
 
     _transaction(store, work)
     association_rows = recompute_associations(store)
@@ -1555,6 +2012,7 @@ def reset_associations(
     if store.read_only:
         raise AssociationStoreError("associations: reset needs a writable store")
     counts = {"skills": 0, "load_events_removed": 0, "association_rows_removed": 0}
+    stamp = _now()
     if skills is None:
 
         def clear_all() -> None:
@@ -1569,8 +2027,16 @@ def reset_associations(
             # and the watermark would make the next incremental pass skip every session on disk.
             write_meta(store, META_CATALOG_FINGERPRINT, "")
             write_meta(store, META_LAST_SCAN_MS, "0")
+            # A reset is a destructive path: record the loss and clear the heal
+            # flag in the same transaction (the creation provenance is never
+            # reset).
+            write_meta(store, META_LAST_HISTORY_LOSS_MS, str(stamp))
+            store.conn.execute("DELETE FROM meta WHERE key = ?", (META_HEAL_FINISHED,))
 
         _transaction(store, clear_all)
+        with _HEAL_LOCK:
+            _HEAL_STATE.pop(store.path, None)
+            _HEAL_FAILURES.pop(store.path, None)
         return ResetReport(**counts)
 
     targets = _resolve_reset_targets(store, skills)
@@ -1591,8 +2057,13 @@ def reset_associations(
                 f"DELETE FROM association WHERE skill_id IN ({placeholders})", params
             ).rowcount
         )
+        write_meta(store, META_LAST_HISTORY_LOSS_MS, str(stamp))
+        store.conn.execute("DELETE FROM meta WHERE key = ?", (META_HEAL_FINISHED,))
 
     _transaction(store, clear_selected)
+    with _HEAL_LOCK:
+        _HEAL_STATE.pop(store.path, None)
+        _HEAL_FAILURES.pop(store.path, None)
     recompute_associations(store)
     return ResetReport(**counts)
 
@@ -1616,14 +2087,14 @@ def delete_association_database(store: AssociationStore) -> None:
     """Delete the association database itself: the file, its WAL and its shared-memory sibling.
 
     This is the documented reset that loses only learned data. The store is closed by the call and
-    must not be used afterwards; reopening the path creates an empty version-1 database. A read-only
+    must not be used afterwards; reopening the path creates an empty version-2 database. A read-only
     handle refuses, because opening read-only is a promise not to destroy the file: open the store
     writable to delete it, which is what every other mutating entry point asks for.
     """
     _require_writable(store)
     path = store.path
     store.close()
-    for candidate in (path, path + "-wal", path + "-shm"):
+    for candidate in (path, path + "-wal", path + "-shm", _migration_lock_path(path)):
         if os.path.exists(candidate):
             os.unlink(candidate)
 
@@ -1682,6 +2153,7 @@ class BackfillReport:
     rejected: Dict[str, int] = field(default_factory=dict)
     ambient_loads: int = 0
     unreadable_results: int = 0
+    unreadable_calls: int = 0
     last_scan_ms: int = 0
     ms: int = 0
 
@@ -1697,6 +2169,7 @@ class _Session:
     id: str
     source: str
     stamp_ms: int
+    started_at_ms: int = 0
 
 
 @dataclass
@@ -1832,6 +2305,7 @@ def backfill(
     try:
         sessions = _list_sessions(source, max_sessions)
         report.sessions_found = _count_sessions(source)
+        _upsert_seen_sessions(store, sessions)
         before = _last_load_id(store)
         for session in sessions:
             rows = _session_rows(source, session.id)
@@ -1840,7 +2314,17 @@ def backfill(
                 report.sessions_skipped += 1
                 continue
             if not rows:
-                report.skip_reasons["no-messages"] += 1
+                # A message-less session still commits its empty-scan ledger
+                # revision (zero counters, NULL scanned id) so coverage can
+                # prove it; it counts as skipped only for load learning.
+                try:
+                    _write_session(
+                        store, session, _scan_session(session, rows, resolver), report
+                    )
+                except sqlite3.Error:
+                    report.skip_reasons["write-failed"] += 1
+                else:
+                    report.skip_reasons["no-messages"] += 1
                 report.sessions_skipped += 1
                 continue
             try:
@@ -1852,7 +2336,8 @@ def backfill(
                 report.skip_reasons["write-failed"] += 1
                 report.sessions_skipped += 1
                 continue
-            report.unreadable_results += scan["unreadable"]
+            report.unreadable_results += scan["unreadable_results"]
+            report.unreadable_calls += scan["unreadable_calls"]
             report.sessions_scanned += 1
             report.last_scan_ms = max(report.last_scan_ms, session.stamp_ms)
     finally:
@@ -1950,17 +2435,45 @@ def heal_store(
     the conditions that asks for the job. ``state_db_path`` defaults to
     :func:`default_state_db_path`, the only path this build reads; a later ``_Spec`` settings row
     for it would be threaded through here.
+
+    A settle whose store cannot be opened propagates before any flag write, so
+    no suppression is claimed for it; a settle whose flag write fails leaves
+    ``meta`` unchanged (an ok backfill still returns its report, a failed one
+    re-raises its own failure).
     """
     store = open_store(os.path.expanduser(store_path))
     try:
-        return backfill(
-            store,
-            state_db_path or default_state_db_path(),
-            catalog=catalog,
-            now_ms=now_ms,
-        )
+        try:
+            report = backfill(
+                store,
+                state_db_path or default_state_db_path(),
+                catalog=catalog,
+                now_ms=now_ms,
+            )
+        except Exception:
+            _settle_flag_best_effort(store, store_path)
+            raise
+        _settle_flag_best_effort(store, store_path)
+        return report
     finally:
         store.close()
+
+
+def _settle_flag_best_effort(store: AssociationStore, store_path: str) -> None:
+    """Persist the finished flag for a settled uncapped backfill. Never raises.
+
+    A write failure is logged and leaves ``meta`` unchanged: the attempt is
+    settled in memory only and a restart may retry, so no cross-restart
+    suppression is claimed for it.
+    """
+    try:
+        _write_heal_finished(store)
+    except Exception as exc:
+        logger.warning(
+            "skill associations: the finished flag for %s could not be written: %s",
+            store_path,
+            exc,
+        )
 
 
 def request_heal(
@@ -1984,6 +2497,12 @@ def request_heal(
     thread that cannot start is a failed heal: it warns in the host logger and leaves contract C5's
     one-line failure note pending, exactly as a failed pass does.
     """
+    # Across a restart the in-memory latch is empty, so the persisted finished
+    # flag is the gate: while it reads finished no second heal starts until
+    # the store is observed complete once (:func:`note_store_complete` clears
+    # the flag). An unreadable flag reads as unset, so the launch is retried.
+    if _heal_finished_persisted(store_path):
+        return False
     entry = heal_store
     with _HEAL_LOCK:
         if _HEAL_STATE.get(store_path) is not None:
@@ -2016,12 +2535,17 @@ def note_store_complete(store_path: str) -> None:
     A running attempt keeps its marker: the job's own thread settles it and clears it if the pass
     made the store complete. A pending failure note is dropped here too, because a complete store
     is evidence that the failure the note reported no longer holds. A store that is complete with
-    no attempt recorded stays without one.
+    no attempt recorded stays without one. When no attempt is running, the persisted finished
+    flag is cleared with the in-memory one; while an attempt is running the flag is left
+    untouched and the running attempt survives until it settles. Never raises.
     """
     with _HEAL_LOCK:
         _HEAL_FAILURES.pop(store_path, None)
-        if _HEAL_STATE.get(store_path) != _HEAL_RUNNING:
+        running = _HEAL_STATE.get(store_path) == _HEAL_RUNNING
+        if not running:
             _HEAL_STATE.pop(store_path, None)
+    if not running:
+        _clear_persisted_heal_finished(store_path)
 
 
 def heal_state(store_path: str) -> Optional[str]:
@@ -2159,20 +2683,40 @@ def _list_sessions(source: sqlite3.Connection, max_sessions: Optional[int]) -> L
     """Return the session rows to read, newest first, bounded when asked."""
     limit = "" if max_sessions is None else f" LIMIT {max(0, int(max_sessions))}"
     rows = source.execute(
-        f"""SELECT id, source, COALESCE(last_activity_at, started_at) AS stamp
+        f"""SELECT id, source, started_at,
+                   COALESCE(last_activity_at, started_at) AS stamp
             FROM sessions ORDER BY stamp DESC, id DESC{limit}"""
     ).fetchall()
     sessions: List[_Session] = []
     for row in rows:
         stamp = row["stamp"]
+        started = row["started_at"]
         sessions.append(
             _Session(
                 id=str(row["id"]),
                 source=str(row["source"] or ""),
                 stamp_ms=int(round(float(stamp) * 1000)) if stamp is not None else 0,
+                started_at_ms=int(round(float(started) * 1000))
+                if started is not None
+                else 0,
             )
         )
     return sessions
+
+
+def _upsert_seen_sessions(store: AssociationStore, sessions: Sequence[_Session]) -> None:
+    """Record every listed session in ``seen_sessions`` (start time immutable)."""
+    if not sessions:
+        return
+    _require_writable(store)
+
+    def work() -> None:
+        store.conn.executemany(
+            "INSERT OR IGNORE INTO seen_sessions (session_id, started_at_ms) VALUES (?, ?)",
+            [(session.id, session.started_at_ms) for session in sessions],
+        )
+
+    _transaction(store, work)
 
 
 def _session_rows(source: sqlite3.Connection, session_id: str) -> Optional[List[sqlite3.Row]]:
@@ -2225,11 +2769,21 @@ def _scan_session(
     eligible: List[_Prompt] = []
     loads: List[_Load] = []
     pending: Dict[str, Dict[str, Any]] = {}
+    unrelated_calls: set = set()
     skill_md_seen: set = set()
     prompt: Optional[_Prompt] = None
     resets: List[int] = []
-    unreadable = 0
+    unreadable_results = 0
+    unreadable_calls = 0
+    scanned_max_row_id: Optional[int] = None
     for position, row in enumerate(rows):
+        row_id = row["id"]
+        if isinstance(row_id, int) and not isinstance(row_id, bool):
+            scanned_max_row_id = (
+                row_id
+                if scanned_max_row_id is None
+                else max(scanned_max_row_id, row_id)
+            )
         role = str(row["role"] or "")
         stamp = _stamp_of(row["timestamp"])
         if role == "user":
@@ -2240,19 +2794,33 @@ def _scan_session(
                 resets.append(position)
             prompt = updated
         elif role == "assistant":
-            pending.update(_pending_calls(row, position, stamp))
+            classified, unrelated, malformed = _classify_calls(row, position, stamp)
+            pending.update(classified)
+            unrelated_calls.update(unrelated)
+            unreadable_calls += malformed
         elif role == "tool":
             call_id = row["tool_call_id"]
-            call = pending.pop(str(call_id), None) if call_id is not None else None
+            key = str(call_id) if call_id is not None else None
+            call = pending.pop(key, None) if key is not None else None
             if call is not None:
-                unreadable += _resolve_tool_result(row, call, resolver, loads, skill_md_seen)
+                unreadable_results += _resolve_tool_result(
+                    row, call, resolver, loads, skill_md_seen
+                )
+            elif key is not None and key in unrelated_calls:
+                pass  # a matched unrelated result is valid, never unreadable
+            else:
+                unreadable_results += 1
     return {
         "origin": origin,
         "prompts": prompts,
         "eligible": eligible,
         "loads": loads,
         "resets": resets,
-        "unreadable": unreadable,
+        "unreadable": unreadable_results,
+        "unreadable_results": unreadable_results,
+        "unreadable_calls": unreadable_calls,
+        "pending_calls": len(pending),
+        "scanned_max_row_id": scanned_max_row_id,
     }
 
 
@@ -2336,18 +2904,38 @@ def _slash_name(text: str) -> Optional[str]:
     return name if len(name) >= 2 else None
 
 
-def _pending_calls(
+def _classify_calls(
     row: sqlite3.Row, position: int, stamp: int
-) -> Dict[str, Dict[str, Any]]:
-    """Return the ``skill_view`` and ``read_file`` calls of one assistant row, keyed by call id."""
+) -> Tuple[Dict[str, Dict[str, Any]], set, int]:
+    """Classify one assistant row's ``tool_calls``.
+
+    Returns (pending relevant calls by call id, parsed unrelated call ids,
+    unreadable-call count). A call with a missing name or call id, a malformed
+    payload, a ``skill_view`` with unparseable arguments or no valid name, or
+    a ``read_file`` with an unparseable or missing required path counts
+    unreadable instead of being silently dropped. A valid name-only
+    ``skill_view`` is classifiable (the file path is optional); any other
+    valid call is a parsed unrelated call that a matched result can answer.
+    """
     pending: Dict[str, Dict[str, Any]] = {}
-    for call in _tool_calls(row["tool_calls"]):
+    unrelated: set = set()
+    unreadable = 0
+    calls, malformed = _tool_calls(row["tool_calls"])
+    unreadable += malformed
+    for call in calls:
         name = call.get("name")
         call_id = call.get("call_id")
-        if not isinstance(name, str) or not isinstance(call_id, str):
+        if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+            unreadable += 1
             continue
         arguments = call.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
         if name == "skill_view":
+            selector = arguments.get("name")
+            if not isinstance(selector, str) or not selector:
+                unreadable += 1
+                continue
             pending[call_id] = {
                 "kind": "skill_view",
                 "file_path": arguments.get("file_path"),
@@ -2356,8 +2944,24 @@ def _pending_calls(
             }
         elif name == "read_file":
             entry = _read_file_pending(arguments)
-            if entry is not None:
-                pending[call_id] = {**entry, "position": position, "stamp": stamp}
+            if entry is None:
+                file_path = arguments.get("file_path") or arguments.get("path")
+                if not isinstance(file_path, str) or not file_path:
+                    unreadable += 1
+                else:
+                    unrelated.add(call_id)
+                continue
+            pending[call_id] = {**entry, "position": position, "stamp": stamp}
+        else:
+            unrelated.add(call_id)
+    return pending, unrelated, unreadable
+
+
+def _pending_calls(
+    row: sqlite3.Row, position: int, stamp: int
+) -> Dict[str, Dict[str, Any]]:
+    """Return the ``skill_view`` and ``read_file`` calls of one assistant row, keyed by call id."""
+    pending, _unrelated, _unreadable = _classify_calls(row, position, stamp)
     return pending
 
 
@@ -2381,26 +2985,32 @@ def _read_file_pending(arguments: Any) -> Optional[Dict[str, Any]]:
     return {"kind": kind, "file_path": file_path}
 
 
-def _tool_calls(raw: Any) -> List[Dict[str, Any]]:
+def _tool_calls(raw: Any) -> Tuple[List[Dict[str, Any]], int]:
     """Return the tool calls of one assistant row as ``{name, call_id, arguments}`` dicts.
 
     A malformed row yields no calls rather than failing the session: one odd record must not stop a
-    walk over the whole store.
+    walk over the whole store. The second value counts the items that could
+    not be read as calls at all (a payload that does not parse, a non-list
+    payload, an item with no function), so the caller can record them as
+    unreadable calls rather than dropping them.
     """
     if not isinstance(raw, str) or not raw.strip():
-        return []
+        return [], 0
     try:
         parsed = json.loads(raw)
     except ValueError:
-        return []
+        return [], 1
     if not isinstance(parsed, list):
-        return []
+        return [], 1
     calls: List[Dict[str, Any]] = []
+    unreadable = 0
     for item in parsed:
         if not isinstance(item, dict):
+            unreadable += 1
             continue
         function = item.get("function")
         if not isinstance(function, dict):
+            unreadable += 1
             continue
         arguments = function.get("arguments")
         try:
@@ -2416,7 +3026,7 @@ def _tool_calls(raw: Any) -> List[Dict[str, Any]]:
                 "arguments": parsed_arguments,
             }
         )
-    return calls
+    return calls, unreadable
 
 
 def _resolve_tool_result(
@@ -2551,37 +3161,63 @@ def _write_session(
 
     The ubiquity denominator is every eligible prompt, not only the ones that loaded something. A
     subagent or unclassified session contributes neither prompt nor load, since the whole session is
-    excluded; its origin is still classified truthfully. A prompt row is reported as soon as it
-    commits, because it is stored evidence even if the session's event write then fails; the load,
-    duplicate and rejection tallies are applied only after that write succeeds, so a failed session
-    is not reported as evidence it does not have.
+    excluded; its origin is still classified truthfully. The session's prompt rows, admitted load
+    and association updates, and its ``scan_ledger`` row commit in ONE transaction: on any write
+    error all of them roll back and any prior ledger row for the session stays strictly behind the
+    source revision. The load, duplicate and rejection tallies are applied only after that commit
+    succeeds, so a failed session is not reported as evidence it does not have.
     """
+    _require_writable(store)
     origin = scan["origin"]
-    if origin in ("human", "automation") and scan["eligible"]:
-        report.prompts += upsert_prompts(
-            store,
-            [
-                PromptEventInput(
-                    session_id=session.id,
-                    turn=prompt.index,
-                    text=prompt.text,
-                    observed_ms=prompt.observed_ms,
-                )
-                for prompt in scan["eligible"]
-            ],
-        )
     rejected: Dict[str, int] = {}
     events: List[AssociationEvent] = []
     for load, nearest in _attributions(scan["prompts"], scan["loads"], scan["resets"]):
         event = _admitted_event(store, session, load, nearest, origin, rejected)
         if event is not None:
             events.append(event)
-    upserted = upsert_events(store, events)
-    report.prompts += upserted.prompts
-    report.loads += upserted.loads
-    report.duplicates += upserted.duplicates
+    result = {"prompts": 0, "loads": 0, "duplicates": 0}
+
+    def work() -> None:
+        if origin in ("human", "automation") and scan["eligible"]:
+            result["prompts"] += _insert_prompts(
+                store,
+                [
+                    PromptEventInput(
+                        session_id=session.id,
+                        turn=prompt.index,
+                        text=prompt.text,
+                        observed_ms=prompt.observed_ms,
+                    )
+                    for prompt in scan["eligible"]
+                ],
+            )
+        _insert_events(store, events, result)
+        _write_scan_ledger(store, session.id, scan)
+
+    _transaction(store, work)
+    report.prompts += result["prompts"]
+    report.loads += result["loads"]
+    report.duplicates += result["duplicates"]
     for reason, count in rejected.items():
         report.rejected[reason] += count
+
+
+def _write_scan_ledger(
+    store: AssociationStore, session_id: str, scan: Dict[str, Any]
+) -> None:
+    """Upsert one session's ``scan_ledger`` finality row. The caller owns the transaction."""
+    store.conn.execute(
+        """INSERT OR REPLACE INTO scan_ledger
+           (session_id, scanned_max_row_id, pending_calls, unreadable_results, unreadable_calls)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            session_id,
+            scan.get("scanned_max_row_id"),
+            int(scan.get("pending_calls", 0)),
+            int(scan.get("unreadable_results", scan.get("unreadable", 0))),
+            int(scan.get("unreadable_calls", 0)),
+        ),
+    )
 
 
 def _attributions(

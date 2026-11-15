@@ -545,9 +545,9 @@ def test_the_store_opens_with_schema_one_wal_and_meta_harness_hermes(tmp_path: P
     assert store.read_only is False
     assert journal == "wal", "write-ahead logging is on"
     assert int(busy) == 5000, "one writer waits five seconds for the other"
-    assert int(version) == 1, "schema version 1 is stamped in the file"
+    assert int(version) == 2, "schema version 2 is stamped in the file"
     assert read_meta(store, META_HARNESS) == "hermes"
-    assert read_meta(store, META_SCHEMA_VERSION) == "1"
+    assert read_meta(store, META_SCHEMA_VERSION) == "2"
     assert read_meta(store, META_LAST_SCAN_MS) == "0"
     tables = [row[0] for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
     assert [name for name in tables if not name.startswith("sqlite_")] == [
@@ -555,6 +555,8 @@ def test_the_store_opens_with_schema_one_wal_and_meta_harness_hermes(tmp_path: P
         "load_event",
         "meta",
         "prompt_event",
+        "scan_ledger",
+        "seen_sessions",
         "skill",
         "skill_alias",
     ]
@@ -581,13 +583,13 @@ def test_the_store_refuses_a_foreign_schema_a_newer_version_and_garbage(tmp_path
     conn = sqlite3.connect(str(foreign))
     conn.execute("CREATE TABLE something_else (x INTEGER)")
     conn.close()
-    with pytest.raises(AssociationStoreError, match="not a version-1 database"):
+    with pytest.raises(AssociationStoreError, match="not a version-2 database"):
         open_store(str(foreign))
 
     newer = tmp_path / "newer.db"
     store = open_store(str(newer))
-    store.conn.execute("PRAGMA user_version = 2")
-    write_meta(store, META_SCHEMA_VERSION, "2")
+    store.conn.execute("PRAGMA user_version = 3")
+    write_meta(store, META_SCHEMA_VERSION, "3")
     store.close()
     with pytest.raises(AssociationStoreError, match="newer than this build"):
         open_store(str(newer))
@@ -1116,7 +1118,7 @@ def test_the_store_refuses_a_schema_version_that_is_not_a_number(tmp_path: Path)
     store = open_store(path)
     write_meta(store, META_SCHEMA_VERSION, "not-a-number")
     store.close()
-    with pytest.raises(AssociationStoreError, match="not a version-1 database"):
+    with pytest.raises(AssociationStoreError, match="not a version-2 database"):
         open_store(path)
 
 
@@ -1201,23 +1203,23 @@ def test_backfill_counts_a_session_whose_write_fails_instead_of_aborting(
     hermes.skill_view("s-bad", "unknown-skill", T0 + 4000)
     hermes.commit()
 
-    real = associations_module.upsert_events
+    real = associations_module._insert_events
 
-    def flaky(store, events):
+    def flaky(store, events, result):
         if any(event.session_id == "s-bad" for event in events):
             raise sqlite3.OperationalError("database is locked")
-        return real(store, events)
+        return real(store, events, result)
 
-    monkeypatch.setattr(associations_module, "upsert_events", flaky)
+    monkeypatch.setattr(associations_module, "_insert_events", flaky)
     store = temp_store(tmp_path, "write-failed")
     report = backfilled(store, hermes.path)
     assert report.skip_reasons["write-failed"] == 1
     assert report.sessions_skipped == 1
     assert report.sessions_scanned == 1
     assert report.loads == 1, "the healthy session was still stored"
-    assert report.prompts == 2, "the failed session's committed prompt rows are reported, not hidden"
+    assert report.prompts == 1, "the failed session's prompt rows roll back with the write"
     assert report.rejected == zero_rejections(), "a failed session leaves no gate counts behind"
-    assert rows(store, "SELECT count(*) FROM prompt_event")[0][0] == 2
+    assert rows(store, "SELECT count(*) FROM prompt_event")[0][0] == 1
     assert [row["skill_name"] for row in load_rows(store)] == ["code-review"]
 
 
