@@ -154,10 +154,13 @@ def record(
     # record actually carried, so a load that never writes a record
     # (disabled, dashboard/pre-load reads, non-routing paths) never
     # suppresses the first real display.
+    # ``entry["note"]`` is ``_line``-collapsed by construction, so match the
+    # collapsed form; pass the original trap on so the fingerprint still
+    # hashes the original note text.
     shown = [
         trap
         for trap in (getattr(cfg, "trap_notes", ()) or ())
-        if trap and trap in entry["note"]
+        if trap and _line(trap) and _line(trap) in entry["note"]
     ]
     if shown:
         acknowledge_trap_notes(shown, cfg.suggestions_path)

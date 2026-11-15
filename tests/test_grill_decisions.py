@@ -304,6 +304,47 @@ def test_dashboard_and_preload_reads_do_not_consume_the_trap(tmp_path):
     assert after_show.trap_notes == (), "only the record write acknowledges it"
 
 
+@pytest.mark.parametrize("key", ["bad  key", "bad\nkey"])
+def test_unknown_key_with_whitespace_acknowledges_once_and_stays_silent(tmp_path, key):
+    """P2-C: a trap the display collapses must still acknowledge.
+
+    ``display._line`` collapses consecutive spaces and newlines, so the
+    written note reads ``bad key: ...`` while the raw trap reads
+    ``bad  key: ...`` / ``bad\\nkey: ...``. Matching the raw trap against
+    the written note never matches, so the warning repeats forever.
+    """
+    path = str(tmp_path / "suggestions.json")
+    raw = {key: 1, "suggestionsPath": path}
+    # A non-routing load (no record write) must not consume the fingerprint.
+    pre = load(raw)
+    assert pre.trap_notes, "a load alone must surface the unknown-key trap"
+    first = load(raw)
+    assert first.trap_notes, "the first load must still warn after a non-routing load"
+    written = _show(first)
+    assert written is not None and "unknown config key" in written["note"]
+    assert "  " not in written["note"] and "\n" not in written["note"], (
+        f"the written note is whitespace-collapsed, got {written['note']!r}"
+    )
+    second = load(raw)
+    assert second.trap_notes == (), (
+        "a trap shown collapsed on the record must acknowledge, or it repeats forever"
+    )
+    third = load(raw)
+    assert third.trap_notes == (), "the acknowledged trap stays silent"
+
+
+def test_unknown_key_normal_acknowledges_once_and_stays_silent(tmp_path):
+    """P2-C control: a normal unknown key still acknowledges once."""
+    path = str(tmp_path / "suggestions.json")
+    raw = {"badkey": 1, "suggestionsPath": path}
+    first = load(raw)
+    assert first.trap_notes and any("badkey" in note for note in first.trap_notes)
+    assert _show(first) is not None
+    second = load(raw)
+    assert second.trap_notes == (), "a normal key acknowledges once"
+    assert load(raw).trap_notes == (), "and stays silent after"
+
+
 # Q2: one always-visible degraded line enumerating each loss.
 
 
