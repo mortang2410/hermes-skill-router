@@ -918,6 +918,133 @@ def test_backfill_counts_a_skipped_session_instead_of_aborting(hermes, tmp_path:
     store.close()
 
 
+def _raw_call(call_id: str, name: str, arguments: dict):
+    return {
+        "id": call_id,
+        "call_id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def _skill_result(name: str) -> str:
+    return json.dumps(
+        {
+            "success": True,
+            "name": name,
+            "_source_path": f"/home/wilder/.hermes/skills/{name}/SKILL.md",
+            "path": f"{name}/SKILL.md",
+        }
+    )
+
+
+def test_backfill_counts_a_duplicate_relevant_call_id_as_unreadable(hermes, tmp_path: Path):
+    """Two skill_view calls sharing one id: the first keeps it, the second is unreadable."""
+    hermes.session("s-dup")
+    hermes.user("s-dup", SUBSTANTIVE, T0 + 1000)
+    hermes.raw_messages(
+        "s-dup",
+        json.dumps(
+            [
+                _raw_call("dup-1", "skill_view", {"name": "code-review"}),
+                _raw_call("dup-1", "skill_view", {"name": "handoff-doc"}),
+            ]
+        ),
+        T0 + 2000,
+    )
+    hermes.result("s-dup", "dup-1", "skill_view", _skill_result("code-review"), T0 + 2100)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "dup-relevant")
+    report = backfilled(store, hermes.path)
+    assert report.unreadable_calls >= 1, "the duplicate call id must fail finality"
+    assert report.loads == 1, "the first call keeps the id and still attributes"
+    store.close()
+
+
+def test_backfill_counts_a_duplicate_call_id_across_rows_as_unreadable(hermes, tmp_path: Path):
+    """The same active id in two assistant rows counts the second use unreadable."""
+    hermes.session("s-dup-rows")
+    hermes.user("s-dup-rows", SUBSTANTIVE, T0 + 1000)
+    hermes.raw_messages(
+        "s-dup-rows",
+        json.dumps([_raw_call("dup-2", "skill_view", {"name": "code-review"})]),
+        T0 + 2000,
+    )
+    hermes.raw_messages(
+        "s-dup-rows",
+        json.dumps([_raw_call("dup-2", "skill_view", {"name": "handoff-doc"})]),
+        T0 + 3000,
+    )
+    hermes.result("s-dup-rows", "dup-2", "skill_view", _skill_result("code-review"), T0 + 3100)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "dup-rows")
+    report = backfilled(store, hermes.path)
+    assert report.unreadable_calls >= 1, "the cross-row duplicate must fail finality"
+    assert report.loads == 1
+    store.close()
+
+
+def test_backfill_counts_a_mixed_relevant_unrelated_call_id_as_unreadable(hermes, tmp_path: Path):
+    """One id claimed as both a skill_view and an unrelated call is unreadable."""
+    hermes.session("s-mixed-ids")
+    hermes.user("s-mixed-ids", SUBSTANTIVE, T0 + 1000)
+    hermes.raw_messages(
+        "s-mixed-ids",
+        json.dumps(
+            [
+                _raw_call("mix-1", "skill_view", {"name": "code-review"}),
+                _raw_call("mix-1", "read_file", {"path": "/scratch/notes.txt"}),
+            ]
+        ),
+        T0 + 2000,
+    )
+    hermes.result("s-mixed-ids", "mix-1", "skill_view", _skill_result("code-review"), T0 + 2100)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "mixed-ids")
+    report = backfilled(store, hermes.path)
+    assert report.unreadable_calls >= 1, "the conflicting id must fail finality"
+    assert report.loads == 1
+    store.close()
+
+
+def test_backfill_counts_a_duplicate_unrelated_result_as_unreadable(hermes, tmp_path: Path):
+    """The first unrelated result consumes the id; the second is an orphan."""
+    hermes.session("s-dup-result")
+    hermes.user("s-dup-result", SUBSTANTIVE, T0 + 1000)
+    hermes.raw_messages(
+        "s-dup-result",
+        json.dumps([_raw_call("unr-1", "read_file", {"path": "/scratch/notes.txt"})]),
+        T0 + 2000,
+    )
+    hermes.result("s-dup-result", "unr-1", "read_file", "one\n", T0 + 2100)
+    hermes.result("s-dup-result", "unr-1", "read_file", "two\n", T0 + 2200)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "dup-result")
+    report = backfilled(store, hermes.path)
+    assert report.unreadable_results >= 1, "the second result for a consumed id must fail finality"
+    store.close()
+
+
+def test_backfill_counts_a_duplicate_relevant_result_as_unreadable(hermes, tmp_path: Path):
+    """The first relevant result consumes the id; the second is an orphan."""
+    hermes.session("s-dup-relevant")
+    hermes.user("s-dup-relevant", SUBSTANTIVE, T0 + 1000)
+    hermes.skill_view("s-dup-relevant", "code-review", T0 + 2000)
+    call_id = "call-1"
+    hermes.result("s-dup-relevant", call_id, "skill_view", _skill_result("code-review"), T0 + 2200)
+    hermes.commit()
+
+    store = temp_store(tmp_path, "dup-relevant-result")
+    report = backfilled(store, hermes.path)
+    assert report.unreadable_results >= 1, "the second result must fail finality"
+    assert report.loads == 1
+    store.close()
+
+
 def test_backfill_refuses_an_injected_user_row_as_a_boundary_and_a_continuation_prompt(hermes, tmp_path: Path):
     hermes.session("s-mixed")
     hermes.user("s-mixed", SUBSTANTIVE, T0 + 1000)

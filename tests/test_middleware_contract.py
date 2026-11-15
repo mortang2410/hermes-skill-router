@@ -378,14 +378,46 @@ def test_an_anthropic_messages_payload_comes_out_same(
     assert result.changed is False
 
 
-def test_a_disabled_plugin_returns_none_through_the_callback(
+def test_disabled_plugin_injects_the_switch_warning_into_the_request(
     plugin_module, endpoints, tmp_path
 ):
+    """With the master switch off the model still gets one warning naming it."""
     settings = settings_for(endpoints, tmp_path / "suggestions.json")
     settings["enabled"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
     callback = _callback_for(plugin_module, settings)
 
+    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert messages[-1]["role"] == "system"
+    assert "enabled" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
+    # The catalog stays: nothing was stripped or routed.
+    assert messages[0]["content"] == chat_payload()["messages"][0]["content"]
+    assert len(messages) == len(chat_payload()["messages"]) + 1
+    assert not (tmp_path / "suggestions.json").exists()
+    # Suppression was persisted after delivery: the second turn carries no warning.
     assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
+
+
+def test_hidden_suggestions_inject_the_switch_warning_with_the_block(
+    plugin_module, endpoints, tmp_path
+):
+    """With the display switch off the routed block still carries its warning."""
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    callback = _callback_for(plugin_module, settings)
+
+    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+
+    messages = result["request"]["messages"]
+    # The suggestion block stays last so the replay guard still recognises it.
+    assert messages[-1]["content"].startswith("Skills routed for this request")
+    warning = messages[-2]
+    assert warning["role"] == "system"
+    assert "showSuggestions" in warning["content"] and " is off; " in warning["content"]
     assert not (tmp_path / "suggestions.json").exists()
 
 

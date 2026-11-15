@@ -2795,8 +2795,18 @@ def _scan_session(
             prompt = updated
         elif role == "assistant":
             classified, unrelated, malformed = _classify_calls(row, position, stamp)
-            pending.update(classified)
-            unrelated_calls.update(unrelated)
+            for key, entry in classified.items():
+                if key in pending or key in unrelated_calls:
+                    # A duplicate or conflicting active call id across rows:
+                    # the first call keeps the id, this one is unreadable.
+                    unreadable_calls += 1
+                else:
+                    pending[key] = entry
+            for key in unrelated:
+                if key in pending or key in unrelated_calls:
+                    unreadable_calls += 1
+                else:
+                    unrelated_calls.add(key)
             unreadable_calls += malformed
         elif role == "tool":
             call_id = row["tool_call_id"]
@@ -2807,7 +2817,9 @@ def _scan_session(
                     row, call, resolver, loads, skill_md_seen
                 )
             elif key is not None and key in unrelated_calls:
-                pass  # a matched unrelated result is valid, never unreadable
+                # A matched unrelated result is valid, never unreadable, and
+                # it consumes the id: a second result for it is an orphan.
+                unrelated_calls.discard(key)
             else:
                 unreadable_results += 1
     return {
@@ -2913,7 +2925,9 @@ def _classify_calls(
     unreadable-call count). A call with a missing name or call id, a malformed
     payload, a ``skill_view`` with unparseable arguments or no valid name, or
     a ``read_file`` with an unparseable or missing required path counts
-    unreadable instead of being silently dropped. A valid name-only
+    unreadable instead of being silently dropped. A call id that is already
+    active in this row, as either kind, also counts unreadable: the first call
+    keeps the id and a duplicate never overwrites it. A valid name-only
     ``skill_view`` is classifiable (the file path is optional); any other
     valid call is a parsed unrelated call that a matched result can answer.
     """
@@ -2926,6 +2940,11 @@ def _classify_calls(
         name = call.get("name")
         call_id = call.get("call_id")
         if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+            unreadable += 1
+            continue
+        if call_id in pending or call_id in unrelated:
+            # A duplicate or conflicting active call id: the first call keeps
+            # the id and this one is unreadable instead of overwriting it.
             unreadable += 1
             continue
         arguments = call.get("arguments")

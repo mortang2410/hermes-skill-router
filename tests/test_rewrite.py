@@ -30,7 +30,7 @@ from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router import search as search_module  # noqa: E402
 from hermes_skill_router.config import DEFAULTS, Config, load  # noqa: E402
-from hermes_skill_router.inject import (DROPPED_MESSAGE, HEADER, ONE_SHOT_HEADER, PINNED)  # noqa: E402
+from hermes_skill_router.inject import (DROPPED_MESSAGE, HEADER, ONE_SHOT_HEADER, PINNED, suggested_names)  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
@@ -553,8 +553,12 @@ def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path)
 
     result = rewrite(second, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
 
-    assert result is None, "every candidate the earlier block listed was suggested again"
-    assert second == before, "a suppression-emptied selection must leave the payload unchanged"
+    assert result is not None, "every candidate was suppressed, so only the degraded note rides"
+    messages = result["request"]["messages"]
+    assert messages[:-1] == before["messages"], "the catalog and the earlier block stay"
+    assert suggested_names(messages[-1]["content"]) == [], "the note never poses as a suggestion"
+    assert "Skills routed for this request" not in messages[-1]["content"]
+    assert second == before, "the rewrite never mutates its input"
     assert record_for(cfg)["status"] == "inert"
 
 
@@ -914,12 +918,19 @@ def test_an_empty_user_message_returns_none(tmp_path):
     assert record_for(cfg)["status"] == "inert"
 
 
-def test_an_empty_block_returns_none_and_stays_inert(tmp_path):
+def test_an_empty_block_carries_the_note_only_and_stays_inert(tmp_path):
+    """An empty selection keeps the catalog and rides the degraded note alone, inert on record."""
     cfg = make_config(tmp_path, maxSuggestions=0, cutoff=0.99)
 
-    result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    payload = _payload()
+    result = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
 
-    assert result is None
+    assert result is not None, "no row is shown, so the note rides as a standalone message"
+    messages = result["request"]["messages"]
+    assert messages[:-1] == payload["messages"], "the catalog stays on the original request"
+    assert messages[-1]["role"] == "system"
+    assert "Cache persistence is off" in messages[-1]["content"]
+    assert suggested_names(messages[-1]["content"]) == []
     record = record_for(cfg)
     assert record["status"] == "inert"
     assert record["names"] == []
@@ -958,9 +969,11 @@ def test_an_all_eager_config_that_selects_nothing_does_not_re_dump(tmp_path):
 def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
     """P1-2, empty-block branch: a below-cutoff pass is healthy, not a failure.
 
-    A pass that selects nothing because every score fell below the cutoff returns None
-    without setting a dump record, so the next working pass routes normally instead of
-    stripping the catalog as if a dump had happened.
+    A pass that selects nothing because every score fell below the cutoff carries
+    the degraded note alone and returns without setting a dump record, so the
+    next working pass routes normally instead of stripping the catalog as if a
+    dump had happened. The note message leaves the catalog in place, so the
+    next pass still sees the same rows.
     """
     index = make_index()
     payload = _payload()
@@ -972,7 +985,9 @@ def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
         embed=FakeEmbedder(),
         rerank=FakeReranker(),
     )
-    assert first is None
+    assert first is not None
+    assert first["request"]["messages"][:-1] == payload["messages"]
+    assert suggested_names(first["request"]["messages"][-1]["content"]) == []
 
     good = rewrite(
         payload, cfg=make_config(tmp_path), index=index, embed=FakeEmbedder(), rerank=FakeReranker()
@@ -1456,7 +1471,11 @@ def test_a_completed_pass_with_no_suggestion_still_writes_its_line(tmp_path, cap
     with caplog.at_level(logging.INFO, logger="hermes_skill_router.router"):
         result = rewrite(_payload(), cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
 
-    assert result is None, "nothing cleared the cutoff, so the catalog stays in the request"
+    assert result is not None, "nothing cleared the cutoff, so the note rides alone on the request"
+    payload = _payload()
+    messages = result["request"]["messages"]
+    assert messages[:-1] == payload["messages"], "the catalog stays in the request"
+    assert "Cache persistence is off" in messages[-1]["content"]
     line = _decision_lines(caplog)[0]
     assert "candidates=beta:0.9,delta:0.2,alpha:0.05,gamma:0.01" in line
     assert "suggestions=-" in line, "the line says no name cleared the cutoff"

@@ -660,3 +660,38 @@ def test_a_search_during_a_degraded_state_carries_the_note_forward(tmp_path, mon
     assert stored["note"] == degraded, (
         f"the search record must carry the degraded line forward, got {stored['note']!r}"
     )
+
+
+def test_no_selected_rows_keeps_catalog_and_injects_degraded_note(tmp_path):
+    """A degraded turn that selects nothing keeps the catalog and still shows the note.
+
+    The cutoff cuts every candidate and the catalog has no kept row, so no
+    suggestion block is produced; the incomplete-store degraded line, with
+    its pending heal-failure note, must still reach the provider context as
+    one standalone system message on the original request, and the display
+    record carries the same line.
+    """
+    from hermes_skill_router.inject import suggested_names
+
+    store_path = tmp_path / "associations.db"
+    cfg = make_config(tmp_path, associationDbPath=str(store_path), cutoff=1.0)
+    _seed_pending_failure(str(store_path))
+
+    result = _turn(cfg)
+
+    assert result is not None, "the note must reach the provider context"
+    messages = result["request"]["messages"]
+    last = messages[-1]
+    assert last["role"] == "system"
+    assert "History incomplete" in last["content"], last["content"]
+    assert "heal failed" in last["content"].lower(), last["content"]
+    assert suggested_names(last["content"]) == [], "the note never poses as a suggestion"
+    # The catalog stays: the first system message still carries its section.
+    assert "## Skills" in messages[0]["content"], messages[0]["content"]
+    assert "alpha" in messages[0]["content"]
+    assert "beta" in messages[0]["content"]
+    assert len(messages) == len(PAYLOAD["messages"]) + 1
+    # The display record agrees with the provider context.
+    stored = read(cfg)
+    assert stored["note"] == last["content"], stored["note"]
+    assert stored["status"] == INERT, stored

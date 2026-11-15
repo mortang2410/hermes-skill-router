@@ -66,7 +66,9 @@ clients the setup-needed line
 (:func:`hermes_skill_router.setup_check.setup_note`), probed fresh every dead-endpoint turn,
 refines that line to name the failing ``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks
 the degraded chooser, so a failed turn never consumes the heal note. The note rides on the record
-and on the injected block, so every surface shows the same line, and a healthy turn adds nothing.
+and on the injected block, so every surface shows the same line; when no row is shown at all, the
+note rides as one standalone system message on the original request so the provider context keeps
+the degraded state while the catalog stays, and a healthy turn adds nothing.
 The record file itself is written after the payload is built, so the display file costs no token
 beyond the one degraded line the block carries. A written record is announced
 on the plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
@@ -415,6 +417,20 @@ def _compose(
         # catalog for nothing, so the whole request is returned untouched.
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         return None
+    if note.strip() and block == note.strip():
+        # The renderer returned the degraded note on its own: no row is shown, so the catalog must
+        # stay. The note rides as one standalone system message on the original request, which
+        # keeps the degraded state the provider context would otherwise lose.
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        return {
+            "request": {
+                **dict(payload),
+                "messages": [
+                    *list(payload.get("messages") or ()),
+                    {"role": "system", "content": block},
+                ],
+            }
+        }
     rewritten = {
         **dict(payload),
         "messages": [

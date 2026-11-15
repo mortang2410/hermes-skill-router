@@ -58,15 +58,6 @@ from hermes_skill_router.embed import opener  # noqa: E402
 #: Anomaly threshold: divergence at or above this flags a skill. Provisional.
 DIVERGENCE_THRESHOLD = 0.4
 
-#: The embed model id sent with every request. The saved-index copy carries
-#: no model id, so the script sends the router's default (config default
-#: ``embedModelId``); a fake that ignores the field cannot tell the difference.
-EMBED_MODEL = "bge-m3"
-
-#: Seconds one embeddings request may take. The router bounds one
-#: ``embedTimeoutMs`` request (default 6000) the same way.
-EMBED_TIMEOUT_S = 6.0
-
 #: Texts per embeddings request, the same batch size the library build uses.
 BATCH_TEXTS = 16
 
@@ -257,14 +248,17 @@ def _meta_table(conn: sqlite3.Connection) -> Optional[Dict[str, str]]:
 
 
 def check_provenance(conn: sqlite3.Connection) -> None:
-    """Require a v2 enrollment record and no recorded history loss.
+    """Require a v2 enrollment record, no recorded history loss, and this harness.
 
     Order: a ``user_version``/``meta.schema_version`` disagreement is a named
     mismatch (never a pass); any presence of the loss marker fails with the
     marker named, regardless of its value (which is also why no
     millisecond-equal tie-break is attempted); a store stamped below v2
     fails as pre-v2; a migrated store whose marker was hand-deleted fails
-    on the missing fresh creation provenance.
+    on the missing fresh creation provenance; a fresh v2 store from another
+    harness fails on ``meta.harness`` (mirroring :func:`associations.open_store`,
+    which refuses a foreign file), so a copy from another harness can never
+    print clean or zero scores.
     """
     meta = _meta_table(conn)
     if meta is None:
@@ -300,6 +294,11 @@ def check_provenance(conn: sqlite3.Connection) -> None:
             "provenance untrustworthy: no fresh creation record "
             f"({META_CREATION_ORIGIN} is not {CREATION_ORIGIN_FRESH!r}); "
             "the store was not created under the v2 contract"
+        )
+    if meta.get(associations.META_HARNESS) != associations.HARNESS:
+        raise _coverage(
+            f"foreign harness: meta.harness is {meta.get(associations.META_HARNESS)!r}, not "
+            f"{associations.HARNESS!r}; the store was not created under this router's contract"
         )
 
 
@@ -489,19 +488,27 @@ def _parse_embeddings(raw: bytes, expected: int, url: str) -> List[List[float]]:
     return vectors
 
 
-def embed_texts(url: str, texts: Sequence[str]) -> List[List[float]]:
+def embed_texts(
+    url: str,
+    texts: Sequence[str],
+    model: str,
+    timeout_s: float,
+) -> List[List[float]]:
     """Embed *texts* through *url*, one vector per text in order, or raise.
 
-    The request reuses the router embed client's redirect-refusing opener;
-    the response is used only when it carries exactly one non-empty
-    vector per input at one common width. An unreachable endpoint and an
-    unusable body both fail with the named embed error, never a partial
-    result, and nothing is retried.
+    *model* and *timeout_s* are the run's own ``embedModelId`` and
+    ``embedTimeoutMs`` (as seconds): the replay must use the same vector
+    space and the same bound the router used, so both are explicit CLI
+    inputs at the call site. The request reuses the router embed client's
+    redirect-refusing opener; the response is used only when it carries
+    exactly one non-empty vector per input at one common width. An
+    unreachable endpoint and an unusable body both fail with the named embed
+    error, never a partial result, and nothing is retried.
     """
     vectors: List[List[float]] = []
     for start in range(0, len(texts), BATCH_TEXTS):
         chunk = list(texts[start:start + BATCH_TEXTS])
-        body = json.dumps({"model": EMBED_MODEL, "input": chunk}).encode("utf-8")
+        body = json.dumps({"model": model, "input": chunk}).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=body,
@@ -509,7 +516,7 @@ def embed_texts(url: str, texts: Sequence[str]) -> List[List[float]]:
             method="POST",
         )
         try:
-            with opener().open(request, timeout=EMBED_TIMEOUT_S) as response:
+            with opener().open(request, timeout=timeout_s) as response:
                 raw = response.read()
         except EmbedError:
             raise
@@ -560,6 +567,8 @@ def search_scores(
     queries: Sequence[str],
     max_description_chars: int,
     embed_url: str,
+    model: str,
+    timeout_s: float,
 ) -> List[List[float]]:
     """Return one search score per query per catalog skill.
 
@@ -567,15 +576,17 @@ def search_scores(
     to [0, 1] (a zero range maps every skill to 0) and averaged into one
     search score. The lexical channel builds its term index from the same
     document texts the embedder sees, with the live router's tokenizer
-    and pinned constants.
+    and pinned constants. *model* and *timeout_s* are the run's
+    ``embedModelId``/``embedTimeoutMs`` seconds, passed through to
+    :func:`embed_texts`.
     """
     documents = [
         document_text(name, description, max_description_chars)
         for name, description in zip(names, descriptions)
     ]
     index = bm25.build_term_index([(name, text) for name, text in zip(names, documents)])
-    catalog_vectors = embed_texts(embed_url, documents)
-    query_vectors = embed_texts(embed_url, list(queries))
+    catalog_vectors = embed_texts(embed_url, documents, model, timeout_s)
+    query_vectors = embed_texts(embed_url, list(queries), model, timeout_s)
     per_query: List[List[float]] = []
     for query, query_vector in zip(queries, query_vectors):
         semantic = _minmax(
@@ -672,6 +683,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catalog", required=True, help="saved-index JSON copy")
     parser.add_argument("--embed-url", required=True, help="embeddings endpoint URL")
     parser.add_argument(
+        "--embed-model",
+        required=True,
+        help="the embedModelId value the logged run used (the replay must stay in that vector space)",
+    )
+    parser.add_argument(
+        "--embed-timeout-ms",
+        required=True,
+        type=int,
+        help="the embedTimeoutMs value the logged run used (100..60000)",
+    )
+    parser.add_argument(
         "--max-description-chars",
         required=True,
         type=int,
@@ -696,6 +718,11 @@ def run(args: argparse.Namespace) -> List[str]:
         raise AnalyticsError(
             "analytics error: --max-description-chars must be between 3 and 4000, "
             f"not {args.max_description_chars}"
+        )
+    if not 100 <= args.embed_timeout_ms <= 60000:
+        raise AnalyticsError(
+            "analytics error: --embed-timeout-ms must be between 100 and 60000, "
+            f"not {args.embed_timeout_ms}"
         )
     store_conn = open_readonly(args.store, "association store")
     try:
@@ -728,7 +755,13 @@ def run(args: argparse.Namespace) -> List[str]:
             skill_ids.append(resolved.id if resolved is not None else None)
         queries = [query for _stamp, query in decisions]
         search = search_scores(
-            names, descriptions, queries, args.max_description_chars, args.embed_url
+            names,
+            descriptions,
+            queries,
+            args.max_description_chars,
+            args.embed_url,
+            args.embed_model,
+            args.embed_timeout_ms / 1000.0,
         )
         divergences: Dict[str, List[Tuple[float, str]]] = {name: [] for name in names}
         for position, ((stamp, query), search_row) in enumerate(zip(decisions, search)):

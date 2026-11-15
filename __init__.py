@@ -39,13 +39,13 @@ import logging
 from typing import Any, Mapping
 
 if __package__:
-    from .hermes_skill_router.config import load, read_settings
-    from .hermes_skill_router.router import rewrite
+    from .hermes_skill_router.config import load, read_settings, switch_warning_messages
+    from .hermes_skill_router.router import INJECTED_HEADER, rewrite
     from .hermes_skill_router.search import expire_dump, forget_session
     from .hermes_skill_router.tools import register_tools
 else:  # imported as a bare module, e.g. by a test collector walking this repository
-    from hermes_skill_router.config import load, read_settings
-    from hermes_skill_router.router import rewrite
+    from hermes_skill_router.config import load, read_settings, switch_warning_messages
+    from hermes_skill_router.router import INJECTED_HEADER, rewrite
     from hermes_skill_router.search import expire_dump, forget_session
     from hermes_skill_router.tools import register_tools
 
@@ -137,10 +137,55 @@ def _route(
     so a request that happens to carry a system-role catalog under Codex Responses or Anthropic
     Messages stays untouched. The rewrite records the ids in the display record; a missing id stays
     an empty string rather than failing the request.
+
+    Pending no-record switch warnings ride on the outgoing request as standalone system
+    messages, before the disabled early return and after a rewrite alike, so the one channel
+    that reaches the model carries the warning that the terminal and the host logger already
+    showed. A request without a messages list has no channel to carry them and stays untouched.
     """
     cfg = load(read_settings(ctx))
+    switch_messages = switch_warning_messages(cfg)
     if not cfg.enabled:
-        return None
-    return rewrite(
+        return _with_switch_messages(request, switch_messages)
+    result = rewrite(
         request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
     )
+    if not isinstance(result, Mapping):
+        return result
+    rewritten = result.get("request")
+    if not switch_messages or not isinstance(rewritten, Mapping):
+        return result
+    messages = rewritten.get("messages")
+    if not isinstance(messages, list):
+        return result
+    return {
+        "request": {**dict(rewritten), "messages": _carrying_switch_messages(messages, switch_messages)}
+    }
+
+
+def _with_switch_messages(request: Any, switch_messages: Any) -> Any:
+    """Return *request* with *switch_messages* appended, or ``None`` when there is no channel.
+
+    Used on the disabled path, where the rewrite never runs: the switch warning still reaches
+    the provider request even though routing and the display record are off.
+    """
+    if not switch_messages or not isinstance(request, Mapping):
+        return None
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return None
+    return {"request": {**dict(request), "messages": [*list(messages), *switch_messages]}}
+
+
+def _carrying_switch_messages(messages: Any, switch_messages: Any) -> list:
+    """Return *messages* with *switch_messages* carried without displacing a trailing block.
+
+    A trailing suggestion block stays last, so the rewrite's replay guard still recognises the
+    request as already injected on the next turn; otherwise the messages are appended at the end.
+    """
+    carried = list(messages)
+    if carried and isinstance(carried[-1], Mapping):
+        content = carried[-1].get("content")
+        if isinstance(content, str) and content.startswith(INJECTED_HEADER):
+            return [*carried[:-1], *switch_messages, carried[-1]]
+    return [*carried, *switch_messages]

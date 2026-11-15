@@ -40,8 +40,10 @@ prose carried: do not create or edit skills.
 
 This module applies no cap. The selector is the only place the cap is applied, so a block handed
 twelve rows renders twelve rows even when ``maxSuggestions`` is 0. The function is pure. Rendering
-returns ``""`` only when it has no row to show at all, which keeps the strip and the injection atomic:
-a request with no block keeps its catalog byte for byte.
+returns ``""`` only when it has no row to show at all and no note, which keeps the strip and the
+injection atomic: a request with no block keeps its catalog byte for byte. A note with no row is
+returned on its own, with no header and no section, so the provider context still receives the
+degraded line while the caller keeps the original catalog.
 """
 
 from __future__ import annotations
@@ -128,7 +130,7 @@ def render(
     paths: Optional[Dict[str, str]] = None,
     note: str = "",
 ) -> str:
-    """Return the block for *rows*, *kept* and *cfg*, or ``""`` when it would carry no row.
+    """Return the block for *rows*, *kept* and *cfg*, or ``""`` when it carries nothing at all.
 
     *rows* are the selected suggestions from :func:`hermes_skill_router.select.select`, already
     capped, best first. *kept* is the kept half of the catalog partition. *one_shot* is
@@ -144,7 +146,9 @@ def render(
     omitted with one warning per process. The cap is not applied here: the selector applied it.
     The note is appended as one final paragraph after the last section. It never starts with
     ``- `` and never matches a section marker, so :func:`suggested_names` reads the same names
-    with or without it.
+    with or without it. With no row to show, the note is returned on its own, with no header and
+    no section, so a degraded turn that selects nothing still hands the provider context the note;
+    the recogniser never reads it as a suggestion either.
     """
     resolved = paths or {}
     descriptions = _descriptions(index)
@@ -181,7 +185,7 @@ def render(
             seen.add(name)
             listed.append(_plain_row(name, description, limit))
     if not suggested and not pinned and not listed:
-        return ""
+        return note.strip() if isinstance(note, str) else ""
     parts = [ONE_SHOT_HEADER if one_shot else HEADER]
     if suggested:
         parts.append(SUGGESTIONS + "\n" + "\n".join(suggested))

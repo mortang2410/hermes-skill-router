@@ -38,6 +38,17 @@ def _path(tmp_path):
     return str(tmp_path / "suggestions.json")
 
 
+def _cache(tmp_path):
+    return str(tmp_path / "index.json")
+
+
+def _load(tmp_path, settings):
+    """Load *settings* with the test's isolated display and cache paths."""
+    merged = {"suggestionsPath": _path(tmp_path), "cachePath": _cache(tmp_path)}
+    merged.update(settings)
+    return load(merged)
+
+
 def _switch_notes(cfg):
     return tuple(
         note
@@ -60,12 +71,12 @@ def _logger_lines(caplog):
     return lines
 
 
-def _traps_file(tmp_path):
-    return tmp_path / "config-traps.json"
+def _switches_file(tmp_path):
+    return tmp_path / "config-switches.json"
 
 
 def _seen(tmp_path):
-    path = _traps_file(tmp_path)
+    path = _switches_file(tmp_path)
     if not path.exists():
         return set()
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -75,7 +86,7 @@ def _seen(tmp_path):
 
 def test_enabled_false_emits_three_channels_naming_switch_and_effect(tmp_path, capsys, caplog):
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        cfg = load({"enabled": False, "suggestionsPath": _path(tmp_path)})
+        cfg = _load(tmp_path, {"enabled": False})
 
     notes = _switch_notes(cfg)
     assert len(notes) == 1, f"enabled warning must be produced, got {cfg.notes!r}"
@@ -104,7 +115,7 @@ def test_show_suggestions_false_emits_three_channels_naming_display_loss(
     tmp_path, capsys, caplog
 ):
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        cfg = load({"showSuggestions": False, "suggestionsPath": _path(tmp_path)})
+        cfg = _load(tmp_path, {"showSuggestions": False})
 
     notes = _switch_notes(cfg)
     assert len(notes) == 1, f"showSuggestions warning must be produced, got {cfg.notes!r}"
@@ -120,9 +131,8 @@ def test_show_suggestions_false_emits_three_channels_naming_display_loss(
 def test_unchanged_value_warns_once_then_stays_silent_across_turns_and_restart(
     tmp_path, capsys, caplog
 ):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = load({"enabled": False, "showSuggestions": False, "suggestionsPath": path})
+        first = _load(tmp_path, {"enabled": False, "showSuggestions": False})
         assert len(_switch_notes(first)) == 2
         assert {note.split(":", 1)[0] for note in _switch_notes(first)} == {
             "enabled",
@@ -134,7 +144,7 @@ def test_unchanged_value_warns_once_then_stays_silent_across_turns_and_restart(
 
         caplog.clear()
         for _ in range(3):
-            again = load({"enabled": False, "showSuggestions": False, "suggestionsPath": path})
+            again = _load(tmp_path, {"enabled": False, "showSuggestions": False})
             assert _switch_notes(again) == ()
             assert switch_warning_messages(again) == ()
         assert capsys.readouterr().err == ""
@@ -142,48 +152,43 @@ def test_unchanged_value_warns_once_then_stays_silent_across_turns_and_restart(
 
         # A restart clears only in-process memory; the persisted set still suppresses.
         config_module._LOGGED_NOTES.clear()
-        restarted = load({"enabled": False, "showSuggestions": False, "suggestionsPath": path})
+        restarted = _load(tmp_path, {"enabled": False, "showSuggestions": False})
         assert _switch_notes(restarted) == ()
         assert capsys.readouterr().err == ""
         assert _logger_lines(caplog) == []
 
 
 def test_each_switch_warns_independently(tmp_path, capsys, caplog):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        cfg = load({"enabled": False, "suggestionsPath": path})
+        cfg = _load(tmp_path, {"enabled": False})
         assert [note.split(":", 1)[0] for note in _switch_notes(cfg)] == ["enabled"]
-        cfg = load({"showSuggestions": False, "suggestionsPath": path})
+        cfg = _load(tmp_path, {"showSuggestions": False})
         # The fixed switch (enabled defaults back to True) clears only its own set,
         # so the other switch still warns for its own fingerprint.
         assert [note.split(":", 1)[0] for note in _switch_notes(cfg)] == ["showSuggestions"]
 
 
 def test_changed_offending_value_warns_once_more(tmp_path, capsys, caplog):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = load({"enabled": False, "suggestionsPath": path})
+        first = _load(tmp_path, {"enabled": False})
         assert len(_switch_notes(first)) == 1
-        changed = load({"enabled": "false", "suggestionsPath": path})
+        changed = _load(tmp_path, {"enabled": "false"})
         assert len(_switch_notes(changed)) == 1, (
             "a different spelling of the offending value is a new fingerprint"
         )
         assert _switch_notes(changed) != _switch_notes(first)
-        again = load({"enabled": "false", "suggestionsPath": path})
+        again = _load(tmp_path, {"enabled": "false"})
         assert _switch_notes(again) == ()
 
 
 def test_fixing_one_switch_drops_only_its_fingerprints(tmp_path, capsys, caplog):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = load(
-            {"enabled": False, "showSuggestions": False, "suggestionsPath": path}
-        )
+        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
         assert len(_switch_notes(both)) == 2
         seen = _seen(tmp_path)
         assert {pair[0] for pair in seen} == {"enabled", "showSuggestions"}
 
-        fixed = load({"enabled": True, "showSuggestions": False, "suggestionsPath": path})
+        fixed = _load(tmp_path, {"enabled": True, "showSuggestions": False})
         assert _switch_notes(fixed) == ()
         seen = _seen(tmp_path)
         assert {pair[0] for pair in seen} == {"showSuggestions"}, (
@@ -192,7 +197,7 @@ def test_fixing_one_switch_drops_only_its_fingerprints(tmp_path, capsys, caplog)
 
         capsys.readouterr()
         caplog.clear()
-        rebroken = load({"enabled": False, "showSuggestions": False, "suggestionsPath": path})
+        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
         notes = _switch_notes(rebroken)
         assert [note.split(":", 1)[0] for note in notes] == ["enabled"], (
             "re-breaking the same value warns again while the other stays suppressed"
@@ -200,22 +205,19 @@ def test_fixing_one_switch_drops_only_its_fingerprints(tmp_path, capsys, caplog)
         assert len(_logger_lines(caplog)) == 1
 
         # Fixing the other switch now drops only its set.
-        load({"enabled": False, "showSuggestions": True, "suggestionsPath": path})
+        _load(tmp_path, {"enabled": False, "showSuggestions": True})
         assert {pair[0] for pair in _seen(tmp_path)} == {"enabled"}
 
 
 def test_both_off_then_fixing_one_rebreak_warns_while_other_stays_silent(
     tmp_path, capsys, caplog
 ):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        load({"enabled": False, "showSuggestions": False, "suggestionsPath": path})
-        load({"enabled": True, "showSuggestions": False, "suggestionsPath": path})
+        _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        _load(tmp_path, {"enabled": True, "showSuggestions": False})
         capsys.readouterr()
         caplog.clear()
-        rebroken = load(
-            {"enabled": False, "showSuggestions": False, "suggestionsPath": path}
-        )
+        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
         assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == ["enabled"]
         assert len(capsys.readouterr().err.splitlines()) == 1
         assert len(_logger_lines(caplog)) == 1
@@ -225,18 +227,42 @@ def test_both_off_then_fixing_one_rebreak_warns_while_other_stays_silent(
 
 
 def test_no_per_turn_spam_loop_with_repeated_turns(tmp_path, capsys, caplog):
-    path = _path(tmp_path)
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        load({"showSuggestions": False, "suggestionsPath": path})
+        _load(tmp_path, {"showSuggestions": False})
         capsys.readouterr()
         caplog.clear()
         for _ in range(5):
-            load({"showSuggestions": False, "suggestionsPath": path})
+            _load(tmp_path, {"showSuggestions": False})
         assert capsys.readouterr().err == ""
         assert _logger_lines(caplog) == []
 
 
 def test_healthy_load_creates_no_trap_file(tmp_path, capsys, caplog):
-    load({"suggestionsPath": _path(tmp_path)})
-    assert not _traps_file(tmp_path).exists()
+    _load(tmp_path, {})
+    assert not _switches_file(tmp_path).exists()
     assert capsys.readouterr().err == ""
+
+
+def test_empty_suggestions_path_still_suppresses_switch_warnings(tmp_path, capsys, caplog):
+    """An empty display path warns once, not on every load (ticket 03's no-spam rule)."""
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        first = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+        assert len(_switch_notes(first)) == 1
+        capsys.readouterr()
+        caplog.clear()
+        for _ in range(3):
+            again = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+            assert _switch_notes(again) == ()
+            assert switch_warning_messages(again) == ()
+        assert capsys.readouterr().err == ""
+        assert _logger_lines(caplog) == []
+
+        # A restart clears only in-process memory; the cache-side set still suppresses.
+        config_module._LOGGED_NOTES.clear()
+        restarted = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+        assert _switch_notes(restarted) == ()
+        assert capsys.readouterr().err == ""
+        assert _logger_lines(caplog) == []
+        assert _switches_file(tmp_path).exists(), (
+            "the seen set persists beside the cache, independent of the display path"
+        )

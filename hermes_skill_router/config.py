@@ -21,6 +21,8 @@ injected context message built by :func:`switch_warning_messages`, and one host-
 naming the switch and its effect. Unlike a malformed-value trap they never reach a display
 record (the switches suppress it), so ``load`` persists their fingerprints at emission time
 instead of waiting for a record write; fixing one switch drops only that switch's fingerprints.
+The fingerprints live beside the index cache, so disabling the display never turns them back
+into per-load spam.
 """
 
 from __future__ import annotations
@@ -139,8 +141,14 @@ BOUNDS: dict[str, Tuple[float, float]] = {
 #: File name of the persisted config-trap set, written beside the suggestions file.
 TRAPS_FILENAME = "config-traps.json"
 
+#: File name of the persisted switch-warning seen set, written beside the index cache.
+SWITCHES_FILENAME = "config-switches.json"
+
 #: Environment override for the traps file; tests point it at a temporary file.
 TRAPS_ENV_VAR = "HERMES_SKILL_ROUTER_TRAPS_PATH"
+
+#: Environment override for the switch-warning seen file; tests point it at a temporary file.
+SWITCHES_ENV_VAR = "HERMES_SKILL_ROUTER_SWITCHES_PATH"
 
 #: The two master switches whose off state stops a record from being written.
 SWITCH_WARNING_SWITCHES = ("enabled", "showSuggestions")
@@ -386,6 +394,29 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
 _LOGGED_NOTES: set[str] = set()
 
 
+def switches_path_for(cache_path: Any) -> Optional[str]:
+    """Return the persisted switch-warning seen-set path for *cache_path*, or ``None``.
+
+    The set lives beside the index cache, so an empty ``suggestionsPath``
+    (display disabled) still suppresses: the location is independent of the
+    optional display path and stays writable when the display is off. An
+    empty cache path means nowhere to write. ``HERMES_SKILL_ROUTER_SWITCHES_PATH``
+    wins when set.
+    """
+    override = os.environ.get(SWITCHES_ENV_VAR) or ""
+    if override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
+    if not isinstance(cache_path, str):
+        return None
+    text = cache_path.strip()
+    if not text:
+        return None
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(text)))
+    if not directory:
+        directory = os.getcwd()
+    return os.path.join(directory, SWITCHES_FILENAME)
+
+
 def traps_path_for(suggestions_path: Any) -> Optional[str]:
     """Return the persisted trap-set path for *suggestions_path*, or ``None`` when nowhere to write.
 
@@ -585,17 +616,19 @@ def _emit_switch_warnings(lines: Sequence[str]) -> None:
 def _pending_switch_warnings(
     settings: Mapping[str, Any],
     values: Mapping[str, Any],
-    suggestions_path: Any,
+    cache_path: Any,
 ) -> Tuple[str, ...]:
     """Return the offending switch warnings not yet seen, emitting and persisting them. Never raises.
 
-    Each switch keeps its own seen set inside the shared trap file: an
+    Each switch keeps its own seen set inside the cache-side switch file: an
     unchanged value warns once and then stays silent, a changed value hashes
     anew and warns once more, and a fixed switch drops only its own set, so
     re-breaking the same value warns again while the other switch stays
     suppressed. Unlike a malformed-value trap there is no display record to
     carry the warning (the off switches suppress it), so the fingerprints are
-    persisted here at emission time rather than by the display writer.
+    persisted here at emission time rather than by the display writer. The
+    file lives beside the index cache, so the display being disabled never
+    turns emission into per-load spam.
     """
     offending = {
         key: _switch_note(key, settings.get(key, False))
@@ -604,9 +637,9 @@ def _pending_switch_warnings(
     }
     fixed = [key for key in SWITCH_WARNING_SWITCHES if values.get(_SWITCH_FIELDS[key]) is True]
     try:
-        path = traps_path_for(suggestions_path)
+        path = switches_path_for(cache_path)
         if path is None:
-            # Nowhere to persist (display disabled): warn on every load.
+            # Nowhere to persist (no cache path): warn on every load.
             pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
             _emit_switch_warnings(pending)
             return pending
@@ -682,7 +715,7 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
     trap_notes = _pending_trap_notes(notes, suggestions)
-    switch_notes = _pending_switch_warnings(settings, values, suggestions)
+    switch_notes = _pending_switch_warnings(settings, values, values.get("cache_path", ""))
     return Config(notes=tuple(notes) + switch_notes, trap_notes=trap_notes, **values)
 
 

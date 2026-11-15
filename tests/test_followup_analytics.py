@@ -330,6 +330,8 @@ def run_script(
     log: Optional[Path] = None,
     state: Optional[Path] = None,
     embed_url: Optional[str] = None,
+    embed_model: str = "bge-m3",
+    embed_timeout_ms: int = 6000,
 ):
     """Run the script as a subprocess and return the completed process."""
     command = [
@@ -339,6 +341,8 @@ def run_script(
         "--log", str(log or paths["log"]),
         "--catalog", str(paths["catalog"]),
         "--embed-url", embed_url or f"{endpoint.base_url}/v1/embeddings",
+        "--embed-model", embed_model,
+        "--embed-timeout-ms", str(embed_timeout_ms),
         "--max-description-chars", str(cap),
         "--state-db", str(state or paths["state"]),
     ]
@@ -1099,3 +1103,64 @@ def test_unreachable_embed_endpoint_is_a_named_error(endpoint, tmp_path):
     assert result.returncode != 0
     assert "analytics embed error" in result.stderr
     assert "127.0.0.1:1" in result.stderr
+
+
+def test_foreign_harness_v2_store_fails_provenance(endpoint, tmp_path):
+    """A fresh v2 store from another harness fails before any scoring."""
+    paths = make_case(tmp_path, store_kwargs={"meta_extra": {"harness": "other-harness"}})
+    result = run_script(endpoint, paths)
+    assert result.returncode != 0
+    assert "analytics coverage error" in result.stderr
+    assert "foreign harness" in result.stderr
+
+
+def test_hermes_harness_store_passes_provenance_control(endpoint, tmp_path):
+    """Control: the same store with this harness's stamp scores normally."""
+    paths = make_case(tmp_path, store_kwargs={"meta_extra": {"harness": "hermes"}})
+    result = run_script(endpoint, paths)
+    assert result.returncode == 0, result.stderr
+    assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+
+
+def test_an_endpoint_rejects_a_mismatched_embed_model(tmp_path):
+    """The script sends the model it was given; another model's endpoint rejects it."""
+
+    def picky(request):
+        payload = request.json()
+        if payload.get("model") != "run-model":
+            return Response(status=400, body={"error": "unknown model"})
+        vectors = [embed_vector(text) for text in payload["input"]]
+        return Response(body={"data": [{"embedding": vector} for vector in vectors]})
+
+    server = FakeEndpoint(responder=picky)
+    try:
+        paths = make_case(tmp_path)
+        matched = run_script(server, paths, embed_model="run-model")
+        assert matched.returncode == 0, matched.stderr
+        assert set(anomalies_for(matched.stdout)) == {"alpha-skill"}
+        mismatched = run_script(server, paths, embed_model="other-model")
+        assert mismatched.returncode != 0
+        assert "analytics embed error" in mismatched.stderr, mismatched.stderr
+    finally:
+        server.close()
+
+
+def test_a_slow_but_valid_endpoint_needs_the_run_timeout(tmp_path):
+    """A 2s response succeeds within the run's 15s budget and fails within 500 ms."""
+
+    def slow(request):
+        payload = request.json()
+        vectors = [embed_vector(text) for text in payload["input"]]
+        return Response(body={"data": [{"embedding": vector} for vector in vectors]}, delay=2.0)
+
+    server = FakeEndpoint(responder=slow)
+    try:
+        paths = make_case(tmp_path)
+        patient = run_script(server, paths, embed_timeout_ms=15000)
+        assert patient.returncode == 0, patient.stderr
+        assert set(anomalies_for(patient.stdout)) == {"alpha-skill"}
+        impatient = run_script(server, paths, embed_timeout_ms=500)
+        assert impatient.returncode != 0
+        assert "analytics embed error" in impatient.stderr, impatient.stderr
+    finally:
+        server.close()
