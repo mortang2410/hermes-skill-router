@@ -389,6 +389,33 @@ def test_planted_anomaly_flags_exactly_the_planted_skill(endpoint, tmp_path):
     assert sections["alpha-skill"] == [("quokka mammoth zebra", pytest.approx(1.0))]
 
 
+def test_documented_invocation_verbatim_without_embed_flags(endpoint, tmp_path):
+    """Round 3 P2: ticket 05 / skeleton C5's exact command works unchanged.
+
+    The documented invocation omits --embed-model/--embed-timeout-ms; the
+    run config's defaults (embed_model_id/embed_timeout_ms) resolve them,
+    so it replays in the same vector space as the explicit invocation.
+    """
+    paths = make_case(tmp_path)
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--store", str(paths["store"]),
+        "--log", str(paths["log"]),
+        "--catalog", str(paths["catalog"]),
+        "--embed-url", f"{endpoint.base_url}/v1/embeddings",
+        "--max-description-chars", "400",
+        "--state-db", str(paths["state"]),
+        "--assert-complete-source-history",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+    explicit = run_script(endpoint, paths)
+    assert explicit.returncode == 0, explicit.stderr
+    assert result.stdout == explicit.stdout
+
+
 def test_top5_prompts_per_skill_in_divergence_order(endpoint, tmp_path):
     """Top-5 is the five highest divergences, ties by query JSON ascending.
 

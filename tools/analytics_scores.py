@@ -498,8 +498,11 @@ def embed_texts(
 
     *model* and *timeout_s* are the run's own ``embedModelId`` and
     ``embedTimeoutMs`` (as seconds): the replay must use the same vector
-    space and the same bound the router used, so both are explicit CLI
-    inputs at the call site. The request reuses the router embed client's
+    space and the same bound the router used. Both are optional CLI
+    inputs defaulting to the run config's values (``config.embed_model_id``
+    / ``cfg.embed_timeout_ms`` through ``load({})``), so the documented
+    invocation works unchanged and still replays in the same space. The
+    request reuses the router embed client's
     redirect-refusing opener; the response is used only when it carries
     exactly one non-empty vector per input at one common width. An
     unreachable endpoint and an unusable body both fail with the named embed
@@ -684,14 +687,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-url", required=True, help="embeddings endpoint URL")
     parser.add_argument(
         "--embed-model",
-        required=True,
-        help="the embedModelId value the logged run used (the replay must stay in that vector space)",
+        default=None,
+        help="the embedModelId value the logged run used (the replay must stay in that "
+        "vector space); defaults to the run config's embed_model_id when omitted",
     )
     parser.add_argument(
         "--embed-timeout-ms",
-        required=True,
+        default=None,
         type=int,
-        help="the embedTimeoutMs value the logged run used (100..60000)",
+        help="the embedTimeoutMs value the logged run used (100..60000); defaults to "
+        "the run config's embed_timeout_ms when omitted",
     )
     parser.add_argument(
         "--max-description-chars",
@@ -719,6 +724,18 @@ def run(args: argparse.Namespace) -> List[str]:
             "analytics error: --max-description-chars must be between 3 and 4000, "
             f"not {args.max_description_chars}"
         )
+    # Resolve the run's embed model/timeout from the run config when the
+    # documented invocation omits them (config.embed_model_id /
+    # cfg.embed_timeout_ms defaults), so the documented command works
+    # unchanged and still replays in the same vector space.
+    if args.embed_model is None or args.embed_timeout_ms is None:
+        from hermes_skill_router.config import load as _load_config
+
+        cfg = _load_config({})
+        if args.embed_model is None:
+            args.embed_model = cfg.embed_model_id
+        if args.embed_timeout_ms is None:
+            args.embed_timeout_ms = cfg.embed_timeout_ms
     if not 100 <= args.embed_timeout_ms <= 60000:
         raise AnalyticsError(
             "analytics error: --embed-timeout-ms must be between 100 and 60000, "

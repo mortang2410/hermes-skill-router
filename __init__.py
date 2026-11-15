@@ -39,13 +39,23 @@ import logging
 from typing import Any, Mapping
 
 if __package__:
-    from .hermes_skill_router.config import load, read_settings, switch_warning_messages
-    from .hermes_skill_router.router import INJECTED_HEADER, rewrite
+    from .hermes_skill_router.config import (
+        acknowledge_switch_deliveries,
+        load,
+        read_settings,
+        switch_warning_messages,
+    )
+    from .hermes_skill_router.router import CHAT_COMPLETIONS, INJECTED_HEADER, rewrite
     from .hermes_skill_router.search import expire_dump, forget_session
     from .hermes_skill_router.tools import register_tools
 else:  # imported as a bare module, e.g. by a test collector walking this repository
-    from hermes_skill_router.config import load, read_settings, switch_warning_messages
-    from hermes_skill_router.router import INJECTED_HEADER, rewrite
+    from hermes_skill_router.config import (
+        acknowledge_switch_deliveries,
+        load,
+        read_settings,
+        switch_warning_messages,
+    )
+    from hermes_skill_router.router import CHAT_COMPLETIONS, INJECTED_HEADER, rewrite
     from hermes_skill_router.search import expire_dump, forget_session
     from hermes_skill_router.tools import register_tools
 
@@ -141,16 +151,27 @@ def _route(
     Pending no-record switch warnings ride on the outgoing request as standalone system
     messages, before the disabled early return and after a rewrite alike, so the one channel
     that reaches the model carries the warning that the terminal and the host logger already
-    showed. A request without a messages list has no channel to carry them and stays untouched.
+    showed. A request without a messages list, a rewrite that returns ``None`` (no catalog,
+    unsupported mode, first failure, already injected), or an unsupported api mode on the
+    disabled path has no supported channel to carry them: the payload stays untouched and
+    the delivered fingerprint is not consumed, so a later supported request still delivers.
+    Only an outgoing request that actually carries the messages acknowledges delivery.
     """
     cfg = load(read_settings(ctx))
     switch_messages = switch_warning_messages(cfg)
     if not cfg.enabled:
-        return _with_switch_messages(request, switch_messages)
+        result = _with_switch_messages(request, switch_messages, api_mode=api_mode)
+        if result is not None:
+            acknowledge_switch_deliveries(
+                [message["content"] for message in switch_messages], cfg.cache_path
+            )
+        return result
     result = rewrite(
         request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
     )
     if not isinstance(result, Mapping):
+        # No catalog, unsupported mode, first failure, or already injected:
+        # nothing was delivered, so the injected fingerprint stays pending.
         return result
     rewritten = result.get("request")
     if not switch_messages or not isinstance(rewritten, Mapping):
@@ -158,18 +179,27 @@ def _route(
     messages = rewritten.get("messages")
     if not isinstance(messages, list):
         return result
+    acknowledge_switch_deliveries(
+        [message["content"] for message in switch_messages], cfg.cache_path
+    )
     return {
         "request": {**dict(rewritten), "messages": _carrying_switch_messages(messages, switch_messages)}
     }
 
 
-def _with_switch_messages(request: Any, switch_messages: Any) -> Any:
+def _with_switch_messages(request: Any, switch_messages: Any, api_mode: str = "chat_completions") -> Any:
     """Return *request* with *switch_messages* appended, or ``None`` when there is no channel.
 
     Used on the disabled path, where the rewrite never runs: the switch warning still reaches
-    the provider request even though routing and the display record are off.
+    the provider request even though routing and the display record are off. Unsupported
+    modes (Anthropic Messages, Responses) have no system-message channel in ``messages``,
+    so the payload is preserved untouched and the warning is deferred until a supported
+    channel exists; delivery is not acknowledged on this path.
     """
     if not switch_messages or not isinstance(request, Mapping):
+        return None
+    mode = request.get("api_mode") or api_mode
+    if mode != CHAT_COMPLETIONS:
         return None
     messages = request.get("messages")
     if not isinstance(messages, list):

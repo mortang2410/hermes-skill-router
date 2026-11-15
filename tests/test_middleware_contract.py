@@ -401,6 +401,78 @@ def test_disabled_plugin_injects_the_switch_warning_into_the_request(
     assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
 
 
+def test_disabled_unsupported_modes_preserve_payload_and_defer_warning(
+    plugin_module, endpoints, tmp_path
+):
+    """Round 3 P2: a disabled plugin must not mutate unsupported payloads."""
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["enabled"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    callback = _callback_for(plugin_module, settings)
+
+    for mode in ("anthropic_messages", "codex_responses"):
+        payload = chat_payload()
+        payload["api_mode"] = mode
+        result = callback(request=payload, api_mode=mode, **{
+            k: v for k, v in DISPATCH_KWARGS.items() if k != "api_mode"
+        })
+        assert result is None, f"disabled plugin must not mutate {mode} payloads"
+
+    # The warning was deferred, not consumed: a supported request delivers it.
+    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert "enabled" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
+    assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
+
+
+def test_no_catalog_first_then_supported_still_delivers_warning(
+    plugin_module, endpoints, tmp_path
+):
+    """Round 3 P1: a no-catalog request must not permanently suppress delivery."""
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    callback = _callback_for(plugin_module, settings)
+
+    no_catalog = {"messages": [{"role": "user", "content": "hi"}], "model": "test-model"}
+    assert callback(request=no_catalog, **DISPATCH_KWARGS) is None
+
+    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert any(
+        "showSuggestions" in message.get("content", "") and " is off; " in message.get("content", "")
+        for message in messages
+        if isinstance(message, dict)
+    ), "the supported request after a no-catalog request must still deliver"
+    # Repeat supported turns are suppressed after first delivery: the routed
+    # block is already injected, so the callback returns None.
+    assert callback(request=result["request"], **DISPATCH_KWARGS) is None
+
+
+def test_tool_first_load_then_supported_still_delivers_warning(
+    plugin_module, endpoints, tmp_path
+):
+    """Round 3 P1: a search-tool config load must not consume delivery."""
+    from hermes_skill_router.config import load
+
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    # The tool's load happens first, with no delivery.
+    load(settings)
+    callback = _callback_for(plugin_module, settings)
+    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert any(
+        "showSuggestions" in message.get("content", "")
+        for message in messages
+        if isinstance(message, dict)
+    ), "middleware after a tool-first load must still deliver"
+
+
 def test_hidden_suggestions_inject_the_switch_warning_with_the_block(
     plugin_module, endpoints, tmp_path
 ):

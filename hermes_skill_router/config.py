@@ -21,8 +21,17 @@ injected context message built by :func:`switch_warning_messages`, and one host-
 naming the switch and its effect. Unlike a malformed-value trap they never reach a display
 record (the switches suppress it), so ``load`` persists their fingerprints at emission time
 instead of waiting for a record write; fixing one switch drops only that switch's fingerprints.
-The fingerprints live beside the index cache, so disabling the display never turns them back
-into per-load spam.
+The fingerprints live beside the index cache when a cache path is set, and in the default
+``~/.cache/hermes-skill-router`` directory when ``cachePath`` is empty, so disabling the
+display or the index cache never turns them back into per-load spam.
+
+The injected channel is tracked separately from the load-time seen set: ``load`` consumes
+only the terminal/logger set, while the injected fingerprint is consumed only by
+:func:`acknowledge_switch_deliveries`, called once a valid outgoing request actually
+carries the message on a supported channel. A tool-first load, a no-catalog request, a
+first failure, an already-injected turn, or an unsupported api mode therefore defers the
+injected warning instead of permanently suppressing it; the next supported request still
+delivers it, and repeats are suppressed only after that delivery.
 """
 
 from __future__ import annotations
@@ -205,6 +214,7 @@ class Config:
     deferred_skills: Tuple[str, ...]
     notes: Tuple[str, ...]
     trap_notes: Tuple[str, ...] = ()
+    switch_message_notes: Tuple[str, ...] = ()
 
 
 def is_safe_base_url(value: Any) -> bool:
@@ -395,26 +405,27 @@ _LOGGED_NOTES: set[str] = set()
 
 
 def switches_path_for(cache_path: Any) -> Optional[str]:
-    """Return the persisted switch-warning seen-set path for *cache_path*, or ``None``.
+    """Return the persisted switch-warning seen-set path for *cache_path*.
 
-    The set lives beside the index cache, so an empty ``suggestionsPath``
-    (display disabled) still suppresses: the location is independent of the
-    optional display path and stays writable when the display is off. An
-    empty cache path means nowhere to write. ``HERMES_SKILL_ROUTER_SWITCHES_PATH``
-    wins when set.
+    The set lives beside the index cache when a cache path is set, so an
+    empty ``suggestionsPath`` (display disabled) still suppresses: the
+    location is independent of the optional display path. An empty cache
+    path (persistence off for the index) falls back to the default
+    ``~/.cache/hermes-skill-router`` directory beside the store/config
+    area, so ``cachePath: ""`` still suppresses once per value instead of
+    warning on every load. ``HERMES_SKILL_ROUTER_SWITCHES_PATH`` wins when set.
     """
     override = os.environ.get(SWITCHES_ENV_VAR) or ""
     if override.strip():
         return os.path.abspath(os.path.expanduser(override.strip()))
-    if not isinstance(cache_path, str):
-        return None
-    text = cache_path.strip()
-    if not text:
-        return None
-    directory = os.path.dirname(os.path.abspath(os.path.expanduser(text)))
-    if not directory:
-        directory = os.getcwd()
-    return os.path.join(directory, SWITCHES_FILENAME)
+    if isinstance(cache_path, str) and cache_path.strip():
+        directory = os.path.dirname(os.path.abspath(os.path.expanduser(cache_path.strip())))
+        if not directory:
+            directory = os.getcwd()
+        return os.path.join(directory, SWITCHES_FILENAME)
+    return os.path.join(
+        os.path.expanduser("~/.cache/hermes-skill-router"), SWITCHES_FILENAME
+    )
 
 
 def traps_path_for(suggestions_path: Any) -> Optional[str]:
@@ -578,8 +589,43 @@ def _is_switch_note(note: str) -> bool:
     return note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
 
 
-def _write_switch_seen(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
-    """Persist *seen* directly, without a temporary file. Never raises.
+def _read_switch_sets(
+    path: Optional[str],
+) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str]]]:
+    """Return ``(seen, delivered)`` from the switch file, empty sets when unreadable."""
+    if path is None:
+        return set(), set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return set(), set()
+    if not isinstance(data, dict):
+        return set(), set()
+
+    def _pairs(entries: Any) -> Set[Tuple[str, str]]:
+        if not isinstance(entries, list):
+            return set()
+        pairs: Set[Tuple[str, str]] = set()
+        for entry in entries:
+            if (
+                isinstance(entry, (list, tuple))
+                and len(entry) == 2
+                and isinstance(entry[0], str)
+                and isinstance(entry[1], str)
+            ):
+                pairs.add((entry[0], entry[1]))
+        return pairs
+
+    return _pairs(data.get("seen")), _pairs(data.get("delivered"))
+
+
+def _write_switch_seen(
+    path: Optional[str],
+    seen: Set[Tuple[str, str]],
+    delivered: Optional[Set[Tuple[str, str]]] = None,
+) -> None:
+    """Persist *seen* and *delivered* directly, without a temporary file. Never raises.
 
     The switch set is written by ``load`` itself, so it must not depend on the
     display writer's atomic replace: a display write failure must not cost
@@ -593,7 +639,14 @@ def _write_switch_seen(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"schema": 1, "seen": sorted([list(pair) for pair in seen])}, handle)
+            json.dump(
+                {
+                    "schema": 1,
+                    "seen": sorted([list(pair) for pair in seen]),
+                    "delivered": sorted([list(pair) for pair in (delivered or set())]),
+                },
+                handle,
+            )
             handle.flush()
             os.fsync(handle.fileno())
     except OSError:
@@ -617,18 +670,19 @@ def _pending_switch_warnings(
     settings: Mapping[str, Any],
     values: Mapping[str, Any],
     cache_path: Any,
-) -> Tuple[str, ...]:
-    """Return the offending switch warnings not yet seen, emitting and persisting them. Never raises.
+) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Return ``(pending_load, pending_injected)``, emitting terminal/logger and persisting seen.
 
-    Each switch keeps its own seen set inside the cache-side switch file: an
-    unchanged value warns once and then stays silent, a changed value hashes
-    anew and warns once more, and a fixed switch drops only its own set, so
-    re-breaking the same value warns again while the other switch stays
-    suppressed. Unlike a malformed-value trap there is no display record to
-    carry the warning (the off switches suppress it), so the fingerprints are
-    persisted here at emission time rather than by the display writer. The
-    file lives beside the index cache, so the display being disabled never
-    turns emission into per-load spam.
+    Each switch keeps its own seen set inside the switch file: an unchanged
+    value warns once on terminal/logger and then stays silent, a changed
+    value hashes anew and warns once more, and a fixed switch drops only
+    its own sets, so re-breaking the same value warns again while the other
+    switch stays suppressed. ``pending_injected`` is the subset whose
+    fingerprint is not yet in the delivered set; ``load`` never consumes
+    the delivered set, only :func:`acknowledge_switch_deliveries` after an
+    actual delivery does. The file lives beside the index cache (or in the
+    default cache directory when ``cachePath`` is empty), so the display
+    being disabled never turns emission into per-load spam.
     """
     offending = {
         key: _switch_note(key, settings.get(key, False))
@@ -639,15 +693,17 @@ def _pending_switch_warnings(
     try:
         path = switches_path_for(cache_path)
         if path is None:
-            # Nowhere to persist (no cache path): warn on every load.
             pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
             _emit_switch_warnings(pending)
-            return pending
-        seen_before = _read_traps(path)
+            return pending, pending
+        seen_before, delivered_before = _read_switch_sets(path)
         new_seen = set(seen_before)
+        new_delivered = set(delivered_before)
         for key in fixed:
             new_seen = {pair for pair in new_seen if pair[0] != key}
+            new_delivered = {pair for pair in new_delivered if pair[0] != key}
         pending_list: list[str] = []
+        injected_list: list[str] = []
         for key in SWITCH_WARNING_SWITCHES:
             if key not in offending:
                 continue
@@ -655,27 +711,39 @@ def _pending_switch_warnings(
             pair = _trap_key(line)
             if pair not in seen_before:
                 pending_list.append(line)
+            if pair not in delivered_before:
+                injected_list.append(line)
             new_seen.add(pair)
         pending = tuple(pending_list)
+        injected = tuple(injected_list)
         _emit_switch_warnings(pending)
-        if new_seen != seen_before:
-            _write_switch_seen(path, new_seen)
-        return pending
+        if new_seen != seen_before or new_delivered != delivered_before:
+            _write_switch_seen(path, new_seen, new_delivered)
+        return pending, injected
     except Exception:  # load never raises; a failure keeps the warnings visible
         logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
-        return tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
+        pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
+        return pending, pending
 
 
 def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
-    """Return the injected context messages for *cfg*'s pending switch warnings.
+    """Return the injected context messages for *cfg*'s undelivered switch warnings.
 
-    One standalone ``system`` message per pending warning line, ready to be
-    appended to the request. The message is the warning channel only: it
-    carries no suggestion row and never uses the suggestions block header, so
-    the rewrite's block recogniser never reads it as a suggestion.
+    One standalone ``system`` message per undelivered warning line, ready to
+    be appended to the request. The delivered set is consulted at load time
+    (``cfg.switch_message_notes``), never consumed by this call: only
+    :func:`acknowledge_switch_deliveries` after an actual delivery on a
+    supported channel consumes it. The message is the warning channel
+    only: it carries no suggestion row and never uses the suggestions
+    block header, so the rewrite's block recogniser never reads it as a
+    suggestion.
     """
     try:
-        notes = getattr(cfg, "notes", ()) or ()
+        injected = getattr(cfg, "switch_message_notes", None)
+        if injected is not None:
+            notes = injected
+        else:
+            notes = getattr(cfg, "notes", ()) or ()
     except Exception:  # a hostile notes field must never cost the call
         return ()
     messages: list[Dict[str, str]] = []
@@ -683,6 +751,31 @@ def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
         if isinstance(note, str) and _is_switch_note(note):
             messages.append({"role": "system", "content": note})
     return tuple(messages)
+
+
+def acknowledge_switch_deliveries(notes: Sequence[str], cache_path: Any) -> None:
+    """Persist the injected-channel fingerprints of *notes* actually delivered. Never raises.
+
+    Called by the middleware only after a valid outgoing request on a
+    supported channel carries the messages. A load that never reached
+    delivery (tool-first, no-catalog, first failure, unsupported mode)
+    never calls this, so its fingerprints stay pending for the next
+    supported request.
+    """
+    if not notes:
+        return
+    try:
+        path = switches_path_for(cache_path)
+        if path is None:
+            return
+        seen_before, delivered_before = _read_switch_sets(path)
+        union = delivered_before | {
+            _trap_key(note) for note in notes if isinstance(note, str) and _is_switch_note(note)
+        }
+        if union != delivered_before:
+            _write_switch_seen(path, seen_before, union)
+    except Exception:  # a persistence failure must never cost the request
+        logger.debug("hermes-skill-router config: the switch delivery failed", exc_info=True)
 
 
 def report_notes(notes: Optional[Sequence[str]]) -> None:
@@ -715,8 +808,15 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
     trap_notes = _pending_trap_notes(notes, suggestions)
-    switch_notes = _pending_switch_warnings(settings, values, values.get("cache_path", ""))
-    return Config(notes=tuple(notes) + switch_notes, trap_notes=trap_notes, **values)
+    switch_notes, switch_message_notes = _pending_switch_warnings(
+        settings, values, values.get("cache_path", "")
+    )
+    return Config(
+        notes=tuple(notes) + switch_notes,
+        trap_notes=trap_notes,
+        switch_message_notes=switch_message_notes,
+        **values,
+    )
 
 
 def read_settings(ctx: Any) -> dict[str, Any]:
