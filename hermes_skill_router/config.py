@@ -28,10 +28,13 @@ display or the index cache never turns them back into per-load spam.
 The injected channel is tracked separately from the load-time seen set: ``load`` consumes
 only the terminal/logger set, while the injected fingerprint is consumed only by
 :func:`acknowledge_switch_deliveries`, called once a valid outgoing request actually
-carries the message on a supported channel. A tool-first load, a no-catalog request, a
-first failure, an already-injected turn, or an unsupported api mode therefore defers the
-injected warning instead of permanently suppressing it; the next supported request still
-delivers it, and repeats are suppressed only after that delivery.
+carries the message on a supported channel. A tool-first load therefore defers the
+injected warning instead of permanently suppressing it, and every no-rewrite path that
+reaches a supported request delivers at the first request that carries messages
+(no-catalog, first failure, already-injected included); only an unsupported api mode or
+a malformed request without a messages list defers it. Repeats are suppressed only
+after that delivery, and an ack is accepted only at the generation its note was
+captured at, so a pre-fix note can never suppress a post-fix delivery.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
@@ -215,6 +218,7 @@ class Config:
     notes: Tuple[str, ...]
     trap_notes: Tuple[str, ...] = ()
     switch_message_notes: Tuple[str, ...] = ()
+    switch_generations: Dict[str, int] = field(default_factory=dict)
 
 
 def is_safe_base_url(value: Any) -> bool:
@@ -591,17 +595,23 @@ def _is_switch_note(note: str) -> bool:
 
 def _read_switch_sets(
     path: Optional[str],
-) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str]]]:
-    """Return ``(seen, delivered)`` from the switch file, empty sets when unreadable."""
+) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str]], Dict[str, int]]:
+    """Return ``(seen, delivered, generations)`` from the switch file.
+
+    Empty sets and zero generations when unreadable. A generation is the
+    per-switch counter a pending note is captured at, bumped by every fix
+    of that switch; a file written before generations existed reads as
+    generation zero everywhere.
+    """
     if path is None:
-        return set(), set()
+        return set(), set(), {}
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
-        return set(), set()
+        return set(), set(), {}
     if not isinstance(data, dict):
-        return set(), set()
+        return set(), set(), {}
 
     def _pairs(entries: Any) -> Set[Tuple[str, str]]:
         if not isinstance(entries, list):
@@ -617,13 +627,25 @@ def _read_switch_sets(
                 pairs.add((entry[0], entry[1]))
         return pairs
 
-    return _pairs(data.get("seen")), _pairs(data.get("delivered"))
+    raw_generations = data.get("generations")
+    generations: Dict[str, int] = {}
+    if isinstance(raw_generations, dict):
+        for key, value in raw_generations.items():
+            if (
+                isinstance(key, str)
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            ):
+                generations[key] = value
+    return _pairs(data.get("seen")), _pairs(data.get("delivered")), generations
 
 
 def _write_switch_seen(
     path: Optional[str],
     seen: Set[Tuple[str, str]],
     delivered: Optional[Set[Tuple[str, str]]] = None,
+    generations: Optional[Dict[str, int]] = None,
 ) -> None:
     """Persist *seen* and *delivered* directly, without a temporary file. Never raises.
 
@@ -644,6 +666,7 @@ def _write_switch_seen(
                     "schema": 1,
                     "seen": sorted([list(pair) for pair in seen]),
                     "delivered": sorted([list(pair) for pair in (delivered or set())]),
+                    "generations": dict(generations or {}),
                 },
                 handle,
             )
@@ -670,8 +693,8 @@ def _pending_switch_warnings(
     settings: Mapping[str, Any],
     values: Mapping[str, Any],
     cache_path: Any,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """Return ``(pending_load, pending_injected)``, emitting terminal/logger and persisting seen.
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int]]:
+    """Return ``(pending_load, pending_injected, generations)``, emitting terminal/logger.
 
     Each switch keeps its own seen set inside the switch file: an unchanged
     value warns once on terminal/logger and then stays silent, a changed
@@ -683,6 +706,12 @@ def _pending_switch_warnings(
     actual delivery does. The file lives beside the index cache (or in the
     default cache directory when ``cachePath`` is empty), so the display
     being disabled never turns emission into per-load spam.
+
+    ``generations`` is the per-switch counter every pending note is
+    captured at: a fix that clears its switch's sets bumps its switch's
+    counter, so a late ack of a pre-fix note never matches the post-fix
+    generation. A fix with nothing to clear writes nothing, so a healthy
+    load stays write-free.
     """
     offending = {
         key: _switch_note(key, settings.get(key, False))
@@ -695,13 +724,23 @@ def _pending_switch_warnings(
         if path is None:
             pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
             _emit_switch_warnings(pending)
-            return pending, pending
-        seen_before, delivered_before = _read_switch_sets(path)
+            return pending, pending, {}
+        seen_before, delivered_before, generations_before = _read_switch_sets(path)
+        generations = dict(generations_before)
         new_seen = set(seen_before)
         new_delivered = set(delivered_before)
         for key in fixed:
+            cleared = any(pair[0] == key for pair in new_seen) or any(
+                pair[0] == key for pair in new_delivered
+            )
             new_seen = {pair for pair in new_seen if pair[0] != key}
             new_delivered = {pair for pair in new_delivered if pair[0] != key}
+            if cleared:
+                # A cleared set means a pending note from before this fix
+                # may still be in flight; bumping stales it. A fix with
+                # nothing to clear writes nothing, so a healthy load
+                # stays write-free.
+                generations[key] = generations.get(key, 0) + 1
         pending_list: list[str] = []
         injected_list: list[str] = []
         for key in SWITCH_WARNING_SWITCHES:
@@ -717,13 +756,17 @@ def _pending_switch_warnings(
         pending = tuple(pending_list)
         injected = tuple(injected_list)
         _emit_switch_warnings(pending)
-        if new_seen != seen_before or new_delivered != delivered_before:
-            _write_switch_seen(path, new_seen, new_delivered)
-        return pending, injected
+        if (
+            new_seen != seen_before
+            or new_delivered != delivered_before
+            or generations != generations_before
+        ):
+            _write_switch_seen(path, new_seen, new_delivered, generations)
+        return pending, injected, generations
     except Exception:  # load never raises; a failure keeps the warnings visible
         logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
         pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
-        return pending, pending
+        return pending, pending, {}
 
 
 def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
@@ -753,20 +796,28 @@ def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
     return tuple(messages)
 
 
-def acknowledge_switch_deliveries(notes: Sequence[str], cache_path: Any) -> None:
+def acknowledge_switch_deliveries(
+    notes: Sequence[str],
+    cache_path: Any,
+    generations: Optional[Mapping[str, int]] = None,
+) -> None:
     """Persist the injected-channel fingerprints of *notes* actually delivered. Never raises.
 
     Called by the middleware only after a valid outgoing request on a
     supported channel carries the messages. A load that never reached
-    delivery (tool-first, no-catalog, first failure, unsupported mode)
-    never calls this, so its fingerprints stay pending for the next
-    supported request. An acknowledgment whose pending note is no longer
-    in the seen set for that switch is stale: a fix since the pending
-    note was produced cleared that switch's seen set, so the ack is
-    rejected (Deliver requires a prior Load, per the WarnSuppression
-    model) and a later re-break of the same value warns and delivers
-    again instead of being silently suppressed by the stale ack. The
-    seen set is re-read here, at ack time, so the check sees the fix.
+    delivery (tool-first, unsupported mode, malformed request) never
+    calls this, so its fingerprints stay pending for the next supported
+    request. An acknowledgment is accepted only when its
+    pending note is still in the seen set for that switch AND the note's
+    captured generation (``generations``, from the load that produced
+    the note) equals the switch's current generation, re-read here at
+    ack time: seen-set membership alone is not identity, because in the
+    fix/rebreak ABA the same pair is back in the seen set while the
+    pre-fix note is stale. A rejected ack leaves the delivered set
+    untouched, so a later re-break of the same value still delivers
+    instead of being silently suppressed by the stale ack. An ack
+    without its captured generations is rejected the same way (fail
+    closed), and the delivered set stays a subset of seen.
     """
     if not notes:
         return
@@ -774,16 +825,23 @@ def acknowledge_switch_deliveries(notes: Sequence[str], cache_path: Any) -> None
         path = switches_path_for(cache_path)
         if path is None:
             return
-        seen_before, delivered_before = _read_switch_sets(path)
-        union = delivered_before | {
-            pair
-            for pair in (
-                _trap_key(note) for note in notes if isinstance(note, str) and _is_switch_note(note)
-            )
-            if pair in seen_before
-        }
+        seen_before, delivered_before, current = _read_switch_sets(path)
+        if generations is None:
+            return
+        captured = dict(generations)
+        accepted = set()
+        for note in notes:
+            if not isinstance(note, str) or not _is_switch_note(note):
+                continue
+            pair = _trap_key(note)
+            if pair not in seen_before:
+                continue
+            if captured.get(pair[0], 0) != current.get(pair[0], 0):
+                continue
+            accepted.add(pair)
+        union = delivered_before | accepted
         if union != delivered_before:
-            _write_switch_seen(path, seen_before, union)
+            _write_switch_seen(path, seen_before, union, current)
     except Exception:  # a persistence failure must never cost the request
         logger.debug("hermes-skill-router config: the switch delivery failed", exc_info=True)
 
@@ -818,13 +876,14 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
     trap_notes = _pending_trap_notes(notes, suggestions)
-    switch_notes, switch_message_notes = _pending_switch_warnings(
+    switch_notes, switch_message_notes, switch_generations = _pending_switch_warnings(
         settings, values, values.get("cache_path", "")
     )
     return Config(
         notes=tuple(notes) + switch_notes,
         trap_notes=trap_notes,
         switch_message_notes=switch_message_notes,
+        switch_generations=switch_generations,
         **values,
     )
 

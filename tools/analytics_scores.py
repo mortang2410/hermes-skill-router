@@ -30,6 +30,16 @@ intervening events as zero.
 The script is read-only: it opens the store and the session store with
 ``mode=ro`` connections and never writes either. Output is deterministic
 for a fixed input copy.
+
+Replay parity: the catalog copy records the ``embedModelId`` its saved
+index was built with (``embed_model`` in the saved-index JSON, written by
+``library`` at build time). The replay model, resolved from the explicit
+flag or the workspace config, must equal that recorded model; otherwise
+the run exits with a named parity error before any embedding call, never
+scoring in the wrong vector space. A catalog written before the key
+existed records no model, so the documented invocation without
+``--embed-model`` is a parity error there too and the operator must name
+the run's model explicitly.
 """
 
 from __future__ import annotations
@@ -91,6 +101,16 @@ class IdentityError(AnalyticsError):
     """A catalog name does not identify one skill."""
 
 
+class ParityError(AnalyticsError):
+    """The replay would run in a different vector space than the logged run.
+
+    The catalog copy records the ``embedModelId`` its saved index was
+    built with; a replay naming any other model (or an invocation that
+    cannot name the run's model at all) exits with this error instead of
+    silently scoring in the wrong space.
+    """
+
+
 class EmbedError(AnalyticsError):
     """The embed endpoint is unreachable or answered unusable vectors."""
 
@@ -121,11 +141,15 @@ def document_text(name: str, description: str, max_description_chars: int) -> st
     return name + "\n" + description[:max_description_chars]
 
 
-def read_catalog(path: str) -> Tuple[List[str], List[str]]:
-    """Read the saved-index copy's ``names`` and ``descriptions`` arrays.
+def read_catalog(path: str) -> Tuple[List[str], List[str], Optional[str]]:
+    """Read the saved-index copy's ``names``, ``descriptions`` and build model.
 
-    A catalog repeating a name is an identity ambiguity and fails the run:
-    the catalog cannot say which skill the name means.
+    The third value is the ``embed_model`` the saved index was built with,
+    or ``None`` for a catalog written before the key existed (a catalog
+    carrying the key with a non-string or empty value is a parity error:
+    the run's model cannot be recovered from it). A catalog repeating a
+    name is an identity ambiguity and fails the run: the catalog cannot
+    say which skill the name means.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -134,6 +158,15 @@ def read_catalog(path: str) -> Tuple[List[str], List[str]]:
         raise AnalyticsError(f"analytics catalog error: cannot read {path}: {exc}") from exc
     names = data.get("names") if isinstance(data, dict) else None
     descriptions = data.get("descriptions") if isinstance(data, dict) else None
+    catalog_model: Optional[str] = None
+    if isinstance(data, dict) and "embed_model" in data:
+        recorded = data["embed_model"]
+        if not isinstance(recorded, str) or not recorded.strip():
+            raise ParityError(
+                f"analytics parity error: catalog {path} records an unusable "
+                f"embed_model {recorded!r}; the run's vector space cannot be proven"
+            )
+        catalog_model = recorded
     if not isinstance(names, list) or not isinstance(descriptions, list):
         raise AnalyticsError(
             f"analytics catalog error: {path} carries no names/descriptions arrays"
@@ -154,7 +187,7 @@ def read_catalog(path: str) -> Tuple[List[str], List[str]]:
         if name in seen:
             raise _identity(f"catalog {path} repeats the name {name!r}")
         seen.add(name)
-    return list(names), list(descriptions)
+    return list(names), list(descriptions), catalog_model
 
 
 def parse_log_timestamp_ms(prefix: str) -> Optional[int]:
@@ -696,7 +729,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the embedModelId value the logged run used (the replay must stay in that "
         "vector space); defaults to the workspace config's embedModelId, then the "
-        "builtin default where no custom config exists, when omitted",
+        "builtin default where no custom config exists, when omitted. The catalog "
+        "copy's recorded build model is the parity authority: a replay model that "
+        "does not match it exits with a parity error, and a catalog recording no "
+        "model requires this flag",
     )
     parser.add_argument(
         "--embed-timeout-ms",
@@ -754,7 +790,9 @@ def _resolve_embed_defaults() -> Tuple[str, int]:
         return default_model, default_timeout
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # UnicodeError (invalid UTF-8) is a named unreadable-config failure
+        # like any other, never a traceback.
         raise AnalyticsError(
             f"analytics error: cannot read workspace config {path}: {exc}"
         ) from exc
@@ -825,9 +863,12 @@ def run(args: argparse.Namespace) -> List[str]:
             f"not {args.max_description_chars}"
         )
     # Resolve the run's embed model/timeout from the workspace config when the
-    # documented invocation omits them, so the documented command works
-    # unchanged and still replays in the same vector space as the logged run.
-    # The explicit flags always override the workspace config.
+    # documented invocation omits them. The workspace config alone cannot
+    # prove the run used those values, so the catalog copy's recorded build
+    # model is the parity authority below: a mismatch is a named parity
+    # error, never a silent replay in the wrong space. The explicit flags
+    # always override the workspace config.
+    model_explicit = args.embed_model is not None
     if args.embed_model is None or args.embed_timeout_ms is None:
         workspace_model, workspace_timeout = _resolve_embed_defaults()
         if args.embed_model is None:
@@ -842,7 +883,24 @@ def run(args: argparse.Namespace) -> List[str]:
     store_conn = open_readonly(args.store, "association store")
     try:
         check_provenance(store_conn)
-        names, descriptions = read_catalog(args.catalog)
+        names, descriptions, catalog_model = read_catalog(args.catalog)
+        if catalog_model is not None:
+            if args.embed_model != catalog_model:
+                raise ParityError(
+                    f"analytics parity error: the replay model {args.embed_model!r} "
+                    f"does not match the catalog's recorded build model "
+                    f"{catalog_model!r}; refusing to score in the wrong vector space"
+                )
+        elif not model_explicit:
+            raise ParityError(
+                f"analytics parity error: catalog {args.catalog} records no build "
+                "model and --embed-model was omitted, so the run's vector space "
+                "cannot be proven; pass --embed-model explicitly"
+            )
+        # The timeout is not part of the parity check: it bounds one embed
+        # request (liveness) and cannot select different vectors, so a wrong
+        # timeout fails with the named embed error instead of silently
+        # scoring in the wrong space.
         decisions = read_decision_log(args.log)
         if not decisions:
             return ["no anomalies"]

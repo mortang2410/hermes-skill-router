@@ -128,6 +128,7 @@ CONFIG_FIELDS = {
     "notes",
     "trap_notes",
     "switch_message_notes",
+    "switch_generations",
 }
 
 OUT_OF_BOUNDS = [

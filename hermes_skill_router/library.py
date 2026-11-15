@@ -1087,7 +1087,7 @@ def _write_cache(cfg: Config, index: Index) -> bool:
         )
         temporary = handle.name
         with handle:
-            json.dump(_cache_payload(index), handle)
+            json.dump(_cache_payload(index, cfg.embed_model_id), handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -1109,11 +1109,21 @@ def _write_cache(cfg: Config, index: Index) -> bool:
                 )
 
 
-def _cache_payload(index: Index) -> Dict[str, object]:
+def _cache_payload(index: Index, embed_model: str) -> Dict[str, object]:
+    """Return the saved-index JSON for *index*, naming the model that built it.
+
+    ``embed_model`` is the run's ``embedModelId`` at build time: the
+    analytics replay reads it back and refuses to score in any other
+    vector space, so a catalog copy always carries its own historical
+    model instead of depending on the workspace config being unchanged
+    since the run. Readers ignore the key, so older builds read newer
+    payloads unchanged.
+    """
     return {
         "version": CACHE_VERSION,
         "fingerprint": index.fingerprint,
         "dim": index.dim,
+        "embed_model": embed_model,
         "names": list(index.names),
         "descriptions": list(index.descriptions),
         "vectors": [list(vector) for vector in index.vectors],

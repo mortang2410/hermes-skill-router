@@ -165,7 +165,9 @@ def _route(
         result = _with_switch_messages(request, switch_messages, api_mode=api_mode)
         if result is not None:
             acknowledge_switch_deliveries(
-                [message["content"] for message in switch_messages], cfg.cache_path
+                [message["content"] for message in switch_messages],
+                cfg.cache_path,
+                getattr(cfg, "switch_generations", None),
             )
         return result
     result = rewrite(
@@ -181,7 +183,9 @@ def _route(
         delivered = _with_switch_messages(request, switch_messages, api_mode=api_mode)
         if delivered is not None:
             acknowledge_switch_deliveries(
-                [message["content"] for message in switch_messages], cfg.cache_path
+                [message["content"] for message in switch_messages],
+                cfg.cache_path,
+                getattr(cfg, "switch_generations", None),
             )
             return delivered
         return result
@@ -192,7 +196,9 @@ def _route(
     if not isinstance(messages, list):
         return result
     acknowledge_switch_deliveries(
-        [message["content"] for message in switch_messages], cfg.cache_path
+        [message["content"] for message in switch_messages],
+        cfg.cache_path,
+        getattr(cfg, "switch_generations", None),
     )
     return {
         "request": {**dict(rewritten), "messages": _carrying_switch_messages(messages, switch_messages)}

@@ -283,8 +283,13 @@ def make_case(
     store_kwargs: Optional[dict] = None,
     sessions: Optional[Sequence[Tuple[str, Optional[int], Optional[int]]]] = None,
     messages: Optional[Sequence[Tuple[int, str, str, int, Optional[str], Optional[str], Optional[str]]]] = None,
+    catalog_model: str = "bge-m3",
 ) -> Dict[str, Path]:
-    """Build one complete case: store, session store, log and catalog."""
+    """Build one complete case: store, session store, log and catalog.
+
+    ``catalog_model`` is the build model the catalog copy records: it must
+    match the model the replay resolves to, or the run is a parity error.
+    """
     tmp_path.mkdir(parents=True, exist_ok=True)
     paths = {
         "store": tmp_path / "associations.db",
@@ -314,7 +319,8 @@ def make_case(
             vectors=[[0.0] * 4 for _ in catalog_names],
             dim=4,
             fingerprint="fixture",
-        )
+        ),
+        catalog_model,
     )
     paths["catalog"].write_text(json.dumps(payload), encoding="utf-8")
     return paths
@@ -480,7 +486,7 @@ def test_custom_workspace_model_replays_in_its_own_space(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(_hermes_home(tmp_path)))
     endpoint, received = _multi_model_endpoint()
     try:
-        paths = make_case(tmp_path)
+        paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
         result = subprocess.run(
             _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
         )
@@ -566,6 +572,114 @@ def test_unreadable_or_unusable_workspace_config_fails_closed(endpoint, tmp_path
     assert "embedTimeoutMs" in result.stderr, result.stderr
 
 
+def test_invalid_utf8_workspace_config_fails_closed(endpoint, tmp_path, monkeypatch):
+    """Round 5 P2: invalid UTF-8 in the workspace config is a named nonzero
+    exit, never a UnicodeDecodeError traceback."""
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    paths = make_case(tmp_path)
+    (home / "config.yaml").write_bytes(
+        b"plugins:\n  entries:\n    hermes-skill-router:\n      settings:\n"
+        b"        embedModelId: \xff\xfe\n"
+    )
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode != 0
+    assert "analytics error" in result.stderr, result.stderr
+    assert "workspace config" in result.stderr, result.stderr
+    assert "Traceback" not in result.stderr, result.stderr
+
+
+def _multi_model_accepting_endpoint(models):
+    """An endpoint that accepts every model in *models* and records them.
+
+    A wrong-space replay would be accepted here, so a passing run proves
+    nothing about parity unless the script itself refuses.
+    """
+    received: List[str] = []
+
+    def responder(request):
+        payload = request.json()
+        received.append(str(payload.get("model")))
+        vectors = [embed_vector(text) for text in payload["input"]]
+        return Response(body={"data": [{"embedding": vector} for vector in vectors]})
+
+    server = FakeEndpoint(responder)
+    return server, received
+
+
+def test_wrong_model_replay_is_a_named_parity_error_before_embedding(tmp_path):
+    """Round 5 P2: an explicit model other than the catalog's recorded build
+    model is a parity error, before any embedding call is made."""
+    endpoint, received = _multi_model_accepting_endpoint(["bge-m3", CUSTOM_MODEL])
+    try:
+        paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
+        result = run_script(endpoint, paths, embed_model="bge-m3")
+        assert result.returncode != 0
+        assert "analytics parity error" in result.stderr, result.stderr
+        assert CUSTOM_MODEL in result.stderr and "bge-m3" in result.stderr, result.stderr
+        assert received == [], f"parity must refuse before embedding, got {received}"
+        matched = run_script(endpoint, paths, embed_model=CUSTOM_MODEL)
+        assert matched.returncode == 0, matched.stderr
+        assert received and all(model == CUSTOM_MODEL for model in received), received
+    finally:
+        endpoint.close()
+
+
+def test_stale_workspace_config_is_a_named_parity_error(tmp_path, monkeypatch):
+    """Round 5 P2: the workspace config changed since the logged run.
+
+    The current workspace names a different model than the catalog's
+    recorded build model; the documented invocation (no flags) must exit
+    with a parity error instead of silently replaying in the new space.
+    """
+    home = tmp_path / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-skill-router:\n      settings:\n"
+        "        embedModelId: stale-model\n        embedTimeoutMs: 6000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    endpoint, received = _multi_model_accepting_endpoint(["stale-model", CUSTOM_MODEL])
+    try:
+        paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
+        result = subprocess.run(
+            _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode != 0
+        assert "analytics parity error" in result.stderr, result.stderr
+        assert "stale-model" in result.stderr and CUSTOM_MODEL in result.stderr, result.stderr
+        assert received == [], f"parity must refuse before embedding, got {received}"
+    finally:
+        endpoint.close()
+
+
+def test_legacy_catalog_without_recorded_model_needs_an_explicit_flag(endpoint, tmp_path):
+    """Round 5 P2: a catalog written before the build model was recorded.
+
+    The documented invocation without ``--embed-model`` is a parity error
+    naming the flag; with the explicit flag the run replays normally.
+    """
+    paths = make_case(tmp_path)
+    payload = json.loads(paths["catalog"].read_text(encoding="utf-8"))
+    payload.pop("embed_model", None)
+    paths["catalog"].write_text(json.dumps(payload), encoding="utf-8")
+
+    result = subprocess.run(
+        _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode != 0
+    assert "analytics parity error" in result.stderr, result.stderr
+    assert "--embed-model" in result.stderr, result.stderr
+
+    explicit = run_script(endpoint, paths, embed_model="bge-m3")
+    assert explicit.returncode == 0, explicit.stderr
+    assert set(anomalies_for(explicit.stdout)) == {"alpha-skill"}
+
+
 def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypatch):
     """Round 4 concern: the analytics process writes no persisted warning state.
 
@@ -592,12 +706,12 @@ def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypa
         if note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
     ]
     assert len(notes) == 1
-    acknowledge_switch_deliveries(notes, "")
+    acknowledge_switch_deliveries(notes, "", cfg.switch_generations)
     assert switch_warning_messages(load(settings)) == ()
 
     env = {**__import__("os").environ, "HOME": str(tmp_path / "home"),
            "HERMES_HOME": str(tmp_path / "hermes-home")}
-    paths = make_case(tmp_path)
+    paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
     result = subprocess.run(
         _documented_command(endpoint, paths), capture_output=True, text=True, timeout=120, env=env
     )
@@ -1342,7 +1456,8 @@ def test_hermes_harness_store_passes_provenance_control(endpoint, tmp_path):
 
 
 def test_an_endpoint_rejects_a_mismatched_embed_model(tmp_path):
-    """The script sends the model it was given; another model's endpoint rejects it."""
+    """A replay model other than the catalog's recorded build model is a parity
+    error before the endpoint is ever called; the recorded model replays."""
 
     def picky(request):
         payload = request.json()
@@ -1353,13 +1468,13 @@ def test_an_endpoint_rejects_a_mismatched_embed_model(tmp_path):
 
     server = FakeEndpoint(responder=picky)
     try:
-        paths = make_case(tmp_path)
+        paths = make_case(tmp_path, catalog_model="run-model")
         matched = run_script(server, paths, embed_model="run-model")
         assert matched.returncode == 0, matched.stderr
         assert set(anomalies_for(matched.stdout)) == {"alpha-skill"}
         mismatched = run_script(server, paths, embed_model="other-model")
         assert mismatched.returncode != 0
-        assert "analytics embed error" in mismatched.stderr, mismatched.stderr
+        assert "analytics parity error" in mismatched.stderr, mismatched.stderr
     finally:
         server.close()
 

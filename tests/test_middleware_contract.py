@@ -596,6 +596,40 @@ def test_every_no_rewrite_path_delivers_on_the_first_supported_turn(
     assert not _warning_messages(recovered), "recovery turn carries no second warning"
 
 
+def test_already_injected_first_supported_turn_delivers_pending_warning_once(
+    plugin_module, endpoints, tmp_path
+):
+    """Round 5 P2: a pending warning on an already-injected FIRST supported turn.
+
+    The every-no-rewrite-path test injects first and only then replays the
+    already-injected payload, so it never exercises a fresh pending warning
+    on an already-injected turn. Here the very first turn already carries
+    the suggestion block: the warning must still deliver once, before the
+    trailing block (which stays last), and the next turn is suppressed.
+    """
+    settings = settings_for(endpoints, tmp_path / "suggestions.json")
+    settings["showSuggestions"] = False
+    settings["cachePath"] = str(tmp_path / "index.json")
+    callback = _callback_for(plugin_module, settings)
+
+    payload = chat_payload()
+    payload["messages"] = [
+        *payload["messages"],
+        {"role": "system", "content": "Skills routed for this request\nbeta (0.9)"},
+    ]
+    first = callback(request=payload, **DISPATCH_KWARGS)
+    warnings = _warning_messages(first)
+    assert len(warnings) == 1, "an already-injected first turn delivers the warning once"
+    messages = first["request"]["messages"]
+    assert messages[-1]["content"].startswith("Skills routed for this request"), (
+        "the suggestion block stays last so the replay guard still fires"
+    )
+    assert messages[-2] == warnings[0], "the warning rides before the trailing block"
+    assert callback(request=first["request"], **DISPATCH_KWARGS) is None, (
+        "after that delivery the already-injected request stays suppressed"
+    )
+
+
 def test_tool_first_load_then_supported_still_delivers_warning(
     plugin_module, endpoints, tmp_path
 ):
@@ -638,10 +672,12 @@ def test_hidden_suggestions_inject_the_switch_warning_with_the_block(
     assert not (tmp_path / "suggestions.json").exists()
 
 
+@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
 def test_both_empty_paths_deliver_the_warning_through_the_middleware(
-    plugin_module, endpoints, tmp_path, monkeypatch
+    plugin_module, endpoints, tmp_path, monkeypatch, switch
 ):
-    """Round 4 gap: both paths empty still delivers through the middleware, not just at load.
+    """Round 4 gap, parameterized over both switch directions in round 5: both
+    paths empty still delivers through the middleware, not just at load.
 
     With ``suggestionsPath`` and ``cachePath`` both empty, the switch warning must
     reach the model on the first supported request and stay suppressed after
@@ -651,7 +687,7 @@ def test_both_empty_paths_deliver_the_warning_through_the_middleware(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
     settings = settings_for(endpoints, tmp_path / "suggestions.json")
-    settings["showSuggestions"] = False
+    settings[switch] = False
     settings["suggestionsPath"] = ""
     settings["cachePath"] = ""
     callback = _callback_for(plugin_module, settings)
