@@ -1,6 +1,6 @@
 # hermes-skill-router
 
-A Hermes Agent plugin that takes the always-on skill catalog out of every Chat Completions request and appends a short list of the skills that fit the turn. Our plugin combines three features: hiding the skill catalog, RRF first-pass combining semantic search, lexical search, and historical learning, and then the second pass reranking the shortlist with a decision model. The model keeps `skills_list` and `skill_view`, so it can still list or open any skill.
+A Hermes Agent plugin that takes the always-on skill catalog out of every Chat Completions request and appends a short list of the skills that fit the turn. Our plugin combines three features: hiding the skill catalog, RRF first-pass combining semantic search, lexical search, and historical learning, and then the second pass reranking the shortlist with a decision model. The model keeps `skills_list`, `skill_view`, and `skill_router_search`, so it can still list, open, or search for any skill.
 
 The skill list is embedded once and cached, so a warm turn does no catalog embedding: it pays for
 the query embed and the rerank. The default 50-row shortlist reranked in a median 0.71 seconds on
@@ -154,7 +154,7 @@ The model can open any row with `skill_view`. `skills_list` still lists the whol
 shortlist misses, the model can search by hand with `skill_router_search`, using its own words.
 
 You also see the last decision on screen, at no token cost. The desktop app shows a `Skills routed`
-pane on the right rail, collapsed by default. In `hermes --tui`, run `/skills-routed` to dock the
+pane on the right side of the window, collapsed by default. In `hermes --tui`, run `/skills-routed` to dock the
 same names. The record holds names only, never your request text.
 
 ## Configuration
