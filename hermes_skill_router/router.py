@@ -609,20 +609,25 @@ def _degraded_note(
     cfg: Config,
     *,
     index: Optional[Index] = None,
+    partial_view: bool = False,
 ) -> str:
     """Return the turn's one degraded line naming every active loss, or ``""`` when healthy.
 
     The line enumerates, on the single-line record note, each loss the survey
     found silent: history incomplete (which of the four skip states), heal
-    failed vs finished-incomplete vs running vs pending, missing BM25,
-    fusion off, cache persistence off, and newly-seen config traps. The
-    saved-index partial-view refusal stays log-only in ``library`` and never
-    rides this line, until the follow-up grill board settles its placement.
-    A failed (dead-endpoint) or budget pass never reaches here, so
-    those lines outrank this chooser and never consume the heal note; a
-    complete store never consumes it either.
+    failed vs finished-incomplete vs running vs absent, the saved-index
+    partial-view fallback, missing BM25, fusion off, cache persistence off, and
+    newly-seen config traps. The history wording matches the attempt state: it
+    says healing is running only while an attempt runs, and heal finished,
+    still incomplete after one settles. The heal-failure part is consumed here
+    and only here: a failed (dead-endpoint) or budget pass never reaches this
+    chooser, so those lines outrank it and never consume the heal note, and a
+    complete store never consumes it either (the pending note is read only on
+    an incomplete store, so an observation of complete or a reset may clear it
+    before display instead).
 
-    *index* supplies the BM25 fact (its term index).
+    *index* supplies the BM25 fact (its term index). *partial_view* says the
+    build refused a truncated catalog and fell back to the saved index.
     """
     parts: List[str] = []
     if _store_in_play(cfg):
@@ -630,26 +635,21 @@ def _degraded_note(
         if path is not None:
             skip = _store_skip_state(path)
             if skip != "complete":
-                failure = associations.heal_failure_note(path)
-                if failure:
-                    parts.append(
-                        f"History incomplete ({skip} store) and the background heal failed; "
-                        "routing continues without learned history."
-                    )
+                state = associations.heal_state(path)
+                if state == "finished":
+                    heal_text = ", heal finished, still incomplete"
+                elif state == "running":
+                    heal_text = ", healing is running in the background"
                 else:
-                    state = associations.heal_state(path)
-                    if state == "finished":
-                        heal_text = (
-                            "and the background heal finished but the store is still incomplete"
-                        )
-                    elif state == "running":
-                        heal_text = "and healing is running in the background"
-                    else:
-                        heal_text = "and a background heal is pending"
-                    parts.append(
-                        f"History incomplete ({skip} store) {heal_text}; "
-                        "routing continues without learned history."
-                    )
+                    heal_text = ""
+                parts.append(
+                    f"History incomplete ({skip} store){heal_text}; "
+                    "routing continues without learned history."
+                )
+                if associations.heal_failure_note(path):
+                    parts.append("The background heal failed.")
+    if partial_view:
+        parts.append(SAVED_INDEX_NOTE)
     settings = resolve_fusion_config(
         {
             "mode": cfg.fusion_mode,

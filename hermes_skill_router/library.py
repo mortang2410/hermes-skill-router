@@ -167,6 +167,46 @@ def cached_row_count(cfg: Config) -> int:
     return len(saved.names) if saved is not None else 0
 
 
+def is_partial_view(cfg: Config, rows: CatalogRows) -> bool:
+    """Return whether *rows* were refused as a partial view of the saved index.
+
+    The refusal rule is :func:`load_or_build`'s: a catalog holding fewer than half
+    the rows of the saved index is not treated as an edit. The note chooser asks
+    this after the build settled, so it can name the saved-index fallback; a
+    caller that supplied its own index never asks, because only the build can
+    refuse.
+    """
+    saved = _read_saved(cfg)
+    if saved is None:
+        return False
+    return len(_unique(rows)) * 2 < len(saved.names)
+
+
+def will_embed(cfg: Config, rows: CatalogRows) -> bool:
+    """Return whether :func:`load_or_build` will embed *rows* instead of returning warm.
+
+    This is the cold-build fact the router announces before it blocks: the memo,
+    the warm-cache match and the partial-view refusal all return without
+    embedding, so none of them is a build in progress. The check reads the same
+    state the build reads; a warm hit landing between this check and the build
+    announces a build that then returns at once, which the settled record
+    replaces.
+    """
+    unique = _unique(rows)
+    if not unique:
+        return False
+    key = _fingerprint(unique, cfg)
+    with _MEMO_LOCK:
+        saved = _read_saved(cfg)
+        if saved is not None and len(unique) * 2 < len(saved.names):
+            return False
+        if _MEMO.get(key) is not None:
+            return False
+        if saved is not None and saved.fingerprint == key and len(saved.names) == len(unique):
+            return False
+        return True
+
+
 def path_resolver(
     cfg: Config,
     index: Index,
