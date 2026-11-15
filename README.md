@@ -1,10 +1,6 @@
 # hermes-skill-router
 
-A Hermes Agent plugin that takes the always-on skill catalog out of every Chat Completions request and appends a short list of the skills that fit the turn. Our plugin combines three features: hiding the skill catalog, RRF first-pass combining semantic search, lexical search, and historical learning, and then the second pass reranking the shortlist with a decision model. The model keeps `skills_list`, `skill_view`, and `skill_router_search`, so it can still list, open, or search for any skill.
-
-The skill list is embedded once and cached, so a warm turn does no catalog embedding: it pays for
-the query embed and the rerank. The default 50-row shortlist reranked in a median 0.71 seconds on
-8 CPU threads in our measurement.
+A Hermes Agent plugin that takes the always-on skill catalog out of every Chat Completions request and appends a short list of the skills that fit the turn.
 
 The intent of this plugin is to provide a fundamental feature in everyday agentic use. In
 particular, it is for people who keep one super-agent profile that does everything but do not want
@@ -13,6 +9,12 @@ specialist profiles, the number of specific skills can grow quickly. A skill rou
 super-agent also pairs well with a memory provider like
 [Hindsight](https://github.com/vectorize-io/hindsight), which takes care of memory routing and turns
 raw history into organized memory that can be distilled into more skills when needed.
+
+Our plugin combines three features: hiding the skill catalog, RRF first-pass combining semantic search, lexical search, and historical learning, and then the second pass reranking the shortlist with a decision model. The model keeps `skills_list`, `skill_view`, and `skill_router_search`, so it can still list, open, or search for any skill.
+
+The skill list is embedded once and cached, so a warm turn does no catalog embedding: it pays for
+the query embed and the rerank. The default 50-row shortlist reranked in a median 0.71 seconds on
+8 CPU threads in our measurement.
 
 This plugin does not replace periodic upkeep of your skill library, such as folding related skills
 into references for a top-level skill. That upkeep is worth doing in plain Hermes too: clearer skills
