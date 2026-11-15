@@ -578,7 +578,7 @@ def acknowledge_trap_notes(notes: Sequence[str], suggestions_path: Any) -> None:
         path = traps_path_for(suggestions_path)
         if path is None:
             return
-        with _state_lock(path):
+        with _state_lock(path, create_dir=True):
             seen_before = _read_traps(path)
             union = seen_before | {_trap_key(note) for note in notes}
             if union != seen_before:
@@ -614,18 +614,39 @@ _SWITCH_LOCK_LOCAL = threading.local()
 
 
 @contextmanager
-def _state_lock(path: Optional[str]) -> Iterator[None]:
+def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[None]:
     """Hold the process-local lock and, when possible, the cross-process lock.
 
-    The cross-process lock is an ``fcntl.flock`` on the state file's
-    directory, the same mechanism family the association store's
-    migration lock uses, but on the directory fd so the lock leaves no
-    lock file behind (a healthy load must create no file). When the
-    directory cannot be opened or locked (read-only directory,
-    non-POSIX platform), the transaction proceeds under the thread lock
-    alone: state persistence is fail-open by design, and a lost lock
-    must never cost the request. Re-entrant calls on the same thread
-    re-use the locks already held instead of re-acquiring them.
+    The cross-process lock is an advisory ``fcntl.flock`` on the state
+    file's directory, on the directory fd so the lock leaves no lock
+    file behind (a healthy load must create no file). Advisory means
+    only processes that take this lock are mutually excluded; nothing
+    else enforces it. The flock is blocking with no timeout: a
+    contender waits until the holder releases it. This directory has
+    no other flock consumer today: the association store's migration
+    lock is a file lock on ``<store>.migration.lock``, a different
+    path, so the two locks never contend. When the directory cannot
+    be opened or locked (read-only directory, non-POSIX platform,
+    or a directory that cannot be created, see below), the
+    transaction proceeds under the thread lock alone: state
+    persistence is fail-open by design, and a lost lock must never
+    cost the request. That fail-open is the documented condition:
+    below it, only the process-local thread lock serializes, and
+    concurrent processes may interleave. Re-entrant calls on the
+    same thread re-use the locks already held instead of
+    re-acquiring them.
+
+    First use: when *create_dir* is set (write-producing callers:
+    a load/fix that persists, an ack, a trap-note union), the
+    directory is created (``mkdir``, ``exist_ok``) before it is
+    opened for the lock and before the caller reads, so two
+    simultaneous first-use processes both lock the same directory
+    and serialize. A directory that cannot be created (permission,
+    a file in the way) stays explicitly fail-open under the thread
+    lock alone, never silently unprotected beyond that documented
+    condition. Callers that may write nothing (a healthy no-write
+    load) pass ``create_dir=False`` and create nothing: no file and
+    no directory.
     """
     depth = getattr(_SWITCH_LOCK_LOCAL, "depth", 0)
     if depth:
@@ -640,8 +661,16 @@ def _state_lock(path: Optional[str]) -> Iterator[None]:
     fd = None
     try:
         if path is not None and fcntl is not None:
+            directory = os.path.dirname(path) or "."
+            if create_dir:
+                try:
+                    os.makedirs(directory, exist_ok=True)
+                except OSError:
+                    # Documented fail-open: the open/flock below will
+                    # also fail, and the transaction runs under the
+                    # thread lock alone.
+                    pass
             try:
-                directory = os.path.dirname(path) or "."
                 fd = os.open(directory, os.O_RDONLY)
                 fcntl.flock(fd, fcntl.LOCK_EX)
             except OSError:
@@ -801,8 +830,12 @@ def _pending_switch_warnings(
             return pending, pending, {}
         # The whole read-modify-write (fix bump, seen/delivered update, write)
         # runs under the state lock, so a concurrent ack cannot restore the
-        # pre-fix snapshot over this fix (or vice versa).
-        with _state_lock(path):
+        # pre-fix snapshot over this fix (or vice versa). A load with an
+        # offending switch may persist the seen set, so it creates the
+        # directory before locking it; a load with nothing offending
+        # writes nothing (a fix that clears sets implies the directory
+        # already exists), so it creates nothing.
+        with _state_lock(path, create_dir=bool(offending)):
             return _pending_switch_warnings_locked(offending, fixed, path)
     except Exception:  # load never raises; a failure keeps the warnings visible
         logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
@@ -914,8 +947,10 @@ def acknowledge_switch_deliveries(
             return
         # The whole read-modify-write runs under the state lock, so a
         # concurrent fix load cannot land between this read and write and
-        # then be overwritten with the pre-fix snapshot.
-        with _state_lock(path):
+        # then be overwritten with the pre-fix snapshot. An ack may
+        # persist the delivered set, so it creates the directory
+        # before locking it.
+        with _state_lock(path, create_dir=True):
             _acknowledge_switch_deliveries_locked(notes, path, generations)
     except Exception:  # a persistence failure must never cost the request
         logger.debug("hermes-skill-router config: the switch delivery failed", exc_info=True)

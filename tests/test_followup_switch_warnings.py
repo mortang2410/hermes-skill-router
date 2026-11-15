@@ -720,3 +720,187 @@ def test_many_fix_rebreak_cycles_replayed_stale_acks_never_consume(
             _load(tmp_path, {switch: True})
             capsys.readouterr()
             caplog.clear()
+
+
+def _first_use_load_worker(settings, cache_path, suggestions_path, barrier):
+    """Run one load in a child process, released with the other process."""
+    barrier.wait(timeout=20)
+    load({"suggestionsPath": suggestions_path, "cachePath": cache_path, **settings})
+
+
+def _first_use_trap_worker(note, suggestions_path, barrier):
+    """Persist one trap note in a child process, released with the other."""
+    barrier.wait(timeout=20)
+    config_module.acknowledge_trap_notes([note], suggestions_path)
+
+
+def _run_two_first_use_processes(worker, *args_per_process):
+    """Run two child processes released together; fail if either stalls."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    barrier = ctx.Barrier(2)
+    children = [
+        ctx.Process(target=worker, args=(*args_per_process[i], barrier))
+        for i in range(2)
+    ]
+    for child in children:
+        child.start()
+    for child in children:
+        child.join(timeout=30)
+    assert all(child.exitcode == 0 for child in children), (
+        f"first-use processes must both finish, exitcodes={[c.exitcode for c in children]}"
+    )
+
+
+def _state_lock_holder_worker(path, ready, release):
+    """Hold the write-producing state lock until released."""
+    with config_module._state_lock(path, create_dir=True):
+        ready.set()
+        release.wait(timeout=20)
+
+
+def _state_lock_contender_worker(path, entered):
+    """Enter the write-producing state lock and signal once inside."""
+    with config_module._state_lock(path, create_dir=True):
+        entered.set()
+
+
+@pytest.mark.parametrize("precreate", [False, True])
+def test_cross_process_first_use_state_lock_serializes(tmp_path, precreate, monkeypatch):
+    """Round 7 P2: first-use (directory absent) lock entry serializes.
+
+    The holder enters the write-producing state lock with the
+    directory initially absent (or, when *precreate*, existing);
+    a contender must not enter until the holder releases, so two
+    simultaneous first-use processes run their read-modify-writes
+    one at a time and neither clobbers the other's state.
+    """
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    import multiprocessing
+
+    absent = tmp_path / f"lock-absent-{precreate}"
+    if precreate:
+        absent.mkdir(parents=True)
+    path = str(absent / "config-switches.json")
+    ctx = multiprocessing.get_context("fork")
+    ready = ctx.Event()
+    release = ctx.Event()
+    entered = ctx.Event()
+    holder = ctx.Process(target=_state_lock_holder_worker, args=(path, ready, release))
+    contender = ctx.Process(target=_state_lock_contender_worker, args=(path, entered))
+    holder.start()
+    try:
+        assert ready.wait(timeout=20), "the holder must reach the lock"
+        contender.start()
+        import time
+
+        time.sleep(1.0)
+        assert not entered.is_set(), (
+            "the contender must wait for the holder's directory lock"
+        )
+    finally:
+        release.set()
+        holder.join(timeout=20)
+        contender.join(timeout=20)
+    assert entered.is_set(), "the contender must enter after the holder releases"
+    assert holder.exitcode == 0 and contender.exitcode == 0
+
+
+@pytest.mark.parametrize("precreate", [False, True])
+def test_cross_process_first_use_loads_write_both_switches(tmp_path, precreate, monkeypatch):
+    """Round 7 P2: two simultaneous first-use switch loads serialize.
+
+    Both processes load with both switches off, released together
+    with the directory initially absent (or, when *precreate*,
+    existing). The written seen file must be one whole record
+    carrying both switches' entries, never a torn interleave of
+    two direct writes. Repeated so a race that needs overlap
+    shows up.
+    """
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    for iteration in range(5):
+        absent = tmp_path / f"absent-{iteration}-{precreate}"
+        if precreate:
+            absent.mkdir(parents=True)
+        cache_path = str(absent / "index.json")
+        suggestions_path = str(absent / "suggestions.json")
+        settings = {"enabled": False, "showSuggestions": False}
+        _run_two_first_use_processes(
+            _first_use_load_worker,
+            (settings, cache_path, suggestions_path),
+            (settings, cache_path, suggestions_path),
+        )
+        seen_file = absent / "config-switches.json"
+        data = json.loads(seen_file.read_text(encoding="utf-8"))
+        switches = {pair[0] for pair in data["seen"]}
+        assert switches == {"enabled", "showSuggestions"}, (
+            f"iteration {iteration}: both first-use effects must survive, got {data!r}"
+        )
+
+
+def test_cross_process_first_use_trap_union_both_effects_survive(tmp_path, monkeypatch):
+    """Round 7 P2: two simultaneous first-use trap unions serialize."""
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    for iteration in range(5):
+        absent = tmp_path / f"trap-absent-{iteration}"
+        suggestions_path = str(absent / "suggestions.json")
+        _run_two_first_use_processes(
+            _first_use_trap_worker,
+            ("embedModelId: 'a' is not a valid string; using default 'bge-m3'", suggestions_path),
+            ("rerankModel: 'x' is not a valid string; using default 'y'", suggestions_path),
+        )
+        traps_file = absent / "config-traps.json"
+        data = json.loads(traps_file.read_text(encoding="utf-8"))
+        trap_ids = {pair[0] for pair in data["seen"]}
+        assert trap_ids == {"embedModelId", "rerankModel"}, (
+            f"iteration {iteration}: both trap unions must survive, got {data!r}"
+        )
+
+
+def test_healthy_load_with_absent_directory_creates_nothing(tmp_path, capsys, caplog, monkeypatch):
+    """Round 7 P2: a healthy no-write load creates no file and no directory."""
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    absent = tmp_path / "absent-healthy"
+    settings = {
+        "suggestionsPath": str(absent / "suggestions.json"),
+        "cachePath": str(absent / "index.json"),
+    }
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        load(settings)
+    assert not absent.exists(), "a healthy load must create no directory"
+    assert list(tmp_path.iterdir()) == [], "a healthy load must create no file either"
+
+
+def test_directory_that_cannot_be_created_stays_fail_open(tmp_path, capsys, caplog, monkeypatch):
+    """Round 7 P2: an uncreatable directory is documented fail-open.
+
+    A regular file sits where the state directory should be, so
+    mkdir and the directory lock both fail. The load still warns
+    (fail-open under the thread lock alone) and never raises; the
+    ack likewise never raises.
+    """
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    cache_path = str(blocker / "index.json")
+    assignments = {
+        "suggestionsPath": str(blocker / "suggestions.json"),
+        "cachePath": cache_path,
+    }
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        cfg = load({**assignments, "enabled": False})
+    assert len(_switch_notes(cfg)) == 1, "the warning still shows under fail-open"
+    # The ack is fail-open too: it never raises and writes nothing.
+    acknowledge_switch_deliveries(
+        [message["content"] for message in switch_warning_messages(cfg)],
+        cache_path,
+        cfg.switch_generations,
+    )
+    assert blocker.is_file(), "the blocking file must be left alone"
+    assert not (blocker / "config-switches.json").exists()

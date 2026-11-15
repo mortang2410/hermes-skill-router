@@ -519,6 +519,62 @@ def test_explicit_flags_override_the_workspace_config(tmp_path, monkeypatch):
         endpoint.close()
 
 
+def test_single_explicit_model_flag_ignores_invalid_workspace_model(tmp_path, monkeypatch):
+    """Round 7 coverage: one explicit flag overrides its workspace field.
+
+    Only ``--embed-model`` is explicit; the workspace ``embedModelId``
+    is invalid (blank) but the explicit flag overrides it, so it is
+    not validated (C5: explicit flags always override the workspace
+    config). The workspace timeout is still used for the omitted
+    timeout flag, and the run must succeed in the explicit space.
+    """
+    monkeypatch.setenv(
+        "HERMES_HOME", str(_hermes_home(tmp_path, model="''", timeout_ms=6000))
+    )
+    endpoint, received = _multi_model_endpoint()
+    try:
+        paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
+        result = subprocess.run(
+            _documented_command(endpoint, paths, model_flag=CUSTOM_MODEL),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+        assert received and all(model == CUSTOM_MODEL for model in received), received
+    finally:
+        endpoint.close()
+
+
+def test_single_explicit_timeout_flag_ignores_invalid_workspace_timeout(tmp_path, monkeypatch):
+    """Round 7 coverage: one explicit flag overrides its workspace field.
+
+    Only ``--embed-timeout-ms`` is explicit; the workspace
+    ``embedTimeoutMs`` is out of range but the explicit flag
+    overrides it, so it is not validated (C5). The workspace model
+    is still used for the omitted model flag, and the run must
+    succeed in the workspace space.
+    """
+    monkeypatch.setenv(
+        "HERMES_HOME", str(_hermes_home(tmp_path, timeout_ms=999999))
+    )
+    endpoint, received = _multi_model_endpoint()
+    try:
+        paths = make_case(tmp_path, catalog_model=CUSTOM_MODEL)
+        result = subprocess.run(
+            _documented_command(endpoint, paths, timeout_flag=6000),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+        assert set(anomalies_for(result.stdout)) == {"alpha-skill"}
+        assert received and all(model == CUSTOM_MODEL for model in received), received
+    finally:
+        endpoint.close()
+
+
 def test_default_only_invocation_without_custom_config(endpoint, tmp_path, monkeypatch):
     """Round 4 P2: with no custom config, the documented invocation uses the builtins."""
     home = tmp_path / "hermes-home"

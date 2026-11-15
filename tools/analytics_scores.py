@@ -767,7 +767,9 @@ def _workspace_config_path() -> Path:
     return Path(os.path.expanduser(home)) / "config.yaml"
 
 
-def _resolve_embed_defaults() -> Tuple[str, int]:
+def _resolve_embed_defaults(
+    need_model: bool = True, need_timeout: bool = True
+) -> Tuple[str, int]:
     """Return ``(embed model, timeout ms)`` from the workspace config or the builtins.
 
     The workspace config is the same file the router reads through the plugin
@@ -779,6 +781,13 @@ def _resolve_embed_defaults() -> Tuple[str, int]:
     :class:`AnalyticsError` naming the problem. No ``config.load`` runs here:
     ``load()`` persists the router's warning-suppression state, and a read-only
     analytics run must never write it.
+
+    Only the fields the caller actually needs are validated: an explicit
+    flag always overrides the workspace config (C5), so a workspace field
+    the explicit flag overrides is never read for validation and its
+    invalid value cannot fail the run. The file structure itself is still
+    validated whenever any field is needed, because the needed field
+    cannot be located in a malformed structure.
     """
     from hermes_skill_router.config import BOUNDS, DEFAULTS
 
@@ -831,7 +840,7 @@ def _resolve_embed_defaults() -> Tuple[str, int]:
     entry = _mapping(entries.get("hermes-skill-router"), "plugins.entries.hermes-skill-router")
     settings = _mapping(entry.get("settings"), "plugins.entries.hermes-skill-router.settings")
     model = default_model
-    if "embedModelId" in settings:
+    if need_model and "embedModelId" in settings:
         named = settings["embedModelId"]
         if not isinstance(named, str) or not named.strip():
             raise AnalyticsError(
@@ -840,7 +849,7 @@ def _resolve_embed_defaults() -> Tuple[str, int]:
             )
         model = named
     timeout = default_timeout
-    if "embedTimeoutMs" in settings:
+    if need_timeout and "embedTimeoutMs" in settings:
         named_timeout = settings["embedTimeoutMs"]
         if (
             not isinstance(named_timeout, int)
@@ -878,7 +887,14 @@ def run(args: argparse.Namespace) -> List[str]:
             f"not {args.embed_model!r}; refusing to score in an unproven vector space"
         )
     if args.embed_model is None or args.embed_timeout_ms is None:
-        workspace_model, workspace_timeout = _resolve_embed_defaults()
+        # Only the omitted flags are resolved from the workspace config:
+        # an explicit flag overrides its workspace field entirely, so
+        # that field is not validated (C5: explicit flags always
+        # override the workspace config).
+        workspace_model, workspace_timeout = _resolve_embed_defaults(
+            need_model=args.embed_model is None,
+            need_timeout=args.embed_timeout_ms is None,
+        )
         if args.embed_model is None:
             args.embed_model = workspace_model
         if args.embed_timeout_ms is None:
