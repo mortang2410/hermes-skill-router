@@ -359,9 +359,10 @@ plugin config, which is why the path is an argument.
 The display has two independent enable steps:
 
 1. The profile's `plugins.enabled` entry enables the Python backend, including the route.
-2. The plugin's own toggle in the desktop app's Capabilities panel enables the desktop half. Hermes
-   never calls the desktop half's `register()` when that toggle is off, so the pane does not exist.
-   With the backend disabled instead, the pane shows the enable line for the missing route.
+2. In the desktop app or webapp, press Ctrl+K, select hermes skill router, and enable the Desktop
+   option in the Skills routed config window. That toggle enables the desktop half. Hermes never
+   calls the desktop half's `register()` when that toggle is off, so the pane does not exist. With
+   the backend disabled instead, the pane shows the enable line for the missing route.
 
 The three display keys are `showSuggestions`, `suggestionsPath` and `maxDisplayNames`, documented in
 the config table below.

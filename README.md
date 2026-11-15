@@ -153,9 +153,11 @@ Skills you keep listed with `deferredSkills` appear under `Also listed:`. If you
 The model can open any row with `skill_view`. `skills_list` still lists the whole catalog. If the
 shortlist misses, the model can search by hand with `skill_router_search`, using its own words.
 
-You also see the last decision on screen, at no token cost. The desktop app shows a `Skills routed`
-pane on the right side of the window, collapsed by default. In `hermes --tui`, run `/skills-routed` to dock the
-same names. The record holds names only, never your request text.
+You also see the last decision on screen, at no token cost. In the desktop app or webapp, press
+Ctrl+K, select hermes skill router, and enable the Desktop option in the Skills routed config
+window. The `Skills routed` pane then appears on the right sidebar, collapsed by default. In
+`hermes --tui`, run `/skills-routed` to dock the same names. The record holds names only, never
+your request text.
 
 ## Configuration
 
