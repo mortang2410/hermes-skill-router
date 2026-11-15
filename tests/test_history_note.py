@@ -228,14 +228,20 @@ def test_a_failed_heal_replaces_the_healing_line_once(tmp_path, monkeypatch):
     assert _pending_failure(str(store_path)), "the failed heal left no note for the turn"
 
     assert _turn(cfg) is not None
-    assert associations_module.HEAL_FAILURE_NOTE in read(cfg)["note"]
+    note = read(cfg)["note"]
+    assert "heal failed" in note.lower(), (
+        f"a failed heal must say it failed, got {note!r}"
+    )
+    assert "(empty store)" in note or "(missing store)" in note, (
+        f"a failed heal must name the skip state, got {note!r}"
+    )
 
     assert _turn(cfg) is not None
     note = read(cfg)["note"]
     assert "History incomplete" in note, (
         "one failure must reach the user once, not on every turn"
     )
-    assert associations_module.HEAL_FAILURE_NOTE not in note
+    assert "heal failed" not in note.lower()
 
 
 def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
@@ -263,4 +269,64 @@ def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
     assert _pending_failure(str(store_path)), "a turn that showed no heal note consumed it"
 
     assert _turn(cfg) is not None
-    assert associations_module.HEAL_FAILURE_NOTE in read(cfg)["note"]
+    note = read(cfg)["note"]
+    assert "heal failed" in note.lower(), (
+        f"a failed heal must say it failed, got {note!r}"
+    )
+    assert "(empty store)" in note, f"the failure line must name the skip state, got {note!r}"
+
+
+def test_heal_failure_line_names_each_skip_state(tmp_path, monkeypatch):
+    """P2-2: a pending heal failure must name the skip state beside the failure.
+
+    Each skip state (missing / empty / stale) with a pending heal failure must
+    produce a degraded line that contains both the skip state and the heal
+    failure, not just the heal failure alone.
+    """
+    newest = 1_800_000_000_000
+    state_path = tmp_path / "state.db"
+    _session_store(state_path, newest)
+    monkeypatch.setattr(
+        associations_module, "default_state_db_path", lambda home=None: str(state_path)
+    )
+
+    def seed_failure(store_path: str) -> None:
+        with associations_module._HEAL_LOCK:
+            associations_module._HEAL_FAILURES[store_path] = (
+                associations_module.HEAL_FAILURE_NOTE
+            )
+
+    # Missing store.
+    missing_path = tmp_path / "missing.db"
+    assert not missing_path.exists()
+    missing_cfg = make_config(tmp_path, associationDbPath=str(missing_path))
+    seed_failure(str(missing_path))
+    note = router_module._degraded_note(missing_cfg)
+    assert "(missing store)" in note, f"missing state must be named, got {note!r}"
+    assert "heal failed" in note.lower(), f"failed heal must be named, got {note!r}"
+
+    # Empty store: opens but has no scan watermark.
+    empty_path = tmp_path / "empty.db"
+    associations_module.open_store(str(empty_path)).close()
+    empty_cfg = make_config(tmp_path, associationDbPath=str(empty_path))
+    seed_failure(str(empty_path))
+    note = router_module._degraded_note(empty_cfg)
+    assert "(empty store)" in note, f"empty state must be named, got {note!r}"
+    assert "heal failed" in note.lower(), f"failed heal must be named, got {note!r}"
+
+    # Stale store: watermark older than the completeness window.
+    stale_path = tmp_path / "stale.db"
+    store = associations_module.open_store(str(stale_path))
+    try:
+        associations_module.write_meta(
+            store,
+            associations_module.META_LAST_SCAN_MS,
+            str(newest - associations_module.COMPLETENESS_WINDOW_MS - 1),
+        )
+    finally:
+        store.close()
+    stale_cfg = make_config(tmp_path, associationDbPath=str(stale_path))
+    seed_failure(str(stale_path))
+    note = router_module._degraded_note(stale_cfg)
+    assert "(stale store)" in note, f"stale state must be named, got {note!r}"
+    assert "heal failed" in note.lower(), f"failed heal must be named, got {note!r}"

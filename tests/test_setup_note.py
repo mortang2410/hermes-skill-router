@@ -540,6 +540,62 @@ def test_every_dead_endpoint_turn_reprobes_regardless_of_the_health_window(
         rerank.close()
 
 
+def test_recovery_inside_health_window_on_fresh_session_does_not_claim_unreachable(tmp_path):
+    """P2-1: a fresh ready probe must not fall back to the unreachable line.
+
+    The embed endpoint first answers 500, closing its health gate for
+    ``healthCheckMs``. A fresh session's second turn is refused locally by
+    that closed gate, but the live setup probe sees both endpoints healthy;
+    the record must not claim the endpoints are unreachable.
+    """
+    from hermes_skill_router.setup_check import check_setup_state
+
+    state = {"embed_fail": True}
+    embed_ok = _embed_responder("/custom/embeddings")
+    rerank_ok = _rerank_responder("/custom/rerank", fail=False)
+
+    def embed_responder(request: Request) -> Response:
+        if state["embed_fail"]:
+            return Response(status=500, body={"error": "broken"})
+        return embed_ok(request)
+
+    embed = FakeEndpoint(embed_responder)
+    rerank = FakeEndpoint(rerank_ok)
+
+    def turn(cfg, session: str):
+        return rewrite(
+            PAYLOAD,
+            cfg=cfg,
+            index=INDEX,
+            session_id=session,
+            turn_id=f"t-{session}",
+            notify=lambda _turn_id: None,
+        )
+
+    try:
+        cfg = _config(tmp_path, embed, rerank, healthCheckMs=60000)
+        assert turn(cfg, "probe-s1") is None
+        first_note = read(cfg)["note"]
+        assert "embedBaseUrl" in first_note, (
+            f"the first failure must name its setting, got {first_note!r}"
+        )
+        state["embed_fail"] = False
+        assert check_setup_state(cfg) == (True, ""), (
+            "after recovery both endpoints must answer the fresh probe"
+        )
+        # A fresh session: the second turn takes the dead-endpoint path
+        # (gate-closed local refusal) rather than the dumped-window path.
+        assert turn(cfg, "probe-s2") is None
+        second_note = read(cfg)["note"]
+        assert "unreachable" not in second_note.lower(), (
+            f"a fresh ready probe must not claim unreachable, got {second_note!r}"
+        )
+        assert second_note != router_module.ENDPOINT_NOTE
+    finally:
+        embed.close()
+        rerank.close()
+
+
 def test_a_custom_path_endpoint_that_is_live_passes_the_wired_check(tmp_path):
     embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
     rerank = FakeEndpoint(_rerank_responder("/custom/rerank", fail=False))

@@ -600,7 +600,10 @@ def _degraded_note(
             if skip != "complete":
                 failure = associations.heal_failure_note(path)
                 if failure:
-                    parts.append(failure)
+                    parts.append(
+                        f"History incomplete ({skip} store) and the background heal failed; "
+                        "routing continues without learned history."
+                    )
                 else:
                     state = associations.heal_state(path)
                     if state == "finished":
@@ -656,6 +659,32 @@ def _degraded_note(
     return " ".join(parts)
 
 
+def _setup_probe(
+    cfg: Config, *, deadline: Optional[float] = None
+) -> tuple[str, bool]:
+    """Return ``(note, fresh_ready)`` for the setup check on *cfg*.
+
+    *note* is contract C2's setup-needed line, or ``""`` when the check is not
+    a definitive down: either the fresh probe found both endpoints ready
+    (``fresh_ready`` is ``True``) or the answer is indeterminate (the deadline
+    skipped or capped the probe, or the check raised), in which case
+    ``fresh_ready`` is ``False``. A caller that needs to distinguish the two
+    empty cases uses the flag rather than the note alone.
+    """
+    if deadline is not None and deadline - monotonic() <= 0:
+        return "", False
+    try:
+        ready, failing = check_setup_state(cfg, deadline=deadline)
+    except Exception:  # the check never raises, but the note must not depend on it
+        logger.debug("skill router: the setup check raised", exc_info=True)
+        return "", False
+    if ready:
+        return "", True
+    if not failing:
+        return "", False
+    return setup_note(failing, bundled=_is_bundled(cfg, failing)), False
+
+
 def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
     """Return contract C2's setup-needed line for *cfg*, or ``""`` when both endpoints are ready.
 
@@ -675,16 +704,7 @@ def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
     An indeterminate check (a probe the deadline skipped or capped into a timeout, so no
     endpoint answered negatively) likewise names nothing.
     """
-    if deadline is not None and deadline - monotonic() <= 0:
-        return ""
-    try:
-        ready, failing = check_setup_state(cfg, deadline=deadline)
-    except Exception:  # the check never raises, but the note must not depend on it
-        logger.debug("skill router: the setup check raised", exc_info=True)
-        return ""
-    if ready or not failing:
-        return ""
-    return setup_note(failing, bundled=_is_bundled(cfg, failing))
+    return _setup_probe(cfg, deadline=deadline)[0]
 
 
 def _is_bundled(cfg: Config, failing: str) -> bool:
@@ -703,13 +723,17 @@ def _failure_note(
 
     With the live clients the setup-needed line names ``embedBaseUrl`` or
     ``rerankBaseUrl``; without them the generic dead-endpoint line is all a fake-transport
-    failure can name. A ready check falls back to the generic line, so a budget or malformed
-    body never claims setup is needed. *deadline* bounds the probe inside the routing budget.
+    failure can name. A fresh ready probe returns ``""`` so a recovered endpoint
+    inside the health window never claims setup is unreachable; only an
+    indeterminate or down answer falls back to the generic line. *deadline*
+    bounds the probe inside the routing budget.
     """
     if uses_live:
-        probed = _setup_note(cfg, deadline=deadline)
+        probed, fresh_ready = _setup_probe(cfg, deadline=deadline)
         if probed:
             return probed
+        if fresh_ready:
+            return ""
     return ENDPOINT_NOTE
 
 

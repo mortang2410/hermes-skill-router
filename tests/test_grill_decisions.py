@@ -161,6 +161,66 @@ def test_trap_persists_across_processes_via_the_file(tmp_path):
     )
 
 
+def test_disabled_then_enabled_warns_once_and_unchanged_repeat_stays_silent(tmp_path):
+    """P2-3: a disabled load must not persist the fingerprint.
+
+    While ``showSuggestions=false`` no record is writable, so persisting the
+    trap fingerprint would consume the warning nobody saw. The first enabled
+    load must warn; an unchanged repeat then stays silent.
+    """
+    from hermes_skill_router.display import record as display_record
+
+    path = str(tmp_path / "suggestions.json")
+    disabled = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "showSuggestions": False}
+    )
+    assert any("shortlistSize" in note for note in disabled.trap_notes), (
+        "a disabled load still surfaces the warning in trap_notes"
+    )
+    assert display_record(
+        disabled,
+        status="inert",
+        names=(),
+        session_id="s",
+        turn_id="t",
+        note=" ".join(disabled.trap_notes),
+    ) is None, "no record is writable while display is disabled"
+
+    enabled = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "showSuggestions": True}
+    )
+    assert any("shortlistSize" in note for note in enabled.trap_notes), (
+        "the first enabled load must warn for the same invalid value"
+    )
+    written = display_record(
+        enabled,
+        status="inert",
+        names=(),
+        session_id="s2",
+        turn_id="t2",
+        note=" ".join(enabled.trap_notes),
+    )
+    assert written is not None and "shortlistSize" in written["note"], (
+        "the warning must reach the display record once enabled"
+    )
+
+    again = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "showSuggestions": True}
+    )
+    assert again.trap_notes == (), (
+        "an unchanged repeat after the enabled warning must stay silent"
+    )
+
+    # A second disabled load must also still warn: nothing was persisted
+    # while disabled, and an unchanged repeat while disabled is not silent.
+    disabled_again = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "showSuggestions": False}
+    )
+    assert any(
+        "shortlistSize" in note for note in disabled_again.trap_notes
+    ), "a disabled load must not suppress its own warning"
+
+
 # Q2: one always-visible degraded line enumerating each loss.
 
 

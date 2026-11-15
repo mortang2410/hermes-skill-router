@@ -455,7 +455,7 @@ def _write_traps(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
 
 
 def _new_trap_notes(
-    notes: Sequence[str], suggestions_path: Any
+    notes: Sequence[str], suggestions_path: Any, show_suggestions: bool = True
 ) -> Tuple[str, ...]:
     """Return the notes not yet in the persisted set, then persist the union. Never raises.
 
@@ -467,6 +467,11 @@ def _new_trap_notes(
     if not notes:
         return ()
     try:
+        if not show_suggestions:
+            # The display is disabled: no record is writable, so the warning
+            # never reaches one. Do not persist the fingerprint, or the first
+            # enabled load would stay silent for a value nobody saw warned.
+            return tuple(dict.fromkeys(notes))
         path = traps_path_for(suggestions_path)
         if path is None:
             # Nowhere to persist (display disabled): warn on every load. The
@@ -515,7 +520,9 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
             notes.append(f"{name}: unknown config key ignored")
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
-    trap_notes = _new_trap_notes(notes, suggestions)
+    trap_notes = _new_trap_notes(
+        notes, suggestions, bool(values.get("show_suggestions", True))
+    )
     return Config(notes=tuple(notes), trap_notes=trap_notes, **values)
 
 
