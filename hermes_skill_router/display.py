@@ -44,7 +44,7 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from .config import Config
+from .config import Config, acknowledge_trap_notes
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,17 @@ def record(
         return None
     if not _write(path, entry):
         return None
+    # The warning has now reached a record: consume only the traps this
+    # record actually carried, so a load that never writes a record
+    # (disabled, dashboard/pre-load reads, non-routing paths) never
+    # suppresses the first real display.
+    shown = [
+        trap
+        for trap in (getattr(cfg, "trap_notes", ()) or ())
+        if trap and trap in entry["note"]
+    ]
+    if shown:
+        acknowledge_trap_notes(shown, cfg.suggestions_path)
     return entry
 
 

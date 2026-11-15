@@ -52,9 +52,12 @@ request clears the previous one first, so a search never ranks rows from an earl
 On every request that carried the catalog on Chat Completions the same decision is written to the
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
 names, or ``inert`` with no names. One degraded line rides on that record whenever routing is
-degraded: history incomplete with its skip state and heal outcome, partial view, missing BM25,
-fusion off, cache persistence off, budget expiry, dropped window, dead endpoint, or a newly-seen
-config trap. When a per-request call fails, contract C7's one line rides on the inert record instead,
+degraded: history incomplete with its skip state and heal outcome, missing BM25,
+fusion off, cache persistence off, budget expiry, dead endpoint, or a newly-seen
+config trap. Two states stay log-only and never ride that line until the
+follow-up grill board settles them: the dropped-catalog compaction window and the
+saved-index partial view (``library`` already logs the partial view). When a
+per-request call fails, contract C7's one line rides on the inert record instead,
 so the surfaces can say the endpoints were unreachable and no suggestions were made; with the live
 clients the setup-needed line
 (:func:`hermes_skill_router.setup_check.setup_note`), probed fresh every dead-endpoint turn,
@@ -93,7 +96,7 @@ from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
-from .library import Index, PathResolver, cached_row_count, load_or_build, path_resolver
+from .library import Index, PathResolver, load_or_build, path_resolver
 from .rerank import rerank as default_rerank
 from .search import (
     BUDGET_EXPIRED,
@@ -128,11 +131,6 @@ ENDPOINT_NOTE = "Routing endpoints are unreachable; no suggestions were made thi
 BUDGET_NOTE = (
     "Routing budget exhausted; raise routingTimeoutMs or check server load. "
     "No suggestions were made this turn."
-)
-
-#: The catalog already went out in this compaction window, so nothing is suggestible.
-DROPPED_NOTE = (
-    "Catalog already shown this window; call skills_list. No suggestions were made this turn."
 )
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
@@ -324,8 +322,9 @@ def _compose(
         return _fail("the skill index carries no row")
     if dropped_before or dumped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
-        # for the rest of the window even when ranking would succeed now.
-        return _fail("catalog already dumped in this window", DROPPED_NOTE)
+        # for the rest of the window even when ranking would succeed now. Log-only: the
+        # visible-line placement of this state is unsettled, so no note rides the record.
+        return _fail("catalog already dumped in this window")
     # One memo for the whole pass: the recency gate and the selection both resolve through the
     # same saved map, so a candidate is looked up at most once a pass and never again once known.
     resolve = path_resolver(cfg, index, skill_path)
@@ -350,7 +349,7 @@ def _compose(
     # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
     # heal when it was incomplete. The degraded line is read once here, so every record this turn
     # writes carries the same line, and a failed pass never reaches here, so the dead-endpoint line outranks it.
-    note = _degraded_note(cfg, index=index, routed_count=len(partition.routed.names))
+    note = _degraded_note(cfg, index=index)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
@@ -575,22 +574,20 @@ def _degraded_note(
     cfg: Config,
     *,
     index: Optional[Index] = None,
-    routed_count: Optional[int] = None,
 ) -> str:
     """Return the turn's one degraded line naming every active loss, or ``""`` when healthy.
 
     The line enumerates, on the single-line record note, each loss the survey
     found silent: history incomplete (which of the four skip states), heal
-    failed vs finished-incomplete vs running vs pending, partial-view refusal,
-    missing BM25, fusion off, cache persistence off, and newly-seen config
-    traps. A failed (dead-endpoint) or budget pass never reaches here, so
+    failed vs finished-incomplete vs running vs pending, missing BM25,
+    fusion off, cache persistence off, and newly-seen config traps. The
+    saved-index partial-view refusal stays log-only in ``library`` and never
+    rides this line, until the follow-up grill board settles its placement.
+    A failed (dead-endpoint) or budget pass never reaches here, so
     those lines outrank this chooser and never consume the heal note; a
     complete store never consumes it either.
 
-    *index* supplies the BM25 fact (its term index) and *routed_count* the
-    arrived catalog size for the partial-view derivation. The partial-view
-    condition is derived per turn from the saved row count, never persisted:
-    a catalog holding fewer than half the saved rows is the refused state.
+    *index* supplies the BM25 fact (its term index).
     """
     parts: List[str] = []
     if _store_in_play(cfg):
@@ -618,18 +615,6 @@ def _degraded_note(
                         f"History incomplete ({skip} store) {heal_text}; "
                         "routing continues without learned history."
                     )
-    if index is not None and routed_count is not None:
-        try:
-            saved = cached_row_count(cfg)
-        except Exception:  # the note must never cost the turn
-            logger.debug("skill router: the saved row count raised", exc_info=True)
-            saved = 0
-        if saved and routed_count * 2 < saved:
-            parts.append(
-                f"Catalog read is partial ({routed_count} of {saved} saved skills); "
-                "routing from the saved index. Remove the cache file to force a "
-                "rebuild if the catalog really shrank."
-            )
     settings = resolve_fusion_config(
         {
             "mode": cfg.fusion_mode,

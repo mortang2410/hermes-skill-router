@@ -115,6 +115,20 @@ def test_setup_note_follows_the_current_answer_not_a_cached_one(tmp_path, monkey
 # Q4: persisted (trap_id, fingerprint) in config.load.
 
 
+def _show(cfg, turn_id="t-show"):
+    """Write a display record carrying *cfg*'s traps; the write is what acknowledges them."""
+    from hermes_skill_router.display import record as display_record
+
+    return display_record(
+        cfg,
+        status="inert",
+        names=(),
+        session_id="show-session",
+        turn_id=turn_id,
+        note=" ".join(cfg.trap_notes),
+    )
+
+
 def test_first_load_exposes_the_trap_and_unchanged_value_stays_silent(tmp_path):
     path = str(tmp_path / "suggestions.json")
     first = load({"shortlistSize": 0, "suggestionsPath": path})
@@ -123,6 +137,14 @@ def test_first_load_exposes_the_trap_and_unchanged_value_stays_silent(tmp_path):
         "load must expose the newly-seen trap for the display record"
     )
     assert any("shortlistSize" in note for note in first.trap_notes)
+    # A load alone never consumes the fingerprint: a second load without a
+    # record in between still warns, because no warning reached a record yet.
+    pre_record = load({"shortlistSize": 0, "suggestionsPath": path})
+    assert pre_record.trap_notes == first.trap_notes, (
+        "a pre-load read must not consume the fingerprint"
+    )
+    written = _show(first)
+    assert written is not None and "shortlistSize" in written["note"]
     second = load({"shortlistSize": 0, "suggestionsPath": path})
     assert second.notes == first.notes, "the underlying notes are still produced"
     assert second.trap_notes == (), (
@@ -136,11 +158,13 @@ def test_changed_value_warns_once_on_the_display_record(tmp_path):
     path = str(tmp_path / "suggestions.json")
     first = load({"shortlistSize": 0, "suggestionsPath": path})
     assert first.trap_notes, "the first offending value warns"
+    assert _show(first, "t-first") is not None
     changed = load({"shortlistSize": 999, "suggestionsPath": path})
     assert changed.trap_notes, (
         "a changed offending value is a new fingerprint and must warn once"
     )
     assert all("shortlistSize" in note for note in changed.trap_notes)
+    assert _show(changed, "t-changed") is not None
     again = load({"shortlistSize": 999, "suggestionsPath": path})
     assert again.trap_notes == (), "the changed value then stays silent"
 
@@ -149,6 +173,7 @@ def test_trap_persists_across_processes_via_the_file(tmp_path):
     path = str(tmp_path / "suggestions.json")
     first = load({"eagerSkills": "alpha", "suggestionsPath": path})
     assert first.trap_notes, "a malformed list warns once"
+    assert _show(first) is not None
     # Simulate a fresh process: _LOGGED_NOTES is process-local, so a per-process
     # log-once set would warn again. The persisted file must suppress the
     # display warning without any in-process memory.
@@ -211,14 +236,72 @@ def test_disabled_then_enabled_warns_once_and_unchanged_repeat_stays_silent(tmp_
         "an unchanged repeat after the enabled warning must stay silent"
     )
 
-    # A second disabled load must also still warn: nothing was persisted
-    # while disabled, and an unchanged repeat while disabled is not silent.
+    # The trap was already shown on a record, so it stays silent even when
+    # the plugin is later disabled: the warning was seen, not suppressed.
     disabled_again = load(
         {"shortlistSize": 0, "suggestionsPath": path, "showSuggestions": False}
     )
-    assert any(
-        "shortlistSize" in note for note in disabled_again.trap_notes
-    ), "a disabled load must not suppress its own warning"
+    assert disabled_again.trap_notes == (), (
+        "an already-shown trap stays silent; only an unseen trap warns"
+    )
+
+
+def test_enabled_false_load_does_not_consume_the_trap(tmp_path):
+    """P2 round-2 A: ``enabled=false`` loads and exits without a record.
+
+    The disabled load surfaces the warning but must not persist it, so the
+    first enabled load still warns; a record then acknowledges it.
+    """
+    path = str(tmp_path / "suggestions.json")
+    disabled = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "enabled": False}
+    )
+    assert disabled.enabled is False
+    assert any("shortlistSize" in note for note in disabled.trap_notes), (
+        "a disabled load still surfaces the warning in trap_notes"
+    )
+    # Repeated disabled loads still warn: nothing was consumed.
+    disabled_again = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "enabled": False}
+    )
+    assert any("shortlistSize" in note for note in disabled_again.trap_notes)
+    enabled = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "enabled": True}
+    )
+    assert any("shortlistSize" in note for note in enabled.trap_notes), (
+        "the first enabled load must warn for the same invalid value"
+    )
+    assert _show(enabled) is not None
+    again = load(
+        {"shortlistSize": 0, "suggestionsPath": path, "enabled": True}
+    )
+    assert again.trap_notes == (), "after a successful record it stays silent"
+
+
+def test_dashboard_and_preload_reads_do_not_consume_the_trap(tmp_path):
+    """P2 round-2 A: non-routing loads (dashboard, pre-load) never consume.
+
+    ``dashboard.plugin_api.configured`` calls ``load`` to resolve the record
+    path and never writes a record, so any number of such loads must leave
+    the fingerprint unseen for the first routing turn.
+    """
+    path = str(tmp_path / "suggestions.json")
+    raw = {"shortlistSize": 0, "suggestionsPath": path}
+    first_read = load(raw)
+    assert any("shortlistSize" in note for note in first_read.trap_notes)
+    # Simulate repeated dashboard reads: load only, never a record write.
+    for _ in range(3):
+        read_cfg = load(raw)
+        assert any("shortlistSize" in note for note in read_cfg.trap_notes), (
+            "a dashboard/pre-load read must not consume the fingerprint"
+        )
+    routing = load(raw)
+    assert any("shortlistSize" in note for note in routing.trap_notes), (
+        "the first routing load must still warn after dashboard reads"
+    )
+    assert _show(routing) is not None
+    after_show = load(raw)
+    assert after_show.trap_notes == (), "only the record write acknowledges it"
 
 
 # Q2: one always-visible degraded line enumerating each loss.
@@ -307,7 +390,10 @@ def test_budget_expiry_carries_a_degraded_line(tmp_path, monkeypatch):
     assert note != router_module.ENDPOINT_NOTE, "budget is not a dead endpoint"
 
 
-def test_dropped_window_carries_a_degraded_line(tmp_path):
+def test_dropped_window_stays_log_only_with_no_visible_note(tmp_path, caplog):
+    """P2 round-2 B: the dropped-window placement is unsettled, so it is log-only."""
+    import logging as _logging
+
     cfg = make_config(tmp_path, cachePath=str(tmp_path / "index.json"))
     session = "dropped-session"
     # First failure in the window: keeps the catalog, remembers the dump.
@@ -320,42 +406,53 @@ def test_dropped_window_carries_a_degraded_line(tmp_path):
         notify=lambda _t: None,
     )
     assert first is None, "the first failure keeps the catalog"
-    # Second failure in the same window: strips the catalog and drops it.
-    second = rewrite(
-        PAYLOAD,
-        cfg=cfg,
-        embed=lambda config, texts: [[1.0, 0.0] for _t in texts],
-        rerank=lambda config, query, documents: None,
-        session_id=session,
-        notify=lambda _t: None,
-    )
+    with caplog.at_level(_logging.WARNING, logger="hermes_skill_router.router"):
+        # Second failure in the same window: strips the catalog and drops it.
+        second = rewrite(
+            PAYLOAD,
+            cfg=cfg,
+            embed=lambda config, texts: [[1.0, 0.0] for _t in texts],
+            rerank=lambda config, query, documents: None,
+            session_id=session,
+            notify=lambda _t: None,
+        )
     assert second is not None and "messages" in second["request"]
     note = read(cfg)["note"]
-    assert "already" in note.lower(), (
-        f"a dropped window must name the loss and its fix, got {note!r}"
+    assert "already" not in note.lower() and "skills_list" not in note, (
+        f"a dropped window must not ride the visible line, got {note!r}"
     )
-    assert "skills_list" in note, f"the dropped line must name the fix, got {note!r}"
+    assert any(
+        "catalog already dumped" in record.getMessage()
+        for record in caplog.records
+    ), "the dropped window must still log the reason"
 
 
-def test_partial_view_refusal_is_named_on_the_line(tmp_path):
+def test_partial_view_refusal_stays_log_only_with_no_visible_note(tmp_path, caplog):
+    """P2 round-2 B: the partial-view placement is unsettled, so it is log-only."""
+    import logging as _logging
+
     from tests.test_rewrite import FakeEmbedder, FakeReranker, make_index, _payload
     import hermes_skill_router.library as library_mod
 
     cfg = make_config(tmp_path, cachePath=str(tmp_path / "index.json"))
     library_mod._write_cache(cfg, make_index())
-    result = rewrite(
-        _payload(rows=(("alpha", "Alpha skill"),)),
-        cfg=cfg,
-        embed=FakeEmbedder(),
-        rerank=FakeReranker(),
-        session_id="partial-session",
-        notify=lambda _t: None,
-    )
+    with caplog.at_level(_logging.WARNING, logger="hermes_skill_router.library"):
+        result = rewrite(
+            _payload(rows=(("alpha", "Alpha skill"),)),
+            cfg=cfg,
+            embed=FakeEmbedder(),
+            rerank=FakeReranker(),
+            session_id="partial-session",
+            notify=lambda _t: None,
+        )
     assert result is not None, "a refused catalog routes from the saved index"
     note = read(cfg)["note"]
-    assert "partial" in note.lower(), (
-        f"a refused partial view must be enumerated, got {note!r}"
+    assert "partial" not in note.lower(), (
+        f"a refused partial view must not ride the visible line, got {note!r}"
     )
+    assert any(
+        "partial view" in record.getMessage() for record in caplog.records
+    ), "the partial view must still log the refusal"
 
 
 def test_heal_finished_incomplete_is_not_reported_as_running(tmp_path, monkeypatch):

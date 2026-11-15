@@ -8,9 +8,12 @@ fragment is rejected. A note about a rejected value shows only the value's origi
 userinfo, path, query or fragment.
 
 Config traps (every ``notes`` entry) also reach the display record, but only when newly seen:
-``load`` persists a set of ``(trap_id, fingerprint)`` pairs beside the suggestions file, so an
-unchanged offending value stays silent forever and a changed value warns once. The persisted set
-never uses a clock.
+``load`` reports the traps not yet in the persisted set of ``(trap_id, fingerprint)`` pairs beside
+the suggestions file, and only a display-record write that actually carries a trap persists its
+fingerprint (:func:`acknowledge_trap_notes`, called by the display writer), so an unchanged
+offending value stays silent forever and a changed value warns once. A load that writes no record
+(disabled, dashboard or pre-load read, any non-routing path) never consumes a fingerprint. The
+persisted set never uses a clock.
 """
 
 from __future__ import annotations
@@ -454,41 +457,54 @@ def _write_traps(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
                 pass
 
 
-def _new_trap_notes(
-    notes: Sequence[str], suggestions_path: Any, show_suggestions: bool = True
+def _pending_trap_notes(
+    notes: Sequence[str], suggestions_path: Any
 ) -> Tuple[str, ...]:
-    """Return the notes not yet in the persisted set, then persist the union. Never raises.
+    """Return the notes not yet in the persisted set, without persisting anything. Never raises.
 
     Unchanged values match a stored fingerprint and stay silent; a changed
     value hashes anew and warns once. No clock is involved: the file's value
     is the only suppression. No trap means no file: a healthy ``load`` never
-    creates the set.
+    creates the set. Persistence is deferred to :func:`acknowledge_trap_notes`
+    so a load that writes no display record (disabled, dashboard or pre-load
+    read, any non-routing path) never consumes the fingerprint.
     """
     if not notes:
         return ()
     try:
-        if not show_suggestions:
-            # The display is disabled: no record is writable, so the warning
-            # never reaches one. Do not persist the fingerprint, or the first
-            # enabled load would stay silent for a value nobody saw warned.
-            return tuple(dict.fromkeys(notes))
         path = traps_path_for(suggestions_path)
         if path is None:
             # Nowhere to persist (display disabled): warn on every load. The
             # caller never writes a record on this path, so this costs nothing.
             return tuple(dict.fromkeys(notes))
         seen_before = _read_traps(path)
-        current: Set[Tuple[str, str]] = {_trap_key(note) for note in notes}
-        newly = tuple(
+        return tuple(
             dict.fromkeys(note for note in notes if _trap_key(note) not in seen_before)
         )
-        union = seen_before | current
-        if union != seen_before:
-            _write_traps(path, union)
-        return newly
     except Exception:  # load never raises; a persistence failure keeps the notes
         logger.debug("hermes-skill-router config: the trap set failed", exc_info=True)
         return tuple(notes)
+
+
+def acknowledge_trap_notes(notes: Sequence[str], suggestions_path: Any) -> None:
+    """Persist the fingerprints of *notes* that a display record actually carried. Never raises.
+
+    Called by the display writer only after a record write succeeds and the
+    written note contains the trap, so the fingerprint is consumed only once
+    the warning has reached a record. No note means no file.
+    """
+    if not notes:
+        return
+    try:
+        path = traps_path_for(suggestions_path)
+        if path is None:
+            return
+        seen_before = _read_traps(path)
+        union = seen_before | {_trap_key(note) for note in notes}
+        if union != seen_before:
+            _write_traps(path, union)
+    except Exception:  # a persistence failure must never cost the record write
+        logger.debug("hermes-skill-router config: the trap set failed", exc_info=True)
 
 
 def report_notes(notes: Optional[Sequence[str]]) -> None:
@@ -520,9 +536,7 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
             notes.append(f"{name}: unknown config key ignored")
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
-    trap_notes = _new_trap_notes(
-        notes, suggestions, bool(values.get("show_suggestions", True))
-    )
+    trap_notes = _pending_trap_notes(notes, suggestions)
     return Config(notes=tuple(notes), trap_notes=trap_notes, **values)
 
 
