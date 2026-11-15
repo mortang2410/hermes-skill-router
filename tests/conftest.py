@@ -45,3 +45,10 @@ def no_live_heal(monkeypatch):
         if hasattr(module, "reset_heal_state"):
             module.reset_heal_state()
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_config_traps(tmp_path, monkeypatch):
+    """Point the persisted trap set at a per-test file, so tests never touch the home cache."""
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_TRAPS_PATH", str(tmp_path / "config-traps.json"))
+    yield

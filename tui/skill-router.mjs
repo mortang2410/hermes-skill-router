@@ -9,11 +9,11 @@
  * path as its launch argument and defaults to the same path the plugin writes by default; it never
  * reads plugin config, which is why a disabled display is simply a missing record.
  *
- * It shows the skill names the router suggested on the last turn, names only, with one muted caption
+ * It shows the skill names the latest pass suggested, names only, with one muted caption
  * naming the turn — or the model search, when the record says a model called the search tool — and
  * its local clock time from the record's own identifiers. Its other muted line is the record's own
- * `note`: contract C5's one line for an incomplete history that is healing, which the plugin wrote
- * and a request never carried. The record's eight fields are projected down to status, origin,
+ * `note`: the degraded line the plugin wrote, which a request never carried. The line renders in
+ * every state (`routed`, `inert`, idle), mirroring the desktop pane. The record's eight fields are projected down to status, origin,
  * names, note, timestamp and turn id, so text from a request can never reach the card. It re-reads
  * the file every 500 ms and lands each update through `sdk.updateWidget`, which no-ops once the
  * widget is closed, and the dock's own launch toggle collapses it on a second `/skills-routed`. A
@@ -157,11 +157,10 @@ export function captionFor(record) {
  * The labels one render needs, derived from a record: the section title, its count, the names to
  * list one per line, the turn caption, and the single line a state without names paints.
  *
- * `note` is the record's own C5 line when the writer supplied one, and otherwise the fixed line
- * this state has always painted: an inert turn, an idle widget or a routed turn that picked
- * nothing. A routed turn that picked names carries no line unless a note says history is healing,
- * so the card gains one line while the association store is incomplete and stays silent once it
- * is complete.
+ * `note` is the record's own degraded line when the writer supplied one, and otherwise the fixed
+ * line this state has always painted: an inert turn, an idle widget or a routed turn that picked
+ * nothing. The carried line renders in every state (`routed`, `inert`, idle), mirroring the
+ * desktop pane: a routed turn that picked names still paints it while routing is degraded.
  */
 export function summary(record) {
   const status = record && STATUSES.includes(record.status) ? record.status : 'idle'

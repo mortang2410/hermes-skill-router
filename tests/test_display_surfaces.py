@@ -454,7 +454,7 @@ const out = {}
 const registered = []
 const events = []
 const rest = []
-const routeBody = { at: STAMP, names: NAMES, session_id: 'session-1', status: 'routed', turn_id: 'turn-1' }
+const routeBody = { at: STAMP, names: NAMES, origin: 'turn', session_id: 'session-1', status: 'routed', turn_id: 'turn-1' }
 const ctx = {
   register: contribution => {
     registered.push(contribution)
@@ -489,10 +489,10 @@ out.queryKey = SUGGESTIONS_QUERY_KEY
 out.lines = { enable: ENABLE_LINE, readError: READ_ERROR_LINE, title: PANE_TITLE, updated: UPDATED_EVENT }
 
 out.summary = {
-  empty: summary({ at: STAMP, names: [], status: 'routed', turn_id: 'turn-1' }),
+  empty: summary({ at: STAMP, names: [], origin: 'turn', status: 'routed', turn_id: 'turn-1' }),
   idle: summary(null),
   inert: summary({ at: STAMP, names: ['ignored'], status: 'inert', turn_id: 'turn-1' }),
-  routed: summary({ at: STAMP, names: NAMES, session_id: 'session-1', status: 'routed', turn_id: 'turn-1' }),
+  routed: summary({ at: STAMP, names: NAMES, origin: 'turn', session_id: 'session-1', status: 'routed', turn_id: 'turn-1' }),
   search: summary({ at: STAMP, names: NAMES, origin: 'search', status: 'routed', turn_id: '' }),
   tampered: summary({
     at: STAMP,
@@ -504,10 +504,10 @@ out.summary = {
   })
 }
 
-// Contract C5: the writer's one line reaches the pane, and a routed turn without one stays silent.
+// The writer's degraded line reaches the pane in every state.
 const NOTE = 'History is incomplete and healing is running in the background.'
 out.note = {
-  empty: summary({ at: STAMP, names: [], note: NOTE, status: 'routed', turn_id: 'turn-1' }),
+  empty: summary({ at: STAMP, names: [], note: NOTE, origin: 'turn', status: 'routed', turn_id: 'turn-1' }),
   inert: summary({
     at: STAMP,
     names: [],
@@ -515,7 +515,7 @@ out.note = {
     status: 'inert',
     turn_id: 'turn-1'
   }),
-  routed: summary({ at: STAMP, names: NAMES, note: NOTE, status: 'routed', turn_id: 'turn-1' })
+  routed: summary({ at: STAMP, names: NAMES, note: NOTE, origin: 'turn', status: 'routed', turn_id: 'turn-1' })
 }
 
 // The caption is built from the record's identifiers only, and drops a half it cannot read.
@@ -922,11 +922,11 @@ def test_the_desktop_half_registers_one_right_hand_pane(desktop):
 
 
 def test_the_desktop_pane_is_collapsed_then_lists_the_names(desktop):
-    assert "Skills routed (3)" in desktop["collapsed"]["text"]
+    assert "Skills routed (3) · latest pass" in desktop["collapsed"]["text"]
     assert desktop["collapsed"]["leaked"] == []
     assert CAPTION in desktop["collapsed"]["text"]
     assert desktop["expanded"]["shown"] == ["alpha", "beta", "gamma"]
-    assert "Skills routed (3)" in desktop["expanded"]["text"]
+    assert "Skills routed (3) · latest pass" in desktop["expanded"]["text"]
 
 
 def test_the_desktop_pane_labels_each_record_state(desktop):
@@ -935,12 +935,12 @@ def test_the_desktop_pane_labels_each_record_state(desktop):
     assert summary["routed"] == {
         "caption": CAPTION,
         "count": 3,
-        "heading": "Skills routed (3)",
+        "heading": "Skills routed (3) · latest pass",
         "names": ["alpha", "beta", "gamma"],
         "note": "",
         "status": "routed",
     }
-    assert summary["empty"]["heading"] == "Skills routed (0)"
+    assert summary["empty"]["heading"] == "Skills routed (0) · latest pass"
     assert summary["empty"]["note"] == "The last routed turn suggested nothing."
     assert summary["empty"]["caption"] == CAPTION
     assert summary["inert"]["names"] == []
@@ -999,6 +999,7 @@ def test_the_desktop_pane_reads_the_plugin_route(desktop):
     assert desktop["query"]["body"] == {
         "at": CAPTION_STAMP,
         "names": ["alpha", "beta", "gamma"],
+        "origin": "turn",
         "session_id": "session-1",
         "status": "routed",
         "turn_id": "turn-1",
@@ -1030,6 +1031,7 @@ def test_the_desktop_pane_marks_a_model_search(desktop):
     assert desktop["captions"]["search"] == marker
     assert desktop["summary"]["search"]["caption"] == marker
     assert desktop["summary"]["search"]["names"] == ["alpha", "beta", "gamma"]
+    assert desktop["summary"]["search"]["heading"] == "Skills routed (3) · model search"
     assert "model search" in desktop["searchPane"]["text"]
     assert "turn turn-1" not in desktop["searchPane"]["text"]
 

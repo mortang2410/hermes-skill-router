@@ -6,14 +6,23 @@ to its default, with a note naming the key, when the value is malformed or out o
 loopback host, any other host must use ``https``, and a URL carrying credentials, a query or a
 fragment is rejected. A note about a rejected value shows only the value's origin, never its
 userinfo, path, query or fragment.
+
+Config traps (every ``notes`` entry) also reach the display record, but only when newly seen:
+``load`` persists a set of ``(trap_id, fingerprint)`` pairs beside the suggestions file, so an
+unchanged offending value stays silent forever and a changed value warns once. The persisted set
+never uses a clock.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
+import tempfile
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -116,6 +125,13 @@ BOUNDS: dict[str, Tuple[float, float]] = {
 }
 
 
+#: File name of the persisted config-trap set, written beside the suggestions file.
+TRAPS_FILENAME = "config-traps.json"
+
+#: Environment override for the traps file; tests point it at a temporary file.
+TRAPS_ENV_VAR = "HERMES_SKILL_ROUTER_TRAPS_PATH"
+
+
 @dataclass(frozen=True)
 class Config:
     """Every plugin setting with its default applied, plus the notes ``load`` produced."""
@@ -151,6 +167,7 @@ class Config:
     eager_skills: Tuple[str, ...]
     deferred_skills: Tuple[str, ...]
     notes: Tuple[str, ...]
+    trap_notes: Tuple[str, ...] = ()
 
 
 def is_safe_base_url(value: Any) -> bool:
@@ -340,6 +357,135 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
 _LOGGED_NOTES: set[str] = set()
 
 
+def traps_path_for(suggestions_path: Any) -> Optional[str]:
+    """Return the persisted trap-set path for *suggestions_path*, or ``None`` when nowhere to write.
+
+    The set lives beside the suggestions file, so moving the record moves the
+    suppression with it. An empty path means the display is disabled, which
+    also disables persistence. ``HERMES_SKILL_ROUTER_TRAPS_PATH`` wins when set.
+    """
+    override = os.environ.get(TRAPS_ENV_VAR) or ""
+    if override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
+    if not isinstance(suggestions_path, str):
+        return None
+    text = suggestions_path.strip()
+    if not text:
+        return None
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(text)))
+    if not directory:
+        directory = os.getcwd()
+    return os.path.join(directory, TRAPS_FILENAME)
+
+
+def _trap_key(note: str) -> Tuple[str, str]:
+    """Return the persisted ``(trap_id, fingerprint)`` identity for one config note.
+
+    *trap_id* is the settings key named before the first colon; *fingerprint* is
+    a sha256 of the full (already redacted) note, so an unchanged offending
+    value hashes identically forever and any changed value hashes anew. The
+    redacted note never carries credentials, so the fingerprint is log-safe.
+    """
+    trap_id = note.split(":", 1)[0].strip() or "config"
+    fingerprint = hashlib.sha256(note.encode("utf-8")).hexdigest()
+    return trap_id, fingerprint
+
+
+def _read_traps(path: Optional[str]) -> Set[Tuple[str, str]]:
+    """Return the persisted seen set at *path*, or an empty set when unreadable. Never raises."""
+    if path is None:
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    if isinstance(data, dict):
+        entries = data.get("seen")
+    else:
+        entries = data
+    if not isinstance(entries, list):
+        return set()
+    seen: Set[Tuple[str, str]] = set()
+    for entry in entries:
+        if (
+            isinstance(entry, (list, tuple))
+            and len(entry) == 2
+            and isinstance(entry[0], str)
+            and isinstance(entry[1], str)
+        ):
+            seen.add((entry[0], entry[1]))
+    return seen
+
+
+def _write_traps(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
+    """Persist *seen* beside the record, atomically and without ever raising."""
+    if path is None:
+        return
+    directory = os.path.dirname(path) or "."
+    temporary: Optional[str] = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".config-traps-",
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary = handle.name
+        with handle:
+            json.dump(
+                {"schema": 1, "seen": sorted([list(pair) for pair in seen])},
+                handle,
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    except OSError:
+        logger.debug("hermes-skill-router config: could not write the trap set", exc_info=True)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _new_trap_notes(
+    notes: Sequence[str], suggestions_path: Any
+) -> Tuple[str, ...]:
+    """Return the notes not yet in the persisted set, then persist the union. Never raises.
+
+    Unchanged values match a stored fingerprint and stay silent; a changed
+    value hashes anew and warns once. No clock is involved: the file's value
+    is the only suppression. No trap means no file: a healthy ``load`` never
+    creates the set.
+    """
+    if not notes:
+        return ()
+    try:
+        path = traps_path_for(suggestions_path)
+        if path is None:
+            # Nowhere to persist (display disabled): warn on every load. The
+            # caller never writes a record on this path, so this costs nothing.
+            return tuple(dict.fromkeys(notes))
+        seen_before = _read_traps(path)
+        current: Set[Tuple[str, str]] = {_trap_key(note) for note in notes}
+        newly = tuple(
+            dict.fromkeys(note for note in notes if _trap_key(note) not in seen_before)
+        )
+        union = seen_before | current
+        if union != seen_before:
+            _write_traps(path, union)
+        return newly
+    except Exception:  # load never raises; a persistence failure keeps the notes
+        logger.debug("hermes-skill-router config: the trap set failed", exc_info=True)
+        return tuple(notes)
+
+
 def report_notes(notes: Optional[Sequence[str]]) -> None:
     """Log each distinct config note once per process. A note names a setting, never request text."""
     for note in notes or ():
@@ -368,7 +514,9 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
             name = _redact_url(key) if isinstance(key, str) else _shown(key)
             notes.append(f"{name}: unknown config key ignored")
     report_notes(notes)
-    return Config(notes=tuple(notes), **values)
+    suggestions = values.get("suggestions_path", "")
+    trap_notes = _new_trap_notes(notes, suggestions)
+    return Config(notes=tuple(notes), trap_notes=trap_notes, **values)
 
 
 def read_settings(ctx: Any) -> dict[str, Any]:

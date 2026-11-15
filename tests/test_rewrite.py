@@ -1354,6 +1354,8 @@ DECISION_PREFIX = "skill router: query="
 GOLDEN_PAYLOAD_SHA256 = "700fbbb243841d2a0d6eb7e1172e5ce3a7e1774e74997c4108d678416f46a14a"
 
 # The display record the same call wrote, minus its unstable ``at`` timestamp.
+# The fixture disables cache persistence (``cachePath`` empty), so the degraded
+# line names that one loss.
 GOLDEN_RECORD = {
     "schema": 2,
     "session_id": "s-1",
@@ -1361,7 +1363,7 @@ GOLDEN_RECORD = {
     "status": "routed",
     "origin": "turn",
     "names": ["beta", "delta", "alpha", "gamma"],
-    "note": "",
+    "note": "Cache persistence is off (cachePath empty); the index is rebuilt each turn.",
 }
 
 

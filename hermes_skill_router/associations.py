@@ -2024,6 +2024,53 @@ def note_store_complete(store_path: str) -> None:
             _HEAL_STATE.pop(store_path, None)
 
 
+def heal_state(store_path: str) -> Optional[str]:
+    """Return ``"running"``, ``"finished"`` or ``None`` for one store's heal attempt. Never raises."""
+    try:
+        with _HEAL_LOCK:
+            return _HEAL_STATE.get(store_path)
+    except Exception:  # the note chooser must not depend on bookkeeping
+        return None
+
+
+def store_skip_state(store_path: str, state_db_path: Optional[str] = None) -> str:
+    """Return how contract C4 skips one store: ``complete|missing|unreadable|empty|stale``.
+
+    ``complete`` means coverage holds; otherwise the four skip states name the
+    loss: no file (``missing``), a file that will not open (``unreadable``), a
+    store with no scan watermark (``empty``) and a scanned store that fell
+    behind the completeness window (``stale``). Never raises: an unreadable
+    store or session store answers ``unreadable`` rather than guessing.
+    """
+    path = os.path.expanduser(store_path) if store_path else ""
+    try:
+        if not path or not os.path.exists(path):
+            return "missing"
+    except OSError:
+        return "unreadable"
+    try:
+        store = open_store(path, read_only=True)
+    except Exception:  # a foreign or corrupt store is no evidence of coverage
+        return "unreadable"
+    try:
+        try:
+            scanned = _meta_int(store, META_LAST_SCAN_MS)
+        except Exception:
+            return "unreadable"
+        if scanned <= 0:
+            return "empty"
+        try:
+            complete = is_store_complete(store, state_db_path)
+        except Exception:
+            return "unreadable"
+        return "complete" if complete else "stale"
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
 def heal_failure_note(store_path: str) -> Optional[str]:
     """Return contract C5's one-line note for a failed heal of *store_path*, once, or ``None``.
 

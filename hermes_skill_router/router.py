@@ -51,17 +51,18 @@ request clears the previous one first, so a search never ranks rows from an earl
 
 On every request that carried the catalog on Chat Completions the same decision is written to the
 display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
-names, or ``inert`` with no names. While the association store is incomplete, contract C5's one
-note rides on that record, so the surfaces can say history is incomplete and healing is running, or
-report the one pending heal failure the C6 job handed the turn. When a per-request call fails,
-contract C7's one line rides on the inert record instead, so the surfaces can say the endpoints
-were unreachable and no suggestions were made; with the live clients the setup-needed line
-(:func:`hermes_skill_router.setup_check.setup_note`) refines that line to name the failing
-``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks both history lines, so a failed
-turn never consumes them. Either note never enters the payload, so it costs no token, and a
-complete store adds nothing. The record is written after the payload is built and never enters
-it, so the display costs no token. A written record is announced on the
-plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
+names, or ``inert`` with no names. One degraded line rides on that record whenever routing is
+degraded: history incomplete with its skip state and heal outcome, partial view, missing BM25,
+fusion off, cache persistence off, budget expiry, dropped window, dead endpoint, or a newly-seen
+config trap. When a per-request call fails, contract C7's one line rides on the inert record instead,
+so the surfaces can say the endpoints were unreachable and no suggestions were made; with the live
+clients the setup-needed line
+(:func:`hermes_skill_router.setup_check.setup_note`), probed fresh every dead-endpoint turn,
+refines that line to name the failing ``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks
+the degraded chooser, so a failed turn never consumes the heal note. The note never enters the
+payload, so it costs no token, and a healthy turn adds nothing. The record is written after the
+payload is built and never enters it, so the display costs no token. A written record is announced
+on the plugin event ``plugin.hermes-skill-router.suggestions.updated`` with the turn id, best effort.
 
 A completed pass also writes one info line to the plugin log, beginning ``skill router: query=``.
 The line carries the query as a JSON string, every shortlisted candidate with the score the selector
@@ -92,9 +93,10 @@ from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
 from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
-from .library import Index, PathResolver, load_or_build, path_resolver
+from .library import Index, PathResolver, cached_row_count, load_or_build, path_resolver
 from .rerank import rerank as default_rerank
 from .search import (
+    BUDGET_EXPIRED,
     EMBED_FAILED,
     RERANK_FAILED,
     Ranked,
@@ -114,11 +116,24 @@ logger = logging.getLogger(__name__)
 CHAT_COMPLETIONS = "chat_completions"
 
 #: Contract C5's one line while the association store is incomplete; it rides on the record only.
+#: Kept as the base wording for callers that reference the constant; the degraded
+#: chooser extends it with the skip state and heal outcome per turn.
 HISTORY_NOTE = "History is incomplete and healing is running in the background."
 
 #: Contract C7's one line when a per-request call fails; it rides on the inert record only.
 #: With the live clients the setup-needed line refining this naming is setup_check.setup_note.
 ENDPOINT_NOTE = "Routing endpoints are unreachable; no suggestions were made this turn."
+
+#: The routing budget ran out before the pass finished; it costs no endpoint claim.
+BUDGET_NOTE = (
+    "Routing budget exhausted; raise routingTimeoutMs or check server load. "
+    "No suggestions were made this turn."
+)
+
+#: The catalog already went out in this compaction window, so nothing is suggestible.
+DROPPED_NOTE = (
+    "Catalog already shown this window; call skills_list. No suggestions were made this turn."
+)
 
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
@@ -310,7 +325,7 @@ def _compose(
     if dropped_before or dumped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
         # for the rest of the window even when ranking would succeed now.
-        return _fail("catalog already dumped in this window")
+        return _fail("catalog already dumped in this window", DROPPED_NOTE)
     # One memo for the whole pass: the recency gate and the selection both resolve through the
     # same saved map, so a candidate is looked up at most once a pass and never again once known.
     resolve = path_resolver(cfg, index, skill_path)
@@ -320,20 +335,22 @@ def _compose(
     ranked = rank(cfg, index, query, embed=embed, rerank=rerank, resolve=resolve, deadline=deadline)
     if ranked.reason:
         # A failed per-request call is a dead endpoint, and its line outranks the history
-        # line; a budget expiry keeps no line and never consumes the pending heal note.
+        # line; a budget expiry names the budget and never consumes the pending heal note.
         if ranked.reason in (EMBED_FAILED, RERANK_FAILED):
             note = _failure_note(
                 cfg,
                 uses_live=embed is default_embed and rerank is default_rerank,
                 deadline=deadline,
             )
+        elif ranked.reason == BUDGET_EXPIRED:
+            note = BUDGET_NOTE
         else:
             note = ""
         return _fail(ranked.detail, note)
     # C4 has fired by now: the pass reached the shortlist, which opened the store and asked for one
-    # heal when it was incomplete. Contract C5's note is read once here, so every record this turn
+    # heal when it was incomplete. The degraded line is read once here, so every record this turn
     # writes carries the same line, and a failed pass never reaches here, so the dead-endpoint line outranks it.
-    note = _history_note(cfg)
+    note = _degraded_note(cfg, index=index, routed_count=len(partition.routed.names))
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
@@ -554,31 +571,89 @@ def _configured_store_path(cfg: Config) -> Optional[str]:
     return associations.association_db_path_for(cache)
 
 
-def _history_note(cfg: Config) -> str:
-    """Return the turn's one note for an incomplete history, or ``""`` when the store is complete.
+def _degraded_note(
+    cfg: Config,
+    *,
+    index: Optional[Index] = None,
+    routed_count: Optional[int] = None,
+) -> str:
+    """Return the turn's one degraded line naming every active loss, or ``""`` when healthy.
 
-    C6's completeness rule answers whether there is a line at all, over the same configured store
-    path and the same Hermes session store the library pass reads. A missing, empty or unreadable
-    store is incomplete by that rule, so the four store states C4 skips all carry a line.
+    The line enumerates, on the single-line record note, each loss the survey
+    found silent: history incomplete (which of the four skip states), heal
+    failed vs finished-incomplete vs running vs pending, partial-view refusal,
+    missing BM25, fusion off, cache persistence off, and newly-seen config
+    traps. A failed (dead-endpoint) or budget pass never reaches here, so
+    those lines outrank this chooser and never consume the heal note; a
+    complete store never consumes it either.
 
-    While the store is incomplete, C6's pending heal-failure note wins over the generic
-    "healing is running" line: a failed heal is not running, so the generic line would claim work
-    that stopped, and the failure is the state the user needs to see. The accessor is one-shot, so
-    it is read only after the turn is known to carry a history note: a turn that shows contract
-    C7's dead-endpoint note returns before this chooser runs, and a complete store never
-    consumes it.
+    *index* supplies the BM25 fact (its term index) and *routed_count* the
+    arrived catalog size for the partial-view derivation. The partial-view
+    condition is derived per turn from the saved row count, never persisted:
+    a catalog holding fewer than half the saved rows is the refused state.
     """
-    if not _store_in_play(cfg):
-        return ""
-    path = _configured_store_path(cfg)
-    if path is None or _store_is_complete(path):
-        return ""
-    return associations.heal_failure_note(path) or HISTORY_NOTE
-
-
-#: The last setup check per endpoint config, so a dead-endpoint turn does not pay two more
-#: endpoint timeouts on every request inside the health window.
-_SETUP_CACHE: Dict[tuple, tuple[float, bool, str]] = {}
+    parts: List[str] = []
+    if _store_in_play(cfg):
+        path = _configured_store_path(cfg)
+        if path is not None:
+            skip = _store_skip_state(path)
+            if skip != "complete":
+                failure = associations.heal_failure_note(path)
+                if failure:
+                    parts.append(failure)
+                else:
+                    state = associations.heal_state(path)
+                    if state == "finished":
+                        heal_text = (
+                            "and the background heal finished but the store is still incomplete"
+                        )
+                    elif state == "running":
+                        heal_text = "and healing is running in the background"
+                    else:
+                        heal_text = "and a background heal is pending"
+                    parts.append(
+                        f"History incomplete ({skip} store) {heal_text}; "
+                        "routing continues without learned history."
+                    )
+    if index is not None and routed_count is not None:
+        try:
+            saved = cached_row_count(cfg)
+        except Exception:  # the note must never cost the turn
+            logger.debug("skill router: the saved row count raised", exc_info=True)
+            saved = 0
+        if saved and routed_count * 2 < saved:
+            parts.append(
+                f"Catalog read is partial ({routed_count} of {saved} saved skills); "
+                "routing from the saved index. Remove the cache file to force a "
+                "rebuild if the catalog really shrank."
+            )
+    settings = resolve_fusion_config(
+        {
+            "mode": cfg.fusion_mode,
+            "channels": {
+                "semantic": cfg.channels_semantic,
+                "bm25": cfg.channels_bm25,
+                "associations": cfg.channels_associations,
+            },
+        }
+    )
+    if settings.mode == "cosine" or not settings.enabled:
+        parts.append(
+            "Fusion is off (cosine or all channels off); routing uses the cosine order only."
+        )
+    elif index is not None and settings.bm25 and index.term_index is None:
+        parts.append(
+            "BM25 index missing; the BM25 channel contributes no ranks."
+        )
+    if not (cfg.cache_path or "").strip():
+        parts.append(
+            "Cache persistence is off (cachePath empty); the index is rebuilt each turn."
+        )
+    trap_notes = getattr(cfg, "trap_notes", ()) or ()
+    for trap in trap_notes:
+        if trap:
+            parts.append(trap)
+    return " ".join(parts)
 
 
 def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
@@ -586,45 +661,27 @@ def _setup_note(cfg: Config, *, deadline: Optional[float] = None) -> str:
 
     The check runs only on a dead-endpoint turn with the live clients. A test that injects its
     own transport proves ranking without touching a socket, so it never probes and keeps the
-    generic dead-endpoint line. The result is throttled by ``healthCheckMs`` per endpoint
-    config, mirroring the clients' health gates.
+    generic dead-endpoint line.
+
+    The line is value-scoped: every dead-endpoint turn probes the current
+    answer and shows the line whenever both servers do not answer now. There
+    is no ``health_check_ms`` replay and no cache, so a server that comes up
+    is visible on the next turn even inside the health window. The health
+    gates in the clients remain as socket-cost control only and never decide
+    visibility.
 
     *deadline* is the routing pass' deadline: when the budget a failed rank already spent has
-    run out, the probe is skipped (and nothing is cached), so the diagnostic never outlives
-    the budget it explains. An indeterminate check (a probe the deadline skipped or capped
-    into a timeout, so no endpoint answered negatively) likewise names nothing and is never
-    cached: caching it would pin a possibly wrong attribution for the whole health window.
-
-    The window is not part of the cache identity: expiry is evaluated against the current
-    ``health_check_ms`` on every look-up, so the configured minimum gap is enforced against
-    the live setting instead of a change to it forcing an immediate re-probe.
+    run out, the probe is skipped, so the diagnostic never outlives the budget it explains.
+    An indeterminate check (a probe the deadline skipped or capped into a timeout, so no
+    endpoint answered negatively) likewise names nothing.
     """
-    key = (
-        cfg.embed_base_url,
-        cfg.embed_path,
-        cfg.embed_model_id,
-        cfg.rerank_base_url,
-        cfg.rerank_path,
-        cfg.rerank_model,
-        cfg.embed_timeout_ms,
-        cfg.rerank_timeout_ms,
-    )
-    window_s = cfg.health_check_ms / 1000.0
-    now = monotonic()
-    cached = _SETUP_CACHE.get(key)
-    if cached is not None and window_s > 0 and (now - cached[0]) < window_s:
-        ready, failing = cached[1], cached[2]
-    else:
-        if deadline is not None and deadline - now <= 0:
-            return ""
-        try:
-            ready, failing = check_setup_state(cfg, deadline=deadline)
-        except Exception:  # the check never raises, but the note must not depend on it
-            logger.debug("skill router: the setup check raised", exc_info=True)
-            return ""
-        if not ready and not failing:
-            return ""
-        _SETUP_CACHE[key] = (now, ready, failing)
+    if deadline is not None and deadline - monotonic() <= 0:
+        return ""
+    try:
+        ready, failing = check_setup_state(cfg, deadline=deadline)
+    except Exception:  # the check never raises, but the note must not depend on it
+        logger.debug("skill router: the setup check raised", exc_info=True)
+        return ""
     if ready or not failing:
         return ""
     return setup_note(failing, bundled=_is_bundled(cfg, failing))
@@ -656,29 +713,18 @@ def _failure_note(
     return ENDPOINT_NOTE
 
 
-def _store_is_complete(path: str) -> bool:
-    """Return whether the association store at *path* is complete, by contract C6's rule.
+def _store_skip_state(path: str) -> str:
+    """Return ``complete|missing|unreadable|empty|stale`` for *path*. Never raises.
 
-    A store that cannot be opened or read answers "incomplete", which is the same answer the
-    detector gives: no evidence of coverage is not coverage. The note must never cost the turn, so
-    every failure here is swallowed after one debug line.
+    The associations module owns the completeness rule; this helper only names
+    which skip state C4 hit, so the degraded line can name the loss. Every
+    failure here is swallowed: no evidence of coverage is not coverage.
     """
-    store: Optional[associations.AssociationStore]
     try:
-        store = associations.open_store(path, read_only=True)
-    except Exception:  # a missing, empty or unreadable file is no evidence of coverage
-        logger.debug("skill router: the store could not be opened for the C5 note", exc_info=True)
-        return False
-    try:
-        return bool(associations.is_store_complete(store))
-    except Exception:  # the detector never raises, but the note must not depend on that
-        logger.debug("skill router: the store completeness check raised", exc_info=True)
-        return False
-    finally:
-        try:
-            store.close()
-        except Exception:  # a close failure must not cost the turn
-            logger.debug("skill router: the association store close raised", exc_info=True)
+        return associations.store_skip_state(path)
+    except Exception:  # the note must never cost the turn
+        logger.debug("skill router: the store skip state raised", exc_info=True)
+        return "unreadable"
 
 
 def _recorder(
@@ -692,7 +738,7 @@ def _recorder(
 ) -> Callable[[], None]:
     """Return a thunk that writes one display record and announces it when a write happened.
 
-    *note* is contract C5's one line for this turn, or ``""``. The thunk never raises: the payload
+    *note* is the turn's degraded line, or ``""`` when healthy. The thunk never raises: the payload
     the caller is about to return must not depend on the display, so a record or broadcast failure
     is swallowed here rather than reaching the pipeline.
     """

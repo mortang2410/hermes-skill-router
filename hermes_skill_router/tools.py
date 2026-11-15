@@ -28,7 +28,7 @@ import logging
 from typing import Any, Callable, Mapping, Optional
 
 from .config import load, read_settings
-from .display import ROUTED, SEARCH, record
+from .display import ROUTED, SEARCH, read, record
 from .embed import embed_texts
 from .rerank import rerank
 from .search import SearchOutcome, catalog_rows, select_rows
@@ -189,14 +189,29 @@ def _write_record(cfg: Any, outcome: SearchOutcome, session_id: str) -> None:
     ``search`` with the selected names, and with it off it removes any record instead, so the pane
     and the widget stay idle and the search never bypasses the setting. A writer failure is logged
     and never changes the answer the model already earned.
+
+    The search overwrite is the correct latest pass, so the record it writes carries the
+    previous record's degraded line forward: a manual lookup during a degraded state must not
+    hide the loss the turn just reported. The line is read from the record being overwritten,
+    never from a request.
     """
     try:
+        carried = ""
+        try:
+            previous = read(cfg)
+        except Exception:
+            previous = None
+        if previous is not None:
+            note = previous.get("note")
+            if isinstance(note, str):
+                carried = note
         record(
             cfg,
             status=ROUTED,
             origin=SEARCH,
             names=[row.name for row in outcome.rows],
             session_id=session_id,
+            note=carried,
         )
     except Exception:
         logger.debug("skill search: the display record failed", exc_info=True)

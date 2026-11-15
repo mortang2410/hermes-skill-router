@@ -5,13 +5,13 @@
  * `$HERMES_HOME/desktop-plugins/hermes-skill-router/` when the plugin lands in a plugins root, the
  * renderer evaluates the file as plain ESM, and `register(ctx)` contributes one pane. The pane is
  * the desktop rail on the right, 260 px wide, collapsed by default, and it lists the skill names
- * the router suggested on the last turn — never a kept row, never text from a request. Under the
+ * the latest pass suggested — never a kept row, never text from a request. The heading names the
+ * origin (`latest pass` for the automatic turn, `model search` for a model lookup). Under the
  * heading sits one muted caption naming the turn and its local clock time, built from the record's
  * own `turn_id` and `at`; when the record says a model search produced the names, the caption
  * paints the model-search marker instead, because a lookup belongs to no turn. Below the caption,
- * a record carrying a `note` paints that one muted line — contract C5's line for an incomplete
- * history that is healing — and with no note the pane keeps its fixed state lines and stays silent
- * on a routed turn.
+ * in every state, a record carrying a `note` paints that one muted line: the degraded line the
+ * plugin wrote. With no note the pane keeps its fixed state lines.
  *
  * The data comes from the plugin's own backend route, `GET /suggestions` (dashboard/plugin_api.py,
  * mounted at `/api/plugins/hermes-skill-router/`), through `ctx.rest`, so the desktop half never
@@ -86,6 +86,9 @@ export function isMissingRoute(error) {
 /** The marker a search record paints where a routed turn paints its turn id. */
 export const MODEL_SEARCH_LABEL = 'model search'
 
+/** The marker a turn record paints in its heading: the automatic pass is the latest pass. */
+export const LATEST_PASS_LABEL = 'latest pass'
+
 /**
  * The local clock time of an ISO 8601 record timestamp, `HH:MM`, or `""` when it does not parse.
  *
@@ -131,14 +134,37 @@ export function captionFor(record) {
 }
 
 /**
+ * The heading for one route body: the title, the count, and who asked.
+ *
+ * A `routed` body names its origin in the heading (`latest pass` for a turn,
+ * `model search` for a lookup), so search results are never mistaken for the
+ * automatic turn. `inert` and idle bodies keep the plain heading, as they
+ * carry no names to attribute.
+ */
+export function headingFor(names, origin) {
+  const base = `${PANE_TITLE} (${names.length})`
+
+  if (origin === 'search') {
+    return `${base} · ${MODEL_SEARCH_LABEL}`
+  }
+
+  if (origin === 'turn') {
+    return `${base} · ${LATEST_PASS_LABEL}`
+  }
+
+  return base
+}
+
+/**
  * The labels one pane render needs, derived from a route body alone.
  *
  * Names only, plus the writer's one-line note: `names` is the record's own list (already capped by
- * `maxDisplayNames` when the writer stored it) and `note` is the C5 line the plugin wrote, never
- * request text. Every other key of the body is ignored, so a request message or a system prompt
- * in the record can never reach the pane. When the record carries no note, the state falls back
- * to the fixed line the pane always painted. A missing record, a corrupt one and an idle answer
- * all collapse to the idle line.
+ * `maxDisplayNames` when the writer stored it) and `note` is the degraded line the plugin wrote,
+ * never request text. Every other key of the body is ignored, so a request message or a system
+ * prompt in the record can never reach the pane. The carried note renders in every state
+ * (`routed`, `inert`, idle): it wins over the fixed line. When the record carries no note, the
+ * state falls back to the fixed line the pane always painted. A missing record, a corrupt one and
+ * an idle answer all collapse to the idle line.
  */
 export function summary(record) {
   const status =
@@ -147,7 +173,10 @@ export function summary(record) {
     status === 'routed' && Array.isArray(record.names)
       ? record.names.filter(name => typeof name === 'string' && name.trim() !== '')
       : []
-  const heading = `${PANE_TITLE} (${names.length})`
+  const origin = record && typeof record === 'object' && typeof record.origin === 'string'
+    ? record.origin
+    : ''
+  const heading = status === 'routed' ? headingFor(names, origin) : `${PANE_TITLE} (${names.length})`
   const caption = captionFor(record)
   const carried =
     record && typeof record === 'object' && typeof record.note === 'string' ? record.note.trim() : ''

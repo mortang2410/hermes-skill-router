@@ -126,6 +126,7 @@ CONFIG_FIELDS = {
     "eager_skills",
     "deferred_skills",
     "notes",
+    "trap_notes",
 }
 
 OUT_OF_BOUNDS = [

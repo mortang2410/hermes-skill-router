@@ -81,7 +81,6 @@ export const useEffect = () => {}
 def _fresh_state(monkeypatch):
     from hermes_skill_router import search as search_module
 
-    router_module._SETUP_CACHE.clear()
     router_module._LOGGED.clear()
     search_module.clear_dumps()
     embed_module.HEALTH.reset()
@@ -90,7 +89,6 @@ def _fresh_state(monkeypatch):
     try:
         yield
     finally:
-        router_module._SETUP_CACHE.clear()
         embed_module.HEALTH.reset()
         rerank_module.HEALTH.reset()
 
@@ -345,7 +343,7 @@ def test_a_slow_healthy_rerank_after_an_embed_failure_is_not_blamed(tmp_path):
 
     The rank embed fails at once (500), the diagnostic embed succeeds after 0.75 s of a
     1.0 s routing budget, and the healthy rerank answers after 0.4 s, past the ~0.25 s
-    left. The turn must carry the generic line, cache nothing, and an unbudgeted check
+    left. The turn must carry the generic line, name nothing, and an unbudgeted check
     right after must report both endpoints ready.
     """
     from hermes_skill_router.setup_check import check_setup_state
@@ -388,9 +386,6 @@ def test_a_slow_healthy_rerank_after_an_embed_failure_is_not_blamed(tmp_path):
             f"an indeterminate probe must stay generic, got {note!r}"
         )
         assert "rerankBaseUrl" not in note and "embedBaseUrl" not in note
-        assert router_module._SETUP_CACHE == {}, (
-            f"an indeterminate result must not be cached: {router_module._SETUP_CACHE!r}"
-        )
         assert check_setup_state(cfg) == (True, ""), (
             "an unbudgeted check right after must see both endpoints healthy"
         )
@@ -404,7 +399,7 @@ def test_a_slow_embed_diagnostic_after_a_rerank_failure_is_not_blamed(tmp_path):
 
     The rank embed succeeds after 0.6 s and the rerank fails at once, leaving ~0.4 s of
     the 1.0 s budget; the diagnostic embed then needs 0.8 s and times out under the cap.
-    The turn must carry the generic line, cache nothing, and an unbudgeted check right
+    The turn must carry the generic line, name nothing, and an unbudgeted check right
     after must report both endpoints ready.
     """
     from hermes_skill_router.setup_check import check_setup_state
@@ -446,9 +441,6 @@ def test_a_slow_embed_diagnostic_after_a_rerank_failure_is_not_blamed(tmp_path):
             f"an indeterminate probe must stay generic, got {note!r}"
         )
         assert "embedBaseUrl" not in note and "rerankBaseUrl" not in note
-        assert router_module._SETUP_CACHE == {}, (
-            f"an indeterminate result must not be cached: {router_module._SETUP_CACHE!r}"
-        )
         assert check_setup_state(cfg) == (True, ""), (
             "an unbudgeted check right after must see both endpoints healthy"
         )
@@ -502,16 +494,14 @@ def test_a_bundled_endpoint_failure_keeps_the_setup_script_line(tmp_path, monkey
         rerank.close()
 
 
-def test_changing_the_health_window_reprobes_instead_of_serving_the_old_check(
+def test_every_dead_endpoint_turn_reprobes_regardless_of_the_health_window(
     tmp_path, monkeypatch
 ):
-    """The health window is not a cache key: expiry runs against the live window.
+    """The not-ready line is value-scoped: every dead-endpoint turn probes fresh.
 
-    Changing healthCheckMs must not force a re-probe while the new minimum gap has
-    not elapsed; once it has, the next turn re-probes.
+    The health window never replays a cached answer, so a second turn inside
+    the window still probes and the line follows the current answer.
     """
-    from time import monotonic as real_monotonic
-
     from hermes_skill_router import setup_check
 
     embed = FakeEndpoint(_embed_responder("/custom/embeddings"))
@@ -542,15 +532,9 @@ def test_changing_the_health_window_reprobes_instead_of_serving_the_old_check(
         # A fresh session per turn: each turn is the first failure in its window,
         # so each reaches the failure-note probe instead of the dumped-window path.
         assert turn(cfg, "s-2") is None
-        assert len(calls) == 1, "a second turn inside the window must serve the cache"
-        narrower = _config(tmp_path, embed, rerank, healthCheckMs=30000)
-        assert turn(narrower, "s-3") is None
-        assert len(calls) == 1, (
-            "changing the window must not re-probe while the new 30s gap has not elapsed"
-        )
-        monkeypatch.setattr(router_module, "monotonic", lambda: real_monotonic() + 31.0)
-        assert turn(narrower, "s-4") is None
-        assert len(calls) == 2, "once the live 30s window has elapsed the turn must re-probe"
+        assert len(calls) == 2, "a second turn inside the window must re-probe"
+        note = read(cfg)["note"]
+        assert "rerankBaseUrl" in note, f"the line must name the failing setting: {note!r}"
     finally:
         embed.close()
         rerank.close()
@@ -565,8 +549,12 @@ def test_a_custom_path_endpoint_that_is_live_passes_the_wired_check(tmp_path):
         assert result is not None, "both custom-path endpoints answer, so the turn routes"
         stored = read(cfg)
         assert stored["status"] == "routed"
-        assert stored["note"] == "", (
-            f"a healthy custom-path endpoint must pass the wired check, got {stored['note']!r}"
+        note = stored["note"]
+        assert note != router_module.ENDPOINT_NOTE, (
+            f"a healthy custom-path endpoint must pass the wired check, got {note!r}"
+        )
+        assert "setup" not in note.lower() and "unreachable" not in note.lower(), (
+            f"a live endpoint must not claim setup is needed, got {note!r}"
         )
     finally:
         embed.close()

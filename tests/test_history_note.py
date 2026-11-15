@@ -104,8 +104,11 @@ def test_an_incomplete_store_puts_one_note_on_the_turn_record(tmp_path):
     assert result is not None
     stored = read(cfg)
     assert stored["status"] == ROUTED
-    assert stored["note"] == router_module.HISTORY_NOTE
-    assert router_module.HISTORY_NOTE not in json.dumps(result["request"]), (
+    assert "History incomplete" in stored["note"], stored["note"]
+    assert "(missing store)" in stored["note"], (
+        f"the line must name the skip state, got {stored['note']!r}"
+    )
+    assert stored["note"] not in json.dumps(result["request"]), (
         "the note must not reach the provider request"
     )
 
@@ -118,7 +121,9 @@ def test_a_valid_but_empty_store_also_carries_the_note(tmp_path):
 
     assert _turn(cfg) is not None
 
-    assert read(cfg)["note"] == router_module.HISTORY_NOTE
+    note = read(cfg)["note"]
+    assert "History incomplete" in note
+    assert "(empty store)" in note, f"the line must name the skip state, got {note!r}"
 
 
 def test_a_complete_store_writes_no_note(tmp_path, monkeypatch):
@@ -131,12 +136,16 @@ def test_a_complete_store_writes_no_note(tmp_path, monkeypatch):
     )
     store_path = tmp_path / "associations.db"
     _complete_store(store_path, newest)
-    cfg = make_config(tmp_path, associationDbPath=str(store_path))
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        associationDbPath=str(store_path),
+    )
 
     result = _turn(cfg)
 
     assert result is not None
-    assert read(cfg)["note"] == "", "a complete store must show nothing"
+    assert read(cfg)["note"] == "", "a complete store with healthy config must show nothing"
 
 
 def test_a_healed_store_turns_the_note_off_on_the_next_turn(tmp_path, monkeypatch):
@@ -148,19 +157,23 @@ def test_a_healed_store_turns_the_note_off_on_the_next_turn(tmp_path, monkeypatc
         associations_module, "default_state_db_path", lambda home=None: str(state_path)
     )
     store_path = tmp_path / "associations.db"
-    cfg = make_config(tmp_path, associationDbPath=str(store_path))
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        associationDbPath=str(store_path),
+    )
     assert not store_path.exists()
 
     _turn(cfg)
-    assert read(cfg)["note"] == router_module.HISTORY_NOTE
+    assert "History incomplete" in read(cfg)["note"]
 
     _complete_store(store_path, newest)
     _turn(cfg)
     assert read(cfg)["note"] == ""
 
 
-def test_the_cosine_rollback_writes_no_note(tmp_path):
-    """Cosine mode returns before the store opens, so no heal exists and no line is true."""
+def test_the_cosine_rollback_names_fusion_off(tmp_path):
+    """Cosine mode returns before the store opens, so it names fusion off, not history."""
     cfg = make_config(
         tmp_path,
         associationDbPath=str(tmp_path / "associations.db"),
@@ -170,7 +183,11 @@ def test_the_cosine_rollback_writes_no_note(tmp_path):
     result = _turn(cfg)
 
     assert result is not None
-    assert read(cfg)["note"] == "", "the cosine rollback never opens the store and starts no heal"
+    note = read(cfg)["note"]
+    assert "fusion" in note.lower(), f"cosine must be enumerated, got {note!r}"
+    assert "history" not in note.lower(), (
+        "the cosine rollback never opens the store, so it must not claim history"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +228,14 @@ def test_a_failed_heal_replaces_the_healing_line_once(tmp_path, monkeypatch):
     assert _pending_failure(str(store_path)), "the failed heal left no note for the turn"
 
     assert _turn(cfg) is not None
-    assert read(cfg)["note"] == associations_module.HEAL_FAILURE_NOTE
+    assert associations_module.HEAL_FAILURE_NOTE in read(cfg)["note"]
 
     assert _turn(cfg) is not None
-    assert read(cfg)["note"] == router_module.HISTORY_NOTE, (
+    note = read(cfg)["note"]
+    assert "History incomplete" in note, (
         "one failure must reach the user once, not on every turn"
     )
+    assert associations_module.HEAL_FAILURE_NOTE not in note
 
 
 def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
@@ -244,4 +263,4 @@ def test_a_failed_turn_leaves_the_failure_note_pending(tmp_path, monkeypatch):
     assert _pending_failure(str(store_path)), "a turn that showed no heal note consumed it"
 
     assert _turn(cfg) is not None
-    assert read(cfg)["note"] == associations_module.HEAL_FAILURE_NOTE
+    assert associations_module.HEAL_FAILURE_NOTE in read(cfg)["note"]
