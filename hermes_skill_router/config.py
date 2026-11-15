@@ -46,9 +46,16 @@ import os
 import re
 import sys
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX platforms: the thread lock below still serializes
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -571,10 +578,11 @@ def acknowledge_trap_notes(notes: Sequence[str], suggestions_path: Any) -> None:
         path = traps_path_for(suggestions_path)
         if path is None:
             return
-        seen_before = _read_traps(path)
-        union = seen_before | {_trap_key(note) for note in notes}
-        if union != seen_before:
-            _write_traps(path, union)
+        with _state_lock(path):
+            seen_before = _read_traps(path)
+            union = seen_before | {_trap_key(note) for note in notes}
+            if union != seen_before:
+                _write_traps(path, union)
     except Exception:  # a persistence failure must never cost the record write
         logger.debug("hermes-skill-router config: the trap set failed", exc_info=True)
 
@@ -591,6 +599,72 @@ def _switch_note(key: str, raw_value: Any) -> str:
 def _is_switch_note(note: str) -> bool:
     """Return whether *note* is a switch warning line (not a malformed value note)."""
     return note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
+
+
+#: Serializes every read-modify-write of the persisted warning state in this
+#: process: the switch load/fix transaction and the ack transactions read the
+#: whole snapshot and write it back, so two of them interleaved between the
+#: read and the write would silently restore the older snapshot (a fix lost
+#: under an ack re-suppresses the re-broken warning). One lock for both files
+#: (switch and trap sets) keeps the two writers of each file mutually
+#: exclusive; the directory file lock below extends the same exclusion across
+#: Hermes processes sharing the cache.
+_SWITCH_STATE_LOCK = threading.Lock()
+_SWITCH_LOCK_LOCAL = threading.local()
+
+
+@contextmanager
+def _state_lock(path: Optional[str]) -> Iterator[None]:
+    """Hold the process-local lock and, when possible, the cross-process lock.
+
+    The cross-process lock is an ``fcntl.flock`` on the state file's
+    directory, the same mechanism family the association store's
+    migration lock uses, but on the directory fd so the lock leaves no
+    lock file behind (a healthy load must create no file). When the
+    directory cannot be opened or locked (read-only directory,
+    non-POSIX platform), the transaction proceeds under the thread lock
+    alone: state persistence is fail-open by design, and a lost lock
+    must never cost the request. Re-entrant calls on the same thread
+    re-use the locks already held instead of re-acquiring them.
+    """
+    depth = getattr(_SWITCH_LOCK_LOCAL, "depth", 0)
+    if depth:
+        _SWITCH_LOCK_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _SWITCH_LOCK_LOCAL.depth = depth
+        return
+    _SWITCH_STATE_LOCK.acquire()
+    _SWITCH_LOCK_LOCAL.depth = 1
+    fd = None
+    try:
+        if path is not None and fcntl is not None:
+            try:
+                directory = os.path.dirname(path) or "."
+                fd = os.open(directory, os.O_RDONLY)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                fd = None
+        yield
+    finally:
+        _SWITCH_LOCK_LOCAL.depth = 0
+        if fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _SWITCH_STATE_LOCK.release()
 
 
 def _read_switch_sets(
@@ -725,48 +799,61 @@ def _pending_switch_warnings(
             pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
             _emit_switch_warnings(pending)
             return pending, pending, {}
-        seen_before, delivered_before, generations_before = _read_switch_sets(path)
-        generations = dict(generations_before)
-        new_seen = set(seen_before)
-        new_delivered = set(delivered_before)
-        for key in fixed:
-            cleared = any(pair[0] == key for pair in new_seen) or any(
-                pair[0] == key for pair in new_delivered
-            )
-            new_seen = {pair for pair in new_seen if pair[0] != key}
-            new_delivered = {pair for pair in new_delivered if pair[0] != key}
-            if cleared:
-                # A cleared set means a pending note from before this fix
-                # may still be in flight; bumping stales it. A fix with
-                # nothing to clear writes nothing, so a healthy load
-                # stays write-free.
-                generations[key] = generations.get(key, 0) + 1
-        pending_list: list[str] = []
-        injected_list: list[str] = []
-        for key in SWITCH_WARNING_SWITCHES:
-            if key not in offending:
-                continue
-            line = offending[key]
-            pair = _trap_key(line)
-            if pair not in seen_before:
-                pending_list.append(line)
-            if pair not in delivered_before:
-                injected_list.append(line)
-            new_seen.add(pair)
-        pending = tuple(pending_list)
-        injected = tuple(injected_list)
-        _emit_switch_warnings(pending)
-        if (
-            new_seen != seen_before
-            or new_delivered != delivered_before
-            or generations != generations_before
-        ):
-            _write_switch_seen(path, new_seen, new_delivered, generations)
-        return pending, injected, generations
+        # The whole read-modify-write (fix bump, seen/delivered update, write)
+        # runs under the state lock, so a concurrent ack cannot restore the
+        # pre-fix snapshot over this fix (or vice versa).
+        with _state_lock(path):
+            return _pending_switch_warnings_locked(offending, fixed, path)
     except Exception:  # load never raises; a failure keeps the warnings visible
         logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
         pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
         return pending, pending, {}
+
+
+def _pending_switch_warnings_locked(
+    offending: Dict[str, str],
+    fixed: Any,
+    path: str,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int]]:
+    """Run the switch load/fix read-modify-write; caller holds the state lock."""
+    seen_before, delivered_before, generations_before = _read_switch_sets(path)
+    generations = dict(generations_before)
+    new_seen = set(seen_before)
+    new_delivered = set(delivered_before)
+    for key in fixed:
+        cleared = any(pair[0] == key for pair in new_seen) or any(
+            pair[0] == key for pair in new_delivered
+        )
+        new_seen = {pair for pair in new_seen if pair[0] != key}
+        new_delivered = {pair for pair in new_delivered if pair[0] != key}
+        if cleared:
+            # A cleared set means a pending note from before this fix
+            # may still be in flight; bumping stales it. A fix with
+            # nothing to clear writes nothing, so a healthy load
+            # stays write-free.
+            generations[key] = generations.get(key, 0) + 1
+    pending_list: list[str] = []
+    injected_list: list[str] = []
+    for key in SWITCH_WARNING_SWITCHES:
+        if key not in offending:
+            continue
+        line = offending[key]
+        pair = _trap_key(line)
+        if pair not in seen_before:
+            pending_list.append(line)
+        if pair not in delivered_before:
+            injected_list.append(line)
+        new_seen.add(pair)
+    pending = tuple(pending_list)
+    injected = tuple(injected_list)
+    _emit_switch_warnings(pending)
+    if (
+        new_seen != seen_before
+        or new_delivered != delivered_before
+        or generations != generations_before
+    ):
+        _write_switch_seen(path, new_seen, new_delivered, generations)
+    return pending, injected, generations
 
 
 def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
@@ -825,25 +912,38 @@ def acknowledge_switch_deliveries(
         path = switches_path_for(cache_path)
         if path is None:
             return
-        seen_before, delivered_before, current = _read_switch_sets(path)
-        if generations is None:
-            return
-        captured = dict(generations)
-        accepted = set()
-        for note in notes:
-            if not isinstance(note, str) or not _is_switch_note(note):
-                continue
-            pair = _trap_key(note)
-            if pair not in seen_before:
-                continue
-            if captured.get(pair[0], 0) != current.get(pair[0], 0):
-                continue
-            accepted.add(pair)
-        union = delivered_before | accepted
-        if union != delivered_before:
-            _write_switch_seen(path, seen_before, union, current)
+        # The whole read-modify-write runs under the state lock, so a
+        # concurrent fix load cannot land between this read and write and
+        # then be overwritten with the pre-fix snapshot.
+        with _state_lock(path):
+            _acknowledge_switch_deliveries_locked(notes, path, generations)
     except Exception:  # a persistence failure must never cost the request
         logger.debug("hermes-skill-router config: the switch delivery failed", exc_info=True)
+
+
+def _acknowledge_switch_deliveries_locked(
+    notes: Sequence[str],
+    path: str,
+    generations: Optional[Mapping[str, int]],
+) -> None:
+    """Run the ack read-modify-write; caller holds the state lock."""
+    seen_before, delivered_before, current = _read_switch_sets(path)
+    if generations is None:
+        return
+    captured = dict(generations)
+    accepted = set()
+    for note in notes:
+        if not isinstance(note, str) or not _is_switch_note(note):
+            continue
+        pair = _trap_key(note)
+        if pair not in seen_before:
+            continue
+        if captured.get(pair[0], 0) != current.get(pair[0], 0):
+            continue
+        accepted.add(pair)
+    union = delivered_before | accepted
+    if union != delivered_before:
+        _write_switch_seen(path, seen_before, union, current)
 
 
 def report_notes(notes: Optional[Sequence[str]]) -> None:

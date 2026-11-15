@@ -869,13 +869,29 @@ def run(args: argparse.Namespace) -> List[str]:
     # error, never a silent replay in the wrong space. The explicit flags
     # always override the workspace config.
     model_explicit = args.embed_model is not None
+    if model_explicit and not args.embed_model.strip():
+        # Presence is not a value: a blank explicit model names no vector
+        # space, so it is a named parity refusal like any mismatched model,
+        # never a pass-through to the endpoint's own default.
+        raise ParityError(
+            "analytics parity error: --embed-model must name a non-empty model, "
+            f"not {args.embed_model!r}; refusing to score in an unproven vector space"
+        )
     if args.embed_model is None or args.embed_timeout_ms is None:
         workspace_model, workspace_timeout = _resolve_embed_defaults()
         if args.embed_model is None:
             args.embed_model = workspace_model
         if args.embed_timeout_ms is None:
             args.embed_timeout_ms = workspace_timeout
-    if not 100 <= args.embed_timeout_ms <= 60000:
+    if (
+        not isinstance(args.embed_timeout_ms, int)
+        or isinstance(args.embed_timeout_ms, bool)
+        or not 100 <= args.embed_timeout_ms <= 60000
+    ):
+        # The other explicit-flag path: presence alone never validates the
+        # timeout either. The CLI's type=int already rejects a blank string,
+        # but a programmatic caller could pass one; name it instead of
+        # raising a TypeError from the range comparison.
         raise AnalyticsError(
             "analytics error: --embed-timeout-ms must be between 100 and 60000, "
             f"not {args.embed_timeout_ms}"

@@ -680,6 +680,31 @@ def test_legacy_catalog_without_recorded_model_needs_an_explicit_flag(endpoint, 
     assert set(anomalies_for(explicit.stdout)) == {"alpha-skill"}
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_legacy_catalog_blank_explicit_model_is_a_named_parity_error(tmp_path, blank):
+    """Round 6 P2: a blank explicit model names no vector space.
+
+    On a legacy catalog (no recorded build model) with a permissive
+    endpoint that accepts any model, ``--embed-model ''`` (or whitespace)
+    must be a named parity refusal with zero embed requests, not a silent
+    pass-through to the endpoint's own default.
+    """
+    endpoint, received = _multi_model_accepting_endpoint(["", "   ", "\t", "bge-m3"])
+    try:
+        paths = make_case(tmp_path)
+        payload = json.loads(paths["catalog"].read_text(encoding="utf-8"))
+        payload.pop("embed_model", None)
+        paths["catalog"].write_text(json.dumps(payload), encoding="utf-8")
+
+        result = run_script(endpoint, paths, embed_model=blank)
+        assert result.returncode != 0, result.stdout
+        assert "analytics parity error" in result.stderr, result.stderr
+        assert "--embed-model" in result.stderr, result.stderr
+        assert received == [], f"a blank model must refuse before embedding, got {received}"
+    finally:
+        endpoint.close()
+
+
 def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypatch):
     """Round 4 concern: the analytics process writes no persisted warning state.
 

@@ -534,3 +534,189 @@ def test_empty_cache_path_suppresses_via_default_location(
         assert capsys.readouterr().err == ""
         default_file = tmp_path / ".cache" / "hermes-skill-router" / "config-switches.json"
         assert default_file.exists(), "fingerprints persist in the default cache directory"
+
+
+def _generations(tmp_path):
+    path = _switches_file(tmp_path)
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return dict(data.get("generations") or {}) if isinstance(data, dict) else {}
+
+
+@pytest.mark.parametrize("fixed,other", [("enabled", "showSuggestions"), ("showSuggestions", "enabled")])
+def test_concurrent_fix_load_cannot_be_overwritten_by_paused_ack(
+    tmp_path, capsys, caplog, monkeypatch, fixed, other
+):
+    """Round 6 P2: the ack's read-modify-write is serialized with the fix load.
+
+    Barrier-scheduled interleaving: the ack thread pauses between its read
+    and its write (inside the write hook), while a fix load for *fixed*
+    runs. After the fix, the ack must not restore the pre-fix snapshot:
+    the fixed switch's sets stay dropped (so a re-break warns again), its
+    generation stays bumped, and the sibling's sets and pending ack are
+    preserved. The on-time ack of the sibling still lands afterwards.
+    """
+    import threading
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        notes = {note.split(":", 1)[0]: note for note in _switch_notes(both)}
+        assert set(notes) == {"enabled", "showSuggestions"}
+        captured = dict(both.switch_generations)
+        capsys.readouterr()
+        caplog.clear()
+
+        original_write = config_module._write_switch_seen
+        paused = threading.Event()
+        release = threading.Event()
+        writes = [0]
+
+        def hooked_write(path, seen, delivered=None, generations=None):
+            writes[0] += 1
+            if writes[0] == 1:
+                paused.set()
+                release.wait(10)
+            return original_write(path, seen, delivered, generations)
+
+        monkeypatch.setattr(config_module, "_write_switch_seen", hooked_write)
+        ack_thread = threading.Thread(
+            target=lambda: acknowledge_switch_deliveries(
+                [notes[fixed]], _cache(tmp_path), captured
+            )
+        )
+        ack_thread.start()
+        assert paused.wait(10), "the ack must reach its write"
+
+        fix_thread = threading.Thread(
+            target=lambda: _load(tmp_path, {fixed: True, other: False})
+        )
+        fix_thread.start()
+        # The fix load must serialize behind the paused ack, not interleave.
+        fix_thread.join(1.0)
+        assert fix_thread.is_alive(), (
+            "the fix load must wait for the ack transaction, not overwrite it"
+        )
+        release.set()
+        ack_thread.join(10)
+        fix_thread.join(10)
+        assert not ack_thread.is_alive() and not fix_thread.is_alive()
+
+        # The fix survived: the fixed switch's sets are dropped and its
+        # generation bumped; the sibling's seen set is untouched.
+        assert {pair[0] for pair in _seen(tmp_path)} == {other}, (
+            "the paused ack must not restore the fixed switch's seen set"
+        )
+        assert _generations(tmp_path).get(fixed, 0) == captured.get(fixed, 0) + 1, (
+            "the fix's generation bump must survive the interleaving"
+        )
+        # The sibling's on-time ack still lands and suppresses delivery.
+        acknowledge_switch_deliveries([notes[other]], _cache(tmp_path), captured)
+        assert {pair[0] for pair in _delivered(tmp_path)} == {other}
+        # A re-break of the fixed switch warns and delivers again.
+        monkeypatch.setattr(config_module, "_write_switch_seen", original_write)
+        capsys.readouterr()
+        caplog.clear()
+        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == [fixed]
+        assert switch_warning_messages(rebroken) == (
+            {"role": "system", "content": _switch_notes(rebroken)[0]},
+        )
+
+
+@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
+def test_old_switches_file_without_generations_key(tmp_path, capsys, caplog, switch):
+    """Round 6 coverage: a schema-1 file written before generations existed.
+
+    Seen and delivered are present but the generations key is absent. The
+    file loads as generation zero everywhere: the old delivered stays
+    suppressed pre-fix, a fix bumps to generation one, and the pre-fix
+    captured ack (generation zero) is then rejected after the re-break.
+    """
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        off = _load(tmp_path, {switch: False})
+        notes = _switch_notes(off)
+        assert len(notes) == 1
+        note = notes[0]
+        acknowledge_switch_deliveries([note], _cache(tmp_path), off.switch_generations)
+        assert _delivered(tmp_path) != set()
+
+        path = _switches_file(tmp_path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["schema"] == 1
+        data.pop("generations", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        again = _load(tmp_path, {switch: False})
+        assert _switch_notes(again) == ()
+        assert switch_warning_messages(again) == (), (
+            "an old delivered fingerprint stays suppressed pre-fix"
+        )
+
+        _load(tmp_path, {switch: True})
+        assert _generations(tmp_path).get(switch, 0) == 1, (
+            "the first fix of an old file bumps its generation to one"
+        )
+        capsys.readouterr()
+        caplog.clear()
+        rebroken = _load(tmp_path, {switch: False})
+        assert _switch_notes(rebroken) == (note,)
+        # The gen-0 captured ack from before the migration-era fix is stale.
+        acknowledge_switch_deliveries([note], _cache(tmp_path), dict(off.switch_generations))
+        assert _delivered(tmp_path) == set(), (
+            "a replayed generation-zero ack must not consume the new generation"
+        )
+        assert switch_warning_messages(_load(tmp_path, {switch: False})) == (
+            {"role": "system", "content": note},
+        )
+
+
+@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
+def test_many_fix_rebreak_cycles_replayed_stale_acks_never_consume(
+    tmp_path, capsys, caplog, switch
+):
+    """Round 6 coverage: repeated fix/rebreak cycles past the old TLA bound.
+
+    Six cycles, each capturing the pending note and generation, fixing,
+    re-breaking, and replaying every earlier captured ack. No stale ack
+    may land in delivered or suppress the current generation's delivery;
+    each cycle's on-time ack lands and suppresses until the next fix.
+    """
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        captured_history = []
+        for cycle in range(6):
+            off = _load(tmp_path, {switch: False})
+            notes = _switch_notes(off)
+            assert len(notes) == 1, (cycle, notes)
+            note = notes[0]
+            captured_history.append((note, dict(off.switch_generations)))
+            assert switch_warning_messages(off) == ({"role": "system", "content": note},)
+
+            _load(tmp_path, {switch: True})
+            assert _delivered(tmp_path) == set()
+            capsys.readouterr()
+            caplog.clear()
+            rebroken = _load(tmp_path, {switch: False})
+            assert _switch_notes(rebroken) == (note,)
+            assert switch_warning_messages(rebroken) == (
+                {"role": "system", "content": note},
+            )
+            # Replay every stale ack ever captured, newest first.
+            for stale_note, stale_gens in reversed(captured_history):
+                acknowledge_switch_deliveries([stale_note], _cache(tmp_path), stale_gens)
+                assert _delivered(tmp_path) == set(), (
+                    f"cycle {cycle}: a stale ack must never land in delivered"
+                )
+            assert switch_warning_messages(_load(tmp_path, {switch: False})) == (
+                {"role": "system", "content": note},
+            ), f"cycle {cycle}: stale acks must not suppress the current delivery"
+            # The on-time ack lands and suppresses.
+            acknowledge_switch_deliveries(
+                [note], _cache(tmp_path), rebroken.switch_generations
+            )
+            assert _delivered(tmp_path) != set()
+            assert switch_warning_messages(_load(tmp_path, {switch: False})) == ()
+            # Fix again so the next cycle's off load warns anew.
+            _load(tmp_path, {switch: True})
+            capsys.readouterr()
+            caplog.clear()
