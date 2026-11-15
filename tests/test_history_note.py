@@ -1,7 +1,7 @@
 """Contract C5: one display note while the association store is incomplete.
 
-The note is out of band: it rides on the display record and never on the provider request, so the
-turn's bytes stay identical. These tests drive the real rewrite over the default fusion path and
+The note rides on the display record and on the injected block, so the model and every surface
+see one state. These tests drive the real rewrite over the default fusion path and
 pin both acceptance halves, an incomplete store puts one line on the record and a complete store
 puts none.
 
@@ -94,7 +94,7 @@ def _complete_store(store_path: Path, newest_ms: int) -> None:
 
 
 def test_an_incomplete_store_puts_one_note_on_the_turn_record(tmp_path):
-    """A missing store is incomplete, so one line rides on the record and on no request byte."""
+    """A missing store is incomplete, so one line rides on the record and on the injected block."""
     store_path = tmp_path / "associations.db"
     assert not store_path.exists()
     cfg = make_config(tmp_path, associationDbPath=str(store_path))
@@ -108,8 +108,8 @@ def test_an_incomplete_store_puts_one_note_on_the_turn_record(tmp_path):
     assert "(missing store)" in stored["note"], (
         f"the line must name the skip state, got {stored['note']!r}"
     )
-    assert stored["note"] not in json.dumps(result["request"]), (
-        "the note must not reach the provider request"
+    assert stored["note"] in json.dumps(result["request"]), (
+        "the note must reach the provider request on the injected block"
     )
 
 

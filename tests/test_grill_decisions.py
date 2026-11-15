@@ -432,7 +432,7 @@ def test_budget_expiry_carries_a_degraded_line(tmp_path, monkeypatch):
 
 
 def test_dropped_window_stays_log_only_with_no_visible_note(tmp_path, caplog):
-    """P2 round-2 B: the dropped-window placement is unsettled, so it is log-only."""
+    """Ticket 01: the dropped-window note rides the visible line on the failed turn."""
     import logging as _logging
 
     cfg = make_config(tmp_path, cachePath=str(tmp_path / "index.json"))
@@ -459,8 +459,8 @@ def test_dropped_window_stays_log_only_with_no_visible_note(tmp_path, caplog):
         )
     assert second is not None and "messages" in second["request"]
     note = read(cfg)["note"]
-    assert "already" not in note.lower() and "skills_list" not in note, (
-        f"a dropped window must not ride the visible line, got {note!r}"
+    assert "already" in note.lower() and "skills_list" in note, (
+        f"a dropped window rides the visible line, got {note!r}"
     )
     assert any(
         "catalog already dumped" in record.getMessage()
@@ -469,7 +469,7 @@ def test_dropped_window_stays_log_only_with_no_visible_note(tmp_path, caplog):
 
 
 def test_partial_view_refusal_stays_log_only_with_no_visible_note(tmp_path, caplog):
-    """P2 round-2 B: the partial-view placement is unsettled, so it is log-only."""
+    """Ticket 01: the partial-view note rides the visible degraded line."""
     import logging as _logging
 
     from tests.test_rewrite import FakeEmbedder, FakeReranker, make_index, _payload
@@ -488,8 +488,8 @@ def test_partial_view_refusal_stays_log_only_with_no_visible_note(tmp_path, capl
         )
     assert result is not None, "a refused catalog routes from the saved index"
     note = read(cfg)["note"]
-    assert "partial" not in note.lower(), (
-        f"a refused partial view must not ride the visible line, got {note!r}"
+    assert "partial" in note.lower(), (
+        f"a refused partial view rides the visible line, got {note!r}"
     )
     assert any(
         "partial view" in record.getMessage() for record in caplog.records

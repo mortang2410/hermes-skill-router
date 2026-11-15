@@ -413,6 +413,9 @@ def test_a_failure_on_a_store_another_writer_completed_surfaces_no_note(
     store_path = tmp_path / "completed-elsewhere.db"
     _heal(store_path, hermes)
     associations_module.reset_heal_state()
+    # The settled heal persisted its finished flag; observing the store
+    # complete once clears it so a fresh staleness gets its own attempt.
+    associations_module.note_store_complete(str(store_path))
     caplog.clear()
 
     monkeypatch.setattr(associations_module, "heal_store", _exploding_entry)

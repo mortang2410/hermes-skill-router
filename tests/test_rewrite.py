@@ -407,7 +407,9 @@ def test_the_record_announcement_fires_once_with_the_turn_id(tmp_path):
         notify=seen.append,
     )
 
-    assert seen == ["turn-7"]
+    # A cold turn broadcasts twice by ticket design: the build announcement before
+    # ``load_or_build`` blocks plus the settled record when the build finishes.
+    assert seen == ["turn-7", "turn-7"]
 
 
 # ---------------------------------------------------------------------------
@@ -1349,9 +1351,10 @@ DECISION_PREFIX = "skill router: query="
 # The hash of ``json.dumps(result, ensure_ascii=False, sort_keys=True)`` for the payload
 # ``_payload()`` rewritten with ``FakeEmbedder()``, ``FakeReranker()``, session ``s-1`` and turn
 # ``t-1``, with the test's resolver answering ``/skills/<name>/SKILL.md``. It was captured from the
-# ticket 02 build, which gave every suggestion its read path and its section marker, so a change to
-# the returned payload fails the test.
-GOLDEN_PAYLOAD_SHA256 = "700fbbb243841d2a0d6eb7e1172e5ce3a7e1774e74997c4108d678416f46a14a"
+# ticket 02 build, which gave every suggestion its read path and its section marker, re-baselined
+# after ticket 04 appended the degraded note as the injected block's final paragraph, so a change
+# to the returned payload fails the test.
+GOLDEN_PAYLOAD_SHA256 = "9cd18971bc829367947fd36dce841831ab8a143906631ba4d15671d4e463c708"
 
 # The display record the same call wrote, minus its unstable ``at`` timestamp.
 # The fixture disables cache persistence (``cachePath`` empty), so the degraded
