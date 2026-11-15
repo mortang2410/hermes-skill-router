@@ -31,62 +31,29 @@ Every setting, both endpoint protocols, the display record and the measurements 
 
 ## How it works
 
-Hermes dumps the whole skill catalog into the model context. This plugin hides the catalog and only
-surfaces skill suggestions when they fit the task. You can also pin a list of eager skills that
-appears under `Pinned skills:` in the router block.
+Each turn, the plugin scores your skills against your latest message and adds the best matches to the request. Skills you pin as eager appear in that same block, under `Pinned skills:`.
 
-The embeddings endpoint compares your newest message, together with the typed
-messages before it (up to 10,000 characters), with the skill rows and keeps a cosine order. A BM25
-term index built beside the vector index scores the same text by the prompt's exact words, and a
-read-only association store adds skills that were loaded for similar prompts before. The plugin
-fuses those three orders with reciprocal rank fusion, gives candidates a small capped recency bump
-when their skill path resolves, and cuts the result to the shortlist. The rerank endpoint then
-scores that shortlist against the same query, and the plugin suggests what scores at or above
-`cutoff`.
+Three signals build that list. Each one ranks the skills its own way.
 
-The rerank stage runs on `tasksource/tasksource-decider-nano`, a 150M-parameter cross-encoder with
-298 MB of weights that runs on the CPU and needs no GPU. On our machine, with 8 CPU threads, the
-default 50-row shortlist reranked in a median 0.71 seconds over ten calls, with the two slowest calls
-at 4.5 and 5.2 seconds while other jobs competed for the CPU; a 10-row shortlist took 0.15 seconds.
-That is the rerank share of a routed turn's cost, and it buys a relevance score per candidate that
-the plugin compares with `cutoff` and sorts by, instead of trusting the fusion order alone.
+Semantic search compares meaning. It embeds your newest message, plus the typed messages before it up to 10,000 characters, and ranks skill rows by how close their vectors are.
 
-If a service is down or too slow, the plugin falls back to the ordinary skill catalog once per
-compaction window, so a bad endpoint costs latency, not a broken turn, and the catalog never
-reaches the model twice in the same window.
+Lexical search compares exact words. It scores the same text against the catalog text the embedder sees, so a skill whose name or description uses your words ranks higher.
+
+Associations remember what you actually loaded: if you opened a skill for a similar prompt before, that skill ranks higher here, and older loads matter less. If the association database is missing, this channel stays off and you get one warning. The other two channels still route.
+
+The plugin merges the three rankings, giving lexical search half the weight of the other two, then cuts the result to a 50-row shortlist. `fusionMode: cosine` skips lexical search and associations, and returns the semantic order alone. `shadow` works out the merged order and logs it, but still returns semantic.
+
+A reranker then looks at the shortlist. It scores each candidate against the same query. The plugin suggests the ones that score at or above `cutoff`, best first.
+
+The reranker is `tasksource/tasksource-decider-nano`. It is a 150M-parameter reranker with 298 MB of weights. It runs on CPU, no GPU needed. On 8 CPU threads, the default 50-row shortlist reranked in a median 0.71 seconds over ten calls. Two calls took 4.5 and 5.2 seconds, while other jobs competed for the CPU; a 10-row shortlist took 0.15 seconds. That rerank score is what the plugin compares with `cutoff` and sorts by. It does not trust the merged order alone.
+
+If a service is down or too slow, the plugin falls back to the ordinary skill catalog. It does that once per compaction window, so a bad endpoint costs latency, not a broken turn. The catalog never reaches the model twice in the same window.
 
 ### Historical learning (associations)
 
-The router learns which skills you loaded for similar prompts. The association channel decays
-each load with a 30-day half-life and surfaces skills with support of three or more for the
-current prompt's terms. A separate recency bump counts a skill once per session turn and fades
-it with a 14-day half-life, moving it up at most five shortlist positions. A missing database
-means the channel is off with one warning and the other two channels still route.
+The association store fills itself from your history. The first routed turn that finds it missing or incomplete starts a background heal. The heal reads `~/.hermes/state.db` read-only and writes `~/.cache/hermes-skill-router/associations.db`. No manual step is needed, and the turn opens the store read-only. The heal is the only writer.
 
-The store fills itself from your history: the first routed turn that finds it
-missing or incomplete starts a background heal that reads `~/.hermes/state.db`
-read-only and writes `~/.cache/hermes-skill-router/associations.db`, so no
-manual step is needed. The turn opens the store read-only; the heal is the only
-writer. A manual one-shot fill stays available through the module's command,
-for example `python3 -m hermes_skill_router.associations --max-sessions 200`,
-which takes the same read-only boundary and is idempotent, so re-running it
-adds nothing.
-
-### Pre-reranking
-
-Three channels propose a fused shortlist (size 50), then the reranker scores it:
-
-- Cosine: the newest message plus up to 10,000 characters of preceding context, embedded
-  and compared by vector similarity.
-- BM25: the same query text scored by exact words (`k1 1.2`, `b 0.75`) over the catalog
-  text the embedder sees.
-- Associations: skills with decayed usage for the prompt's terms, as above.
-
-Reciprocal rank fusion (constant 20, weights 1.0, 0.5, 1.0) merges the three orders, a
-recency bump moves a skill up at most 5 positions, then the cut to 50 happens. Only then
-does the reranker run. `fusionMode: cosine` skips the term index, the store, and the bump
-and returns the cosine order alone; `shadow` computes the fused order and logs it while
-still returning cosine.
+You can also fill it by hand. Run `python3 -m hermes_skill_router.associations --max-sessions 200`. That takes the same read-only boundary and is idempotent. Re-running it adds nothing.
 
 ## Install
 
