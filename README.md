@@ -146,7 +146,7 @@ Pinned skills:
 ```
 
 Each row gives the skill's name, its description, and the path `skill_view` opens. Suggestions are
-best first. Pinned skills appear only in the first block of a conversation, or again after compaction
+best first, capped at `maxSuggestions` (`0` means no cap). Pinned skills appear only in the first block of a conversation, or again after compaction
 removes an earlier block.
 
 Skills you keep listed with `deferredSkills` appear under `Also listed:`. If you do not set
