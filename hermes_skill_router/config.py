@@ -14,6 +14,13 @@ fingerprint (:func:`acknowledge_trap_notes`, called by the display writer), so a
 offending value stays silent forever and a changed value warns once. A load that writes no record
 (disabled, dashboard or pre-load read, any non-routing path) never consumes a fingerprint. The
 persisted set never uses a clock.
+
+The two no-record switches (``enabled: false`` and ``showSuggestions: false``) warn on three
+channels under the same fingerprint shape, one seen set per switch: a terminal line on stderr, an
+injected context message built by :func:`switch_warning_messages`, and one host-logger event, each
+naming the switch and its effect. Unlike a malformed-value trap they never reach a display
+record (the switches suppress it), so ``load`` persists their fingerprints at emission time
+instead of waiting for a record write; fixing one switch drops only that switch's fingerprints.
 """
 
 from __future__ import annotations
@@ -23,9 +30,10 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -133,6 +141,24 @@ TRAPS_FILENAME = "config-traps.json"
 
 #: Environment override for the traps file; tests point it at a temporary file.
 TRAPS_ENV_VAR = "HERMES_SKILL_ROUTER_TRAPS_PATH"
+
+#: The two master switches whose off state stops a record from being written.
+SWITCH_WARNING_SWITCHES = ("enabled", "showSuggestions")
+
+#: What a switch being off costs, one effect per switch.
+_SWITCH_WARNING_EFFECTS = {
+    "enabled": (
+        "routing is switched off, the router changes nothing and writes no record; "
+        "set enabled: true to restore routing"
+    ),
+    "showSuggestions": (
+        "suggestion names are hidden, the display record is removed and the pane stays idle; "
+        "set showSuggestions: true to restore the display"
+    ),
+}
+
+#: Manifest switch key -> Config field.
+_SWITCH_FIELDS = {"enabled": "enabled", "showSuggestions": "show_suggestions"}
 
 
 @dataclass(frozen=True)
@@ -507,6 +533,125 @@ def acknowledge_trap_notes(notes: Sequence[str], suggestions_path: Any) -> None:
         logger.debug("hermes-skill-router config: the trap set failed", exc_info=True)
 
 
+def _switch_note(key: str, raw_value: Any) -> str:
+    """Return the switch warning line for *key* off with raw value *raw_value*.
+
+    The raw value is shown redacted, so a string spelling of ``false`` and a
+    boolean ``False`` read differently and hash to different fingerprints.
+    """
+    return f"{key}: {_shown(raw_value)} is off; {_SWITCH_WARNING_EFFECTS[key]}"
+
+
+def _is_switch_note(note: str) -> bool:
+    """Return whether *note* is a switch warning line (not a malformed value note)."""
+    return note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
+
+
+def _write_switch_seen(path: Optional[str], seen: Set[Tuple[str, str]]) -> None:
+    """Persist *seen* directly, without a temporary file. Never raises.
+
+    The switch set is written by ``load`` itself, so it must not depend on the
+    display writer's atomic replace: a display write failure must not cost
+    the switch suppression, and a direct write leaves no temporary file
+    behind when the directory refuses the rename. A torn write reads as an
+    empty set (a duplicate warning), never as a lost suppression.
+    """
+    if path is None:
+        return
+    try:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"schema": 1, "seen": sorted([list(pair) for pair in seen])}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        logger.debug("hermes-skill-router config: could not write the switch set", exc_info=True)
+
+
+def _emit_switch_warnings(lines: Sequence[str]) -> None:
+    """Emit *lines* on the terminal and host-logger channels. Never raises."""
+    for line in lines:
+        try:
+            print(line, file=sys.stderr)
+        except Exception:  # a closed terminal must never cost the load
+            logger.debug("hermes-skill-router config: the terminal warn failed", exc_info=True)
+        try:
+            logger.warning("hermes-skill-router config: %s", line)
+        except Exception:  # logging never raises, but load must still hold
+            logger.debug("hermes-skill-router config: the logger warn failed", exc_info=True)
+
+
+def _pending_switch_warnings(
+    settings: Mapping[str, Any],
+    values: Mapping[str, Any],
+    suggestions_path: Any,
+) -> Tuple[str, ...]:
+    """Return the offending switch warnings not yet seen, emitting and persisting them. Never raises.
+
+    Each switch keeps its own seen set inside the shared trap file: an
+    unchanged value warns once and then stays silent, a changed value hashes
+    anew and warns once more, and a fixed switch drops only its own set, so
+    re-breaking the same value warns again while the other switch stays
+    suppressed. Unlike a malformed-value trap there is no display record to
+    carry the warning (the off switches suppress it), so the fingerprints are
+    persisted here at emission time rather than by the display writer.
+    """
+    offending = {
+        key: _switch_note(key, settings.get(key, False))
+        for key in SWITCH_WARNING_SWITCHES
+        if values.get(_SWITCH_FIELDS[key]) is False
+    }
+    fixed = [key for key in SWITCH_WARNING_SWITCHES if values.get(_SWITCH_FIELDS[key]) is True]
+    try:
+        path = traps_path_for(suggestions_path)
+        if path is None:
+            # Nowhere to persist (display disabled): warn on every load.
+            pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
+            _emit_switch_warnings(pending)
+            return pending
+        seen_before = _read_traps(path)
+        new_seen = set(seen_before)
+        for key in fixed:
+            new_seen = {pair for pair in new_seen if pair[0] != key}
+        pending_list: list[str] = []
+        for key in SWITCH_WARNING_SWITCHES:
+            if key not in offending:
+                continue
+            line = offending[key]
+            pair = _trap_key(line)
+            if pair not in seen_before:
+                pending_list.append(line)
+            new_seen.add(pair)
+        pending = tuple(pending_list)
+        _emit_switch_warnings(pending)
+        if new_seen != seen_before:
+            _write_switch_seen(path, new_seen)
+        return pending
+    except Exception:  # load never raises; a failure keeps the warnings visible
+        logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
+        return tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
+
+
+def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
+    """Return the injected context messages for *cfg*'s pending switch warnings.
+
+    One standalone ``system`` message per pending warning line, ready to be
+    appended to the request. The message is the warning channel only: it
+    carries no suggestion row and never uses the suggestions block header, so
+    the rewrite's block recogniser never reads it as a suggestion.
+    """
+    try:
+        notes = getattr(cfg, "notes", ()) or ()
+    except Exception:  # a hostile notes field must never cost the call
+        return ()
+    messages: list[Dict[str, str]] = []
+    for note in notes:
+        if isinstance(note, str) and _is_switch_note(note):
+            messages.append({"role": "system", "content": note})
+    return tuple(messages)
+
+
 def report_notes(notes: Optional[Sequence[str]]) -> None:
     """Log each distinct config note once per process. A note names a setting, never request text."""
     for note in notes or ():
@@ -537,7 +682,8 @@ def load(raw: Optional[Mapping[str, Any]] = None) -> Config:
     report_notes(notes)
     suggestions = values.get("suggestions_path", "")
     trap_notes = _pending_trap_notes(notes, suggestions)
-    return Config(notes=tuple(notes), trap_notes=trap_notes, **values)
+    switch_notes = _pending_switch_warnings(settings, values, suggestions)
+    return Config(notes=tuple(notes) + switch_notes, trap_notes=trap_notes, **values)
 
 
 def read_settings(ctx: Any) -> dict[str, Any]:
