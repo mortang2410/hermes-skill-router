@@ -2532,13 +2532,23 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
     session store is no evidence of new sessions, so the turn starts no
     scan and the next turn retries.
 
-    A store that has never been scanned (missing or unreadable) is never
-    behind: the heal (C4) owns creating one. A settled zero-watermark
+    A store that has never been scanned is never behind unless it is
+    settled: the heal (C4) owns creating one. A settled zero-watermark
     store -- the persisted finished flag set, or the in-memory finished
     attempt -- is behind when source data needs ingestion: the heal's
     one-attempt rule (C2) still gates the heal, never this bootstrap, so
     a first heal that settled empty or failed cannot trap later data.
     An unsettled zero-watermark store is still the heal's to scan.
+
+    A read-only open failure splits two cases. A genuinely absent path
+    (never created) with an in-memory finished attempt is
+    bootstrap-eligible: a thread-start failure records that attempt
+    before any file exists, so without this branch learning would stay
+    stuck without a restart even though the learning scan would create
+    the store fresh. An existing but unreadable, corrupt or foreign
+    file stays heal-owned even with the latch finished (doctored
+    safeguard): it is never safely creatable, so ``learning_behind``
+    returns False and the file is left untouched.
 
     The persisted flag is consulted on the opened store before it closes.
     The in-memory latch is read only after that close, in its own brief
@@ -2549,37 +2559,58 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
     here cannot nest the non-reentrant lock and cannot deadlock against the
     heal thread's settle, which takes the same lock only to assign the
     finished state. Only ``finished`` counts as settled; ``running`` and
-    ``None`` stay heal-owned.
+    ``None`` stay heal-owned. The absent-path branch reads the latch
+    likewise outside any nested :data:`_HEAL_LOCK` scope: this function
+    holds no lock there.
     """
     path = os.path.expanduser(store_path)
     try:
         store = open_store(path, read_only=True)
     except Exception:
-        return False
-    try:
-        watermark = _meta_int(store, META_LAST_SCAN_MS)
-        settled = heal_finished(store)
-        ledger = {
-            str(row[0]): (None if row[1] is None else int(row[1]))
-            for row in store.conn.execute(
-                "SELECT session_id, scanned_max_row_id FROM scan_ledger"
-            ).fetchall()
-        }
-    except Exception:
-        return False
-    finally:
-        store.close()
-    if watermark <= 0 and not settled:
-        # Zero-watermark bootstrap also honours the in-memory finished latch:
-        # _run_heal records it even when the flag write failed transiently,
-        # and a thread-start failure records it without any heal pass. Both
-        # leave heal gated (C2) but must not trap later source data; an
-        # unsettled (None/running) first heal stays heal-owned.
+        # Only a genuinely absent path (never created) is creatable. An
+        # existing path whose read-only open failed is unreadable,
+        # corrupt or foreign, and stays heal-owned even when the latch
+        # reads finished. lexists counts a dangling symlink as existing.
+        try:
+            exists = os.path.lexists(path)
+        except (OSError, ValueError):
+            return False
+        if exists:
+            return False
+        # Absent path: an in-memory finished attempt makes it
+        # bootstrap-eligible against source data; an unsettled first
+        # heal (None/running) stays heal-owned.
         settled = heal_state(store_path) == _HEAL_FINISHED or (
             path != store_path and heal_state(path) == _HEAL_FINISHED
         )
-    if watermark <= 0 and not settled:
-        return False
+        if not settled:
+            return False
+        ledger = {}
+    else:
+        try:
+            watermark = _meta_int(store, META_LAST_SCAN_MS)
+            settled = heal_finished(store)
+            ledger = {
+                str(row[0]): (None if row[1] is None else int(row[1]))
+                for row in store.conn.execute(
+                    "SELECT session_id, scanned_max_row_id FROM scan_ledger"
+                ).fetchall()
+            }
+        except Exception:
+            return False
+        finally:
+            store.close()
+        if watermark <= 0 and not settled:
+            # Zero-watermark bootstrap also honours the in-memory finished latch:
+            # _run_heal records it even when the flag write failed transiently,
+            # and a thread-start failure records it without any heal pass. Both
+            # leave heal gated (C2) but must not trap later source data; an
+            # unsettled (None/running) first heal stays heal-owned.
+            settled = heal_state(store_path) == _HEAL_FINISHED or (
+                path != store_path and heal_state(path) == _HEAL_FINISHED
+            )
+        if watermark <= 0 and not settled:
+            return False
     try:
         current = _source_session_revisions(state_db_path)
     except (sqlite3.Error, OSError, ValueError):

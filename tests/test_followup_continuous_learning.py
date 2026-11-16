@@ -715,6 +715,109 @@ def test_a_thread_start_failure_latch_bootstraps_learning(hermes, tmp_path, monk
     assert associations_module.learning_behind(str(store_path)) is False
 
 
+def test_a_thread_start_failure_with_no_store_file_bootstraps_learning(
+    hermes, tmp_path, monkeypatch
+):
+    """Finder B micro delta: thread-start failure with no association file.
+
+    First use with no file: an unsettled absent store stays heal-owned
+    (``learning_behind`` is False and no scan starts, and neither creates
+    the file). A transient ``Thread.start`` failure records an in-memory
+    finished heal without creating the file; once thread creation
+    recovers in the same process, the absent store with source data must
+    bootstrap learning — ``learning_behind`` treats the genuinely absent
+    path as bootstrap-eligible on the in-memory finished attempt, and
+    the learning scan creates the store and ingests. An existing but
+    unreadable or foreign store never reaches this bootstrap (doctored
+    safeguard), pinned separately below with the same latch trigger.
+    """
+    store_path = tmp_path / "bootstrap-no-file.db"
+    _add_session(hermes, "s-new", T0)
+    assert not os.path.exists(str(store_path)), "the fixture precreated the store"
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "an unsettled absent store is not the heal's bootstrap"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a scan started over an unsettled absent store"
+    )
+    assert not os.path.exists(str(store_path)), "the unsettled check created the store"
+
+    real_start = threading.Thread.start
+    attempts = {"n": 0}
+
+    def flaky_start(self):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("cannot start heal thread (transient)")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the thread-start failure must refuse the heal launch"
+    )
+    assert attempts["n"] == 1
+    assert associations_module.heal_state(str(store_path)) == "finished"
+    assert not os.path.exists(str(store_path)), "the thread-start failure created the store"
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the in-memory finished latch no longer gates the heal"
+    )
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "an absent store with an in-memory finished attempt ignored later data"
+    )
+    assert not os.path.exists(str(store_path)), "learning_behind created the store"
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    assert os.path.exists(str(store_path)), "the bootstrapped scan did not create the store"
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-new"}, "the bootstrapped scan did not ingest the new session"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a follow-up turn started another scan after the bootstrap ingest"
+    )
+
+
+def test_an_existing_corrupt_store_with_finished_latch_stays_heal_owned(
+    hermes, tmp_path, monkeypatch
+):
+    """Doctored safeguard: the same finished latch over an existing file.
+
+    With a corrupt existing association file, a thread-start failure
+    still records an in-memory finished heal, but ``learning_behind``
+    stays False and no learning scan starts: an existing but
+    unreadable or foreign file is heal-owned, never safely creatable
+    by the bootstrap. The file bytes are unchanged.
+    """
+    store_path = tmp_path / "corrupt-latch.db"
+    store_path.write_text("this is not a database\n", encoding="utf-8")
+    before = store_path.read_bytes()
+    _add_session(hermes, "s-new", T0)
+
+    real_start = threading.Thread.start
+    attempts = {"n": 0}
+
+    def flaky_start(self):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("cannot start heal thread (transient)")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False
+    assert attempts["n"] == 1
+    assert associations_module.heal_state(str(store_path)) == "finished"
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "an existing corrupt store with a finished latch claimed the bootstrap"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a scan started over an existing corrupt store"
+    )
+    assert store_path.read_bytes() == before, "the corrupt store was modified by the check"
+
+
 def test_a_failed_first_heal_then_recovery_bootstraps_learning(hermes, tmp_path):
     """F1: a first heal whose pass failed (watermark 0) must not trap learning."""
     store_path = tmp_path / "bootstrap-failed.db"
