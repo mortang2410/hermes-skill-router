@@ -432,6 +432,7 @@ partition is computed per request from the catalog rows.
 | `showSuggestions` | `true` | boolean | Let the display read the last suggestion names. False stops the record and removes an existing one. |
 | `suggestionsPath` | `~/.cache/hermes-skill-router/suggestions.json` | path, empty disables the record | Display record both surfaces read. Names only, never request text. |
 | `healthCheckMs` | `60000` | 0..3600000 | Minimum gap between probes of an endpoint that failed. Zero probes every request. |
+| `oneShotMode` | `oneshot_no_create_skill` | `oneshot_no_create_skill` or `oneshot_can_create_skill` | One-shot skill-creation rule. The default keeps Hermes' no-create rule in the one-shot header; the opt-in value lets that header allow creating and editing skills. Unknown values render no-create. |
 <!-- config-defaults:end -->
 
 ### Endpoint URL rule

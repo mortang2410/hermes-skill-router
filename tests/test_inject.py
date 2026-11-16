@@ -23,12 +23,15 @@ if str(ROOT) not in sys.path:
 
 from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router.catalog import CatalogRows  # noqa: E402
-from hermes_skill_router.config import load  # noqa: E402
+from hermes_skill_router.config import load, read_settings  # noqa: E402
 from hermes_skill_router.inject import (  # noqa: E402
     ALSO_LISTED,
     HEADER,
     LOADER_TOOLS,
+    ONE_SHOT_CAN_CREATE_CLAUSE,
+    ONE_SHOT_CAN_CREATE_HEADER,
     ONE_SHOT_HEADER,
+    ONE_SHOT_NO_CREATE_CLAUSE,
     PINNED,
     SUGGESTIONS,
     render,
@@ -160,6 +163,76 @@ def test_both_headers_share_their_first_line_and_differ_only_after_it():
     assert "Do not load general process skills" in ONE_SHOT_HEADER
     assert "Do not load general process skills" not in HEADER
     assert "even partially relevant" not in ONE_SHOT_HEADER
+
+
+def _one_shot_block(cfg):
+    return render(
+        [("alpha", 0.9)],
+        CatalogRows(("pinned",), ("Pinned skill",)),
+        make_index([("alpha", "Alpha skill")]),
+        cfg,
+        one_shot=True,
+        paths=paths_for("alpha"),
+    )
+
+
+def test_the_one_shot_can_create_header_flips_only_the_create_edit_clause():
+    # Byte-diff: the opt-in header differs from the default header only where
+    # the create/edit clause sits.
+    assert ONE_SHOT_NO_CREATE_CLAUSE in ONE_SHOT_HEADER
+    assert ONE_SHOT_CAN_CREATE_CLAUSE in ONE_SHOT_CAN_CREATE_HEADER
+    assert ONE_SHOT_CAN_CREATE_HEADER == ONE_SHOT_HEADER.replace(
+        ONE_SHOT_NO_CREATE_CLAUSE, ONE_SHOT_CAN_CREATE_CLAUSE
+    )
+    assert ONE_SHOT_CAN_CREATE_CLAUSE not in ONE_SHOT_HEADER
+
+    default_block = _one_shot_block(make_config())
+    opt_in_block = _one_shot_block(make_config(oneShotMode="oneshot_can_create_skill"))
+
+    assert default_block.startswith(ONE_SHOT_HEADER)
+    assert opt_in_block.startswith(ONE_SHOT_CAN_CREATE_HEADER)
+    assert "do not create or edit skills" in default_block
+    assert "you may create or edit skills in this run" in opt_in_block
+    # Every other byte is identical: swapping the clause back in the opt-in
+    # block reproduces the default block exactly.
+    assert opt_in_block.replace(ONE_SHOT_CAN_CREATE_CLAUSE, ONE_SHOT_NO_CREATE_CLAUSE) == default_block
+    assert opt_in_block.split("\n", 1)[0] == default_block.split("\n", 1)[0]
+
+
+def test_the_one_shot_default_and_unknown_values_render_no_create():
+    default_block = _one_shot_block(make_config())
+    explicit_block = _one_shot_block(make_config(oneShotMode="oneshot_no_create_skill"))
+    fallback_block = _one_shot_block(make_config(oneShotMode="something-else-entirely"))
+
+    assert explicit_block == default_block, "the explicit default matches today's bytes"
+    assert fallback_block == default_block, "an unknown value renders no-create"
+    for block in (default_block, explicit_block, fallback_block):
+        assert "do not create or edit skills" in block
+        assert ONE_SHOT_CAN_CREATE_CLAUSE not in block
+
+
+def test_one_shot_settings_chain_from_manifest_to_rendered_bytes():
+    """The settings chain: manifest declaration -> host settings -> read_settings
+    -> Config -> rendered bytes, with the operator value set through settings
+    only."""
+    import yaml
+
+    manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    schema = manifest["config_schema"]["oneShotMode"]
+    assert schema["default"] == "oneshot_no_create_skill"
+    assert set(schema["values"]) == {"oneshot_no_create_skill", "oneshot_can_create_skill"}
+
+    class _Context:
+        def get_config(self, key, default=None):
+            return {"oneShotMode": "oneshot_can_create_skill"}.get(key, default)
+
+    cfg = load(read_settings(_Context()))
+    assert cfg.one_shot_mode == "oneshot_can_create_skill"
+
+    block = _one_shot_block(cfg)
+    assert block.startswith(ONE_SHOT_CAN_CREATE_HEADER)
+    assert "you may create or edit skills in this run" in block
+    assert "do not create or edit skills" not in block
 
 
 def test_a_suggested_row_gets_its_description_from_the_index_and_its_read_path():

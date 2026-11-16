@@ -762,11 +762,15 @@ def test_legacy_catalog_blank_explicit_model_is_a_named_parity_error(tmp_path, b
 
 
 def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypatch):
-    """Round 4 concern: the analytics process writes no persisted warning state.
+    """The analytics process writes no persisted warning state.
 
-    Initialize and acknowledge a disabled-switch warning under an isolated
-    HOME, run the documented analytics command (no embed flags), then reload
-    disabled: the warning stays suppressed instead of recurring.
+    Two arms under an isolated HOME. The off arm (D2): a load with the master
+    switch off emits no switch warning and persists nothing (no switch file
+    anywhere under the home), and the analytics run keeps it that way. The
+    enabled arm: initialize and acknowledge a ``showSuggestions`` warning,
+    run the documented analytics command (no embed flags), then reload: the
+    warning stays suppressed instead of recurring, so the analytics-store
+    invariant holds on the enabled path too.
     """
     import logging
 
@@ -776,17 +780,29 @@ def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypa
         switch_warning_messages,
     )
 
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(_hermes_home(tmp_path)))
     monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
-    settings = {"enabled": False, "cachePath": "", "suggestionsPath": ""}
+
+    def switch_notes(cfg):
+        return [
+            note
+            for note in cfg.notes
+            if note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
+        ]
+
+    off_settings = {"enabled": False, "cachePath": "", "suggestionsPath": ""}
+    off_cfg = load(off_settings)
+    assert switch_notes(off_cfg) == []
+    assert switch_warning_messages(off_cfg) == ()
+    assert list(home.rglob("*")) == [], "an off load persists nothing at all"
+
+    settings = {"showSuggestions": False, "cachePath": "", "suggestionsPath": ""}
     cfg = load(settings)
-    notes = [
-        note
-        for note in cfg.notes
-        if note.startswith(("enabled: ", "showSuggestions: ")) and " is off; " in note
-    ]
+    notes = switch_notes(cfg)
     assert len(notes) == 1
+    assert notes[0].startswith("showSuggestions: ")
     acknowledge_switch_deliveries(notes, "", cfg.switch_generations)
     assert switch_warning_messages(load(settings)) == ()
 
@@ -799,8 +815,17 @@ def test_analytics_run_does_not_touch_warning_state(endpoint, tmp_path, monkeypa
     assert result.returncode == 0, result.stderr
 
     reloaded = load(settings)
-    assert [n for n in reloaded.notes if " is off; " in n] == []
+    assert switch_notes(reloaded) == []
     assert switch_warning_messages(reloaded) == ()
+
+    reloaded_off = load(off_settings)
+    assert switch_notes(reloaded_off) == []
+    assert switch_warning_messages(reloaded_off) == ()
+    default_switches = home / ".cache" / "hermes-skill-router" / "config-switches.json"
+    assert default_switches.exists(), "the enabled-path seen set lives in the default cache directory"
+    assert {pair[0] for pair in json.loads(default_switches.read_text())["seen"]} == {
+        "showSuggestions"
+    }, "the off loads added no fingerprint for the enabled switch"
 
 
 def test_top5_prompts_per_skill_in_divergence_order(endpoint, tmp_path):

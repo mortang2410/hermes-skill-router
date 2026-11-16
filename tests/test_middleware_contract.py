@@ -378,33 +378,33 @@ def test_an_anthropic_messages_payload_comes_out_same(
     assert result.changed is False
 
 
-def test_disabled_plugin_injects_the_switch_warning_into_the_request(
+def test_disabled_plugin_leaves_the_request_and_state_untouched(
     plugin_module, endpoints, tmp_path
 ):
-    """With the master switch off the model still gets one warning naming it."""
+    """D2: with the master switch off the plugin returns None and writes nothing."""
     settings = settings_for(endpoints, tmp_path / "suggestions.json")
     settings["enabled"] = False
     settings["cachePath"] = str(tmp_path / "index.json")
     callback = _callback_for(plugin_module, settings)
 
-    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+    payload = chat_payload()
+    before = copy.deepcopy(payload)
+    result = callback(request=payload, **DISPATCH_KWARGS)
 
-    assert result is not None
-    messages = result["request"]["messages"]
-    assert messages[-1]["role"] == "system"
-    assert "enabled" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
-    # The catalog stays: nothing was stripped or routed.
-    assert messages[0]["content"] == chat_payload()["messages"][0]["content"]
-    assert len(messages) == len(chat_payload()["messages"]) + 1
+    assert result is None
+    assert payload == before, "the off path must not mutate the request"
     assert not (tmp_path / "suggestions.json").exists()
-    # Suppression was persisted after delivery: the second turn carries no warning.
+    assert not (tmp_path / "config-switches.json").exists()
+    # Repeated off turns stay silent and still write nothing.
     assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
+    assert not (tmp_path / "config-switches.json").exists()
 
 
-def test_disabled_unsupported_modes_preserve_payload_and_defer_warning(
+def test_disabled_unsupported_modes_preserve_payload_and_deliver_nothing(
     plugin_module, endpoints, tmp_path
 ):
-    """Round 3 P2: a disabled plugin must not mutate unsupported payloads."""
+    """A disabled plugin must not mutate unsupported payloads, and a supported
+    request after them carries no warning either (D2: there is none to defer)."""
     settings = settings_for(endpoints, tmp_path / "suggestions.json")
     settings["enabled"] = False
     settings["cachePath"] = str(tmp_path / "index.json")
@@ -418,12 +418,9 @@ def test_disabled_unsupported_modes_preserve_payload_and_defer_warning(
         })
         assert result is None, f"disabled plugin must not mutate {mode} payloads"
 
-    # The warning was deferred, not consumed: a supported request delivers it.
-    result = callback(request=chat_payload(), **DISPATCH_KWARGS)
-    assert result is not None
-    messages = result["request"]["messages"]
-    assert "enabled" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
+    # The supported request is untouched too: D2 left no warning to deliver.
     assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
+    assert not (tmp_path / "config-switches.json").exists()
 
 
 def test_no_catalog_first_then_supported_still_delivers_warning(
@@ -676,13 +673,11 @@ def test_hidden_suggestions_inject_the_switch_warning_with_the_block(
 def test_both_empty_paths_deliver_the_warning_through_the_middleware(
     plugin_module, endpoints, tmp_path, monkeypatch, switch
 ):
-    """Round 4 gap, parameterized over both switch directions in round 5: both
-    paths empty still delivers through the middleware, not just at load.
-
-    With ``suggestionsPath`` and ``cachePath`` both empty, the switch warning must
-    reach the model on the first supported request and stay suppressed after
-    that delivery; the persisted set lives beside the index cache, independent
-    of the disabled display.
+    """Round 4 gap: both paths empty. The ``showSuggestions`` switch still warns
+    through the middleware: the warning must reach the model on the first
+    supported request and stay suppressed after that delivery; the persisted
+    set lives beside the index cache, independent of the disabled display.
+    The ``enabled`` switch is untouched instead (D2): no delivery, no file.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
@@ -691,6 +686,11 @@ def test_both_empty_paths_deliver_the_warning_through_the_middleware(
     settings["suggestionsPath"] = ""
     settings["cachePath"] = ""
     callback = _callback_for(plugin_module, settings)
+
+    if switch == "enabled":
+        assert callback(request=chat_payload(), **DISPATCH_KWARGS) is None
+        assert not (tmp_path / ".cache" / "hermes-skill-router" / "config-switches.json").exists()
+        return
 
     first = callback(request=chat_payload(), **DISPATCH_KWARGS)
     assert _warning_messages(first), "the first supported request delivers"

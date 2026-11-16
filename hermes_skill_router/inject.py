@@ -36,7 +36,10 @@ heading by the name ``## Skills``, and the block never reintroduces it.
 
 Skill-maintenance guidance ("fix it with ``skill_manage``", "offer to save the result as a skill") is
 deliberately absent from both headers. The one-shot header goes further and states the rule the removed
-prose carried: do not create or edit skills.
+prose carried: do not create or edit skills. The ``oneShotMode`` setting (default
+``oneshot_no_create_skill``) selects that sentence; ``oneshot_can_create_skill`` renders the same
+header with only the create/edit clause flipped to allow it, and any unknown or missing value
+renders the no-create form.
 
 This module applies no cap. The selector is the only place the cap is applied, so a block handed
 twelve rows renders twelve rows even when ``maxSuggestions`` is 0. The function is pure. Rendering
@@ -90,6 +93,20 @@ ONE_SHOT_HEADER = (
     "when none of these fits, to see every skill available."
 )
 
+#: The create/edit clause the no-create one-shot header carries, and the clause the opt-in
+#: header puts in its place. Building the opt-in header by replacing exactly this clause
+#: keeps every other byte of the header identical by construction.
+ONE_SHOT_NO_CREATE_CLAUSE = (
+    "do not create or edit skills: this is a one-shot run with no later session to reuse them"
+)
+ONE_SHOT_CAN_CREATE_CLAUSE = "you may create or edit skills in this run"
+
+#: The opt-in one-shot header (``oneShotMode: oneshot_can_create_skill``): identical to
+#: :data:`ONE_SHOT_HEADER` except the create/edit clause allows creating and editing skills.
+ONE_SHOT_CAN_CREATE_HEADER = ONE_SHOT_HEADER.replace(
+    ONE_SHOT_NO_CREATE_CLAUSE, ONE_SHOT_CAN_CREATE_CLAUSE
+)
+
 #: Section marker that opens the selected suggestions.
 SUGGESTIONS = "Suggestions:"
 
@@ -134,7 +151,9 @@ def render(
 
     *rows* are the selected suggestions from :func:`hermes_skill_router.select.select`, already
     capped, best first. *kept* is the kept half of the catalog partition. *one_shot* is
-    ``Partition.one_shot``: it chooses which of the two fixed headers opens the block. *opening*
+    ``Partition.one_shot``: it chooses between the two fixed headers that open the block, and
+    ``cfg.one_shot_mode`` chooses which one-shot header (the no-create default, or the opt-in
+    can-create form; an unknown or missing value renders no-create). *opening*
     says the request's messages carry no earlier block, so the pinned rows are listed; a later turn
     in the same compaction window omits them. *paths* maps a name to the absolute read path the host
     lookup resolved, for both suggestions and pinned rows. *index* supplies the descriptions of
@@ -186,7 +205,15 @@ def render(
             listed.append(_plain_row(name, description, limit))
     if not suggested and not pinned and not listed:
         return note.strip() if isinstance(note, str) else ""
-    parts = [ONE_SHOT_HEADER if one_shot else HEADER]
+    if one_shot:
+        header = (
+            ONE_SHOT_CAN_CREATE_HEADER
+            if getattr(cfg, "one_shot_mode", None) == "oneshot_can_create_skill"
+            else ONE_SHOT_HEADER
+        )
+    else:
+        header = HEADER
+    parts = [header]
     if suggested:
         parts.append(SUGGESTIONS + "\n" + "\n".join(suggested))
     if pinned:

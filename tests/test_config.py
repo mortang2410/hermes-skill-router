@@ -57,6 +57,7 @@ SPEC_DEFAULTS = {
     "showSuggestions": True,
     "suggestionsPath": "~/.cache/hermes-skill-router/suggestions.json",
     "healthCheckMs": 60000,
+    "oneShotMode": "oneshot_no_create_skill",
 }
 
 SPEC_BOUNDS = {
@@ -119,6 +120,7 @@ CONFIG_FIELDS = {
     "cache_path",
     "association_db_path",
     "health_check_ms",
+    "one_shot_mode",
     "show_suggestions",
     "suggestions_path",
     "max_display_names",
@@ -214,6 +216,7 @@ def test_load_none_returns_every_default():
     assert cfg.max_description_chars == 400
     assert cfg.max_display_names == 12
     assert cfg.health_check_ms == 60000
+    assert cfg.one_shot_mode == "oneshot_no_create_skill"
     assert cfg.show_suggestions is True
     assert cfg.eager_skills == ()
     assert cfg.deferred_skills == ()
@@ -352,6 +355,24 @@ def test_fusion_mode_is_case_insensitive_and_rejects_another_word():
     cfg = load({"fusionMode": "ranked", "cachePath": ""})
     assert cfg.fusion_mode == "live"
     assert any("fusionMode" in note for note in cfg.notes)
+
+
+@pytest.mark.parametrize("mode", ["oneshot_no_create_skill", "oneshot_can_create_skill"])
+def test_one_shot_mode_accepts_each_published_value(mode):
+    cfg = load({"oneShotMode": mode, "cachePath": ""})
+    assert cfg.one_shot_mode == mode
+    assert cfg.notes == ()
+
+
+def test_one_shot_mode_default_is_no_create():
+    assert load({"cachePath": ""}).one_shot_mode == "oneshot_no_create_skill"
+
+
+def test_one_shot_unknown_or_malformed_values_fall_back_to_no_create_with_a_note():
+    for bad in ("something-else-entirely", "", 5, None, True):
+        cfg = load({"oneShotMode": bad, "cachePath": ""})
+        assert cfg.one_shot_mode == "oneshot_no_create_skill", bad
+        assert any("oneShotMode" in note for note in cfg.notes), bad
 
 
 def test_name_lists_are_stripped_deduplicated_and_empty_by_default():

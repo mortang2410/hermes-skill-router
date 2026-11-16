@@ -16,7 +16,7 @@ config_schema:
   enabled:
     type: bool
     default: true
-    description: "Master switch. False disables routing; the model still gets one warning naming the switch."
+    description: "Master switch. False disables routing and leaves the request and plugin state untouched: no message, no record, no persisted warning state."
   eagerSkills:
     type: list
     items: str
@@ -159,3 +159,8 @@ config_schema:
     minimum: 0
     maximum: 3600000
     description: "Minimum gap between endpoint health probes in milliseconds; 0 probes every request (0..3600000)."
+  oneShotMode:
+    type: str
+    default: oneshot_no_create_skill
+    values: [oneshot_no_create_skill, oneshot_can_create_skill]
+    description: "One-shot skill-creation rule. oneshot_no_create_skill keeps the no-create rule of the default Hermes one-shot prompt; oneshot_can_create_skill lets the one-shot header allow creating and editing skills. Unknown values render no-create."

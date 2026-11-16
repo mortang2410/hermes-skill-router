@@ -15,15 +15,21 @@ offending value stays silent forever and a changed value warns once. A load that
 (disabled, dashboard or pre-load read, any non-routing path) never consumes a fingerprint. The
 persisted set never uses a clock.
 
-The two no-record switches (``enabled: false`` and ``showSuggestions: false``) warn on three
+The one no-record switch that warns (``showSuggestions: false``) warns on three
 channels under the same fingerprint shape, one seen set per switch: a terminal line on stderr, an
 injected context message built by :func:`switch_warning_messages`, and one host-logger event, each
-naming the switch and its effect. Unlike a malformed-value trap they never reach a display
-record (the switches suppress it), so ``load`` persists their fingerprints at emission time
-instead of waiting for a record write; fixing one switch drops only that switch's fingerprints.
+naming the switch and its effect. Unlike a malformed-value trap it never reaches a display
+record (the switch suppresses it), so ``load`` persists its fingerprints at emission time
+instead of waiting for a record write; fixing it drops only its fingerprints.
 The fingerprints live beside the index cache when a cache path is set, and in the default
 ``~/.cache/hermes-skill-router`` directory when ``cachePath`` is empty, so disabling the
 display or the index cache never turns them back into per-load spam.
+
+``enabled: false`` is surveyed by D2 (off stays untouched) and is different: :func:`_pending_switch_warnings`
+returns at once when the master switch is off, so a load with routing off emits no switch warning
+for either switch (not even a ``showSuggestions`` one) and persists no switch-warning state. The
+prior three-channel warning on that path is superseded; the ``showSuggestions`` warning on the
+enabled path is unchanged.
 
 The injected channel is tracked separately from the load-time seen set: ``load`` consumes
 only the terminal/logger set, while the injected fingerprint is consumed only by
@@ -74,6 +80,10 @@ RERANK_PROVIDERS = ("cohere",)
 #: The fusion modes. ``cosine`` is the single rollback switch.
 FUSION_MODES = ("live", "shadow", "cosine")
 
+#: The one-shot skill-creation modes. The default keeps Hermes' no-create rule;
+#: the opt-in value lets the one-shot header allow creating and editing skills.
+ONE_SHOT_MODES = ("oneshot_no_create_skill", "oneshot_can_create_skill")
+
 _KIND_LABELS = {
     "bool": "boolean",
     "int": "integer",
@@ -84,6 +94,7 @@ _KIND_LABELS = {
     "name_list": "list of skill names",
     "provider": "provider name",
     "fusion_mode": "fusion mode (live, shadow or cosine)",
+    "one_shot_mode": "one-shot mode (oneshot_no_create_skill or oneshot_can_create_skill)",
     "url": "endpoint URL",
 }
 
@@ -146,6 +157,9 @@ _SPECS: Tuple[_Spec, ...] = (
         "~/.cache/hermes-skill-router/suggestions.json",
     ),
     _Spec("healthCheckMs", "health_check_ms", "int", 60000, 0, 3600000),
+    # One-shot skill-creation rule: the no-create default keeps Hermes' rule,
+    # the opt-in value lets the one-shot header allow creating and editing skills.
+    _Spec("oneShotMode", "one_shot_mode", "one_shot_mode", "oneshot_no_create_skill"),
 )
 
 #: Manifest key -> default value.
@@ -223,6 +237,7 @@ class Config:
     eager_skills: Tuple[str, ...]
     deferred_skills: Tuple[str, ...]
     notes: Tuple[str, ...]
+    one_shot_mode: str = "oneshot_no_create_skill"
     trap_notes: Tuple[str, ...] = ()
     switch_message_notes: Tuple[str, ...] = ()
     switch_generations: Dict[str, int] = field(default_factory=dict)
@@ -396,6 +411,10 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
         return _invalid(spec, value, notes)
     if kind == "fusion_mode":
         if isinstance(value, str) and value.strip().lower() in FUSION_MODES:
+            return value.strip().lower()
+        return _invalid(spec, value, notes)
+    if kind == "one_shot_mode":
+        if isinstance(value, str) and value.strip().lower() in ONE_SHOT_MODES:
             return value.strip().lower()
         return _invalid(spec, value, notes)
     if kind == "url":
@@ -824,7 +843,14 @@ def _pending_switch_warnings(
     counter, so a late ack of a pre-fix note never matches the post-fix
     generation. A fix with nothing to clear writes nothing, so a healthy
     load stays write-free.
+
+    D2 (off stays untouched): when the master switch is off the load returns
+    at once with no pending pair, no emission and no persistence, for either
+    switch. Prior state is left exactly as it was: an off load neither warns
+    about ``showSuggestions`` nor clears its fingerprints.
     """
+    if values.get("enabled") is False:
+        return (), (), {}
     offending = {
         key: _switch_note(key, settings.get(key, False))
         for key in SWITCH_WARNING_SWITCHES

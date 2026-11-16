@@ -148,28 +148,25 @@ def _route(
     Messages stays untouched. The rewrite records the ids in the display record; a missing id stays
     an empty string rather than failing the request.
 
+    D2 (off stays untouched): with the master switch off this returns ``None``
+    immediately, before any switch message is computed; the request payload and the
+    plugin state are left byte-identical.
+
     Pending no-record switch warnings ride on the outgoing request as standalone system
-    messages, before the disabled early return and after a rewrite alike, so the one channel
-    that reaches the model carries the warning that the terminal and the host logger already
-    showed. When the rewrite returns ``None`` (no catalog, unsupported mode, first failure,
-    already injected, an exception) the warnings ride on the original request instead, under
-    the same supported-channel gate as the disabled path below, so the first supported turn
-    still delivers. A request without a messages list or with an unsupported api mode has no
-    supported channel to carry them: the payload stays untouched and the delivered
-    fingerprint is not consumed, so a later supported request still delivers. Only an
-    outgoing request that actually carries the messages acknowledges delivery.
+    messages after a rewrite, so the one channel that reaches the model carries the warning
+    that the terminal and the host logger already showed. When the rewrite returns ``None``
+    (no catalog, unsupported mode, first failure, already injected, an exception) the
+    warnings ride on the original request instead, under the same supported-channel gate
+    below, so the first supported turn still delivers. A request without a messages list or
+    with an unsupported api mode has no supported channel to carry them: the payload stays
+    untouched and the delivered fingerprint is not consumed, so a later supported request
+    still delivers. Only an outgoing request that actually carries the messages
+    acknowledges delivery.
     """
     cfg = load(read_settings(ctx))
-    switch_messages = switch_warning_messages(cfg)
     if not cfg.enabled:
-        result = _with_switch_messages(request, switch_messages, api_mode=api_mode)
-        if result is not None:
-            acknowledge_switch_deliveries(
-                [message["content"] for message in switch_messages],
-                cfg.cache_path,
-                getattr(cfg, "switch_generations", None),
-            )
-        return result
+        return None
+    switch_messages = switch_warning_messages(cfg)
     result = rewrite(
         request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
     )
@@ -208,10 +205,9 @@ def _route(
 def _with_switch_messages(request: Any, switch_messages: Any, api_mode: str = "chat_completions") -> Any:
     """Return *request* with *switch_messages* appended, or ``None`` when there is no channel.
 
-    Used on the disabled path, where the rewrite never runs, and on the enabled path when
-    the rewrite returns ``None``: the switch warning still reaches the provider request
-    even though routing and the display record are off or the rewrite left the request
-    unchanged. Unsupported modes (Anthropic Messages, Responses) have no system-message
+    Used on the enabled path when the rewrite returns ``None``: the switch warning still
+    reaches the provider request even though the rewrite left the request unchanged.
+    Unsupported modes (Anthropic Messages, Responses) have no system-message
     channel in ``messages``, so the payload is preserved untouched and the warning is
     deferred until a supported channel exists; delivery is not acknowledged on this path.
     A trailing suggestion block stays last (see :func:`_carrying_switch_messages`), so the

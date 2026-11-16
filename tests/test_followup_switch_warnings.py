@@ -1,14 +1,21 @@
-"""Ticket 03: no-record switch warnings on three channels.
+"""No-record switch warnings on three channels, and the D2 off-untouched rule.
 
-With ``enabled: false`` or ``showSuggestions: false`` in effect, ``config.load``
+With ``showSuggestions: false`` in effect (and ``enabled`` true), ``config.load``
 emits one terminal line (stderr), one injected context message (a ``system``
 message dict built by :func:`switch_warning_messages`, never a suggestions-block
 row), and one host-logger event, each naming the switch and its effect.
 Anti-spam keys on the offending ``(switch, value)`` fingerprint in the
 persisted trap set, one seen set per switch: an unchanged value warns once and
 then stays silent across turns and a restart, a changed value warns once more,
-and fixing one switch drops only that switch's fingerprints so re-breaking the
-same value warns again while the other switch stays suppressed.
+and fixing the switch drops its fingerprints so re-breaking the same value
+warns again.
+
+D2 (off stays untouched, ticket 02, contract C2): with ``enabled: false`` a
+load emits no switch warning for either switch and persists no switch-warning
+state, and the middleware returns ``None`` without computing any switch
+message. The prior three-channel warning on that path is superseded; the
+``showSuggestions`` warning on the enabled path is unchanged, and the
+machinery tests below exercise it through that switch.
 """
 
 from __future__ import annotations
@@ -88,31 +95,58 @@ def _seen(tmp_path):
     return {tuple(entry) for entry in entries}
 
 
-def test_enabled_false_emits_three_channels_naming_switch_and_effect(tmp_path, capsys, caplog):
+def test_enabled_false_load_is_untouched(tmp_path, capsys, caplog):
+    """D2: with ``enabled: false`` a load emits no warning and persists nothing."""
+    before = {path.name for path in tmp_path.iterdir()}
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
         cfg = _load(tmp_path, {"enabled": False})
 
-    notes = _switch_notes(cfg)
-    assert len(notes) == 1, f"enabled warning must be produced, got {cfg.notes!r}"
-    line = notes[0]
-    assert "enabled" in line
-    assert "routing" in line and ("switch" in line.lower() or "off" in line.lower())
+    assert cfg.enabled is False
+    assert _switch_notes(cfg) == ()
+    assert switch_warning_messages(cfg) == ()
+    assert capsys.readouterr().err == ""
+    assert _logger_lines(caplog) == []
+    assert {path.name for path in tmp_path.iterdir()} == before, (
+        "an off load must leave the state directory unchanged"
+    )
+    assert not _switches_file(tmp_path).exists()
 
-    # Terminal line: one stderr line identical to the warning line.
-    err = capsys.readouterr().err
-    assert [row for row in err.splitlines() if "enabled" in row] == [line]
 
-    # Host-logger event: one config warning naming the switch.
-    assert _logger_lines(caplog) == [line]
+def test_enabled_false_with_display_off_is_still_untouched(tmp_path, capsys, caplog):
+    """D2: even with ``showSuggestions: false`` too, an off load warns about neither switch."""
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        cfg = _load(tmp_path, {"enabled": False, "showSuggestions": False})
 
-    # Injected context message: a standalone system message, never a block row.
-    messages = switch_warning_messages(cfg)
-    assert messages == ({"role": "system", "content": line},)
-    assert not line.startswith("Skills routed for this request")
-    assert "Suggestions:" not in line
-    from hermes_skill_router.inject import suggested_names
+    assert _switch_notes(cfg) == ()
+    assert switch_warning_messages(cfg) == ()
+    assert capsys.readouterr().err == ""
+    assert _logger_lines(caplog) == []
+    assert not _switches_file(tmp_path).exists()
 
-    assert suggested_names(line) == []
+
+def test_enabled_false_load_preserves_existing_switch_state(tmp_path, capsys, caplog):
+    """D2: an off load neither warns about nor clears a pending ``showSuggestions`` state."""
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        off = _load(tmp_path, {"showSuggestions": False})
+        assert len(_switch_notes(off)) == 1
+        seen_before = _seen(tmp_path)
+        assert {pair[0] for pair in seen_before} == {"showSuggestions"}
+        capsys.readouterr()
+        caplog.clear()
+
+        cfg = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        assert _switch_notes(cfg) == ()
+        assert switch_warning_messages(cfg) == ()
+        assert _seen(tmp_path) == seen_before, (
+            "an off load must not clear the existing fingerprints"
+        )
+        assert capsys.readouterr().err == ""
+        assert _logger_lines(caplog) == []
+
+        # The pending display warning is still there on the enabled path afterwards.
+        again = _load(tmp_path, {"showSuggestions": False})
+        assert _switch_notes(again) == ()
+        assert len(switch_warning_messages(again)) == 1
 
 
 def test_show_suggestions_false_emits_three_channels_naming_display_loss(
@@ -136,38 +170,35 @@ def test_unchanged_value_warns_once_then_stays_silent_across_turns_and_restart(
     tmp_path, capsys, caplog
 ):
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        assert len(_switch_notes(first)) == 2
-        assert {note.split(":", 1)[0] for note in _switch_notes(first)} == {
-            "enabled",
-            "showSuggestions",
-        }
+        first = _load(tmp_path, {"showSuggestions": False})
+        assert len(_switch_notes(first)) == 1
+        assert _switch_notes(first)[0].startswith("showSuggestions: ")
         terminal_first = capsys.readouterr().err.splitlines()
-        assert len([row for row in terminal_first if row]) == 2
-        assert len(_logger_lines(caplog)) == 2
+        assert len([row for row in terminal_first if row]) == 1
+        assert len(_logger_lines(caplog)) == 1
 
         caplog.clear()
         for _ in range(3):
-            again = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+            again = _load(tmp_path, {"showSuggestions": False})
             assert _switch_notes(again) == ()
             # Round 3: a load alone no longer suppresses the injected channel;
             # it stays pending until a supported request actually delivers it.
-            assert len(switch_warning_messages(again)) == 2
+            assert len(switch_warning_messages(again)) == 1
         assert capsys.readouterr().err == ""
         assert _logger_lines(caplog) == [], "repeated turns must not spam the logger"
 
         # Delivery on a supported request acknowledges the injected channel.
         acknowledge_switch_deliveries(
-            [_switch_notes(first)[0], _switch_notes(first)[1]],
+            [_switch_notes(first)[0]],
             _cache(tmp_path),
             first.switch_generations,
         )
-        after_delivery = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        after_delivery = _load(tmp_path, {"showSuggestions": False})
         assert switch_warning_messages(after_delivery) == ()
 
         # A restart clears only in-process memory; the persisted set still suppresses.
         config_module._LOGGED_NOTES.clear()
-        restarted = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        restarted = _load(tmp_path, {"showSuggestions": False})
         assert _switch_notes(restarted) == ()
         assert switch_warning_messages(restarted) == ()
         assert capsys.readouterr().err == ""
@@ -175,73 +206,71 @@ def test_unchanged_value_warns_once_then_stays_silent_across_turns_and_restart(
 
 
 def test_each_switch_warns_independently(tmp_path, capsys, caplog):
+    """Only the ``showSuggestions`` switch warns, and only on the enabled path."""
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        cfg = _load(tmp_path, {"enabled": False})
-        assert [note.split(":", 1)[0] for note in _switch_notes(cfg)] == ["enabled"]
+        cfg = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        assert _switch_notes(cfg) == (), "the off path warns about neither switch"
+        assert not _switches_file(tmp_path).exists()
         cfg = _load(tmp_path, {"showSuggestions": False})
-        # The fixed switch (enabled defaults back to True) clears only its own set,
-        # so the other switch still warns for its own fingerprint.
         assert [note.split(":", 1)[0] for note in _switch_notes(cfg)] == ["showSuggestions"]
 
 
 def test_changed_offending_value_warns_once_more(tmp_path, capsys, caplog):
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = _load(tmp_path, {"enabled": False})
+        first = _load(tmp_path, {"showSuggestions": False})
         assert len(_switch_notes(first)) == 1
-        changed = _load(tmp_path, {"enabled": "false"})
+        changed = _load(tmp_path, {"showSuggestions": "false"})
         assert len(_switch_notes(changed)) == 1, (
             "a different spelling of the offending value is a new fingerprint"
         )
         assert _switch_notes(changed) != _switch_notes(first)
-        again = _load(tmp_path, {"enabled": "false"})
+        again = _load(tmp_path, {"showSuggestions": "false"})
         assert _switch_notes(again) == ()
 
 
-def test_fixing_one_switch_drops_only_its_fingerprints(tmp_path, capsys, caplog):
-    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        assert len(_switch_notes(both)) == 2
-        seen = _seen(tmp_path)
-        assert {pair[0] for pair in seen} == {"enabled", "showSuggestions"}
-
-        fixed = _load(tmp_path, {"enabled": True, "showSuggestions": False})
-        assert _switch_notes(fixed) == ()
-        seen = _seen(tmp_path)
-        assert {pair[0] for pair in seen} == {"showSuggestions"}, (
-            "fixing enabled must drop only its own fingerprints"
-        )
-
-        capsys.readouterr()
-        caplog.clear()
-        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        notes = _switch_notes(rebroken)
-        assert [note.split(":", 1)[0] for note in notes] == ["enabled"], (
-            "re-breaking the same value warns again while the other stays suppressed"
-        )
-        assert len(_logger_lines(caplog)) == 1
-
-        # Fixing the other switch now drops only its set.
-        _load(tmp_path, {"enabled": False, "showSuggestions": True})
-        assert {pair[0] for pair in _seen(tmp_path)} == {"enabled"}
-
-
-def test_both_off_then_fixing_one_rebreak_warns_while_other_stays_silent(
+def test_fixing_the_switch_drops_its_fingerprints_and_rebreak_warns_again(
     tmp_path, capsys, caplog
 ):
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        # Simulate delivery of both warnings on a supported request, so the
+        off = _load(tmp_path, {"showSuggestions": False})
+        assert len(_switch_notes(off)) == 1
+        seen = _seen(tmp_path)
+        assert {pair[0] for pair in seen} == {"showSuggestions"}
+
+        fixed = _load(tmp_path, {"showSuggestions": True})
+        assert _switch_notes(fixed) == ()
+        assert _seen(tmp_path) == set(), "fixing the switch drops its fingerprints"
+
+        capsys.readouterr()
+        caplog.clear()
+        rebroken = _load(tmp_path, {"showSuggestions": False})
+        notes = _switch_notes(rebroken)
+        assert [note.split(":", 1)[0] for note in notes] == ["showSuggestions"], (
+            "re-breaking the same value warns again"
+        )
+        assert len(_logger_lines(caplog)) == 1
+
+        # Fixing it again drops the set once more, so the next re-break warns anew.
+        _load(tmp_path, {"showSuggestions": True})
+        assert _seen(tmp_path) == set()
+
+
+def test_off_fix_delivery_rebreak_delivers_again(tmp_path, capsys, caplog):
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        first = _load(tmp_path, {"showSuggestions": False})
+        # Simulate delivery of the warning on a supported request, so the
         # injected channel is acknowledged before the fix/re-break cycle.
         acknowledge_switch_deliveries(
             [message["content"] for message in switch_warning_messages(first)],
             _cache(tmp_path),
             first.switch_generations,
         )
-        _load(tmp_path, {"enabled": True, "showSuggestions": False})
+        assert switch_warning_messages(_load(tmp_path, {"showSuggestions": False})) == ()
+        _load(tmp_path, {"showSuggestions": True})
         capsys.readouterr()
         caplog.clear()
-        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == ["enabled"]
+        rebroken = _load(tmp_path, {"showSuggestions": False})
+        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == ["showSuggestions"]
         assert len(capsys.readouterr().err.splitlines()) == 1
         assert len(_logger_lines(caplog)) == 1
         assert switch_warning_messages(rebroken) == (
@@ -269,12 +298,12 @@ def test_healthy_load_creates_no_trap_file(tmp_path, capsys, caplog):
 def test_empty_suggestions_path_still_suppresses_switch_warnings(tmp_path, capsys, caplog):
     """An empty display path warns once, not on every load (ticket 03's no-spam rule)."""
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        first = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+        first = _load(tmp_path, {"showSuggestions": False, "suggestionsPath": ""})
         assert len(_switch_notes(first)) == 1
         capsys.readouterr()
         caplog.clear()
         for _ in range(3):
-            again = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+            again = _load(tmp_path, {"showSuggestions": False, "suggestionsPath": ""})
             assert _switch_notes(again) == ()
             # Round 3: load alone stays pending on the injected channel.
             assert len(switch_warning_messages(again)) == 1
@@ -288,7 +317,7 @@ def test_empty_suggestions_path_still_suppresses_switch_warnings(tmp_path, capsy
 
         # A restart clears only in-process memory; the cache-side set still suppresses.
         config_module._LOGGED_NOTES.clear()
-        restarted = _load(tmp_path, {"enabled": False, "suggestionsPath": ""})
+        restarted = _load(tmp_path, {"showSuggestions": False, "suggestionsPath": ""})
         assert _switch_notes(restarted) == ()
         assert switch_warning_messages(restarted) == ()
         assert capsys.readouterr().err == ""
@@ -301,10 +330,10 @@ def test_empty_suggestions_path_still_suppresses_switch_warnings(tmp_path, capsy
 def test_load_alone_does_not_consume_the_injected_channel(tmp_path, capsys, caplog):
     """Round 3 P1: a tool-first load must not permanently suppress delivery."""
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        tool_first = _load(tmp_path, {"enabled": False})
+        tool_first = _load(tmp_path, {"showSuggestions": False})
         assert len(switch_warning_messages(tool_first)) == 1
         # A second load (e.g. the middleware's own) still has it pending.
-        middleware_load = _load(tmp_path, {"enabled": False})
+        middleware_load = _load(tmp_path, {"showSuggestions": False})
         assert _switch_notes(middleware_load) == ()
         assert len(switch_warning_messages(middleware_load)) == 1
         acknowledge_switch_deliveries(
@@ -312,10 +341,10 @@ def test_load_alone_does_not_consume_the_injected_channel(tmp_path, capsys, capl
             _cache(tmp_path),
             middleware_load.switch_generations,
         )
-        after = _load(tmp_path, {"enabled": False})
+        after = _load(tmp_path, {"showSuggestions": False})
         assert switch_warning_messages(after) == ()
         # Repeat supported turns stay suppressed after first delivery.
-        again = _load(tmp_path, {"enabled": False})
+        again = _load(tmp_path, {"showSuggestions": False})
         assert switch_warning_messages(again) == ()
 
 
@@ -339,13 +368,13 @@ def test_stale_ack_surviving_a_fix_is_rejected(tmp_path, capsys, caplog):
     Deliver guard in the model.
     """
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        off = _load(tmp_path, {"enabled": False})
+        off = _load(tmp_path, {"showSuggestions": False})
         notes = _switch_notes(off)
         assert len(notes) == 1
         stale = notes[0]
         assert len(switch_warning_messages(off)) == 1
 
-        fixed = _load(tmp_path, {"enabled": True})
+        fixed = _load(tmp_path, {"showSuggestions": True})
         assert _switch_notes(fixed) == ()
         assert _seen(tmp_path) == set() and _delivered(tmp_path) == set()
 
@@ -355,7 +384,7 @@ def test_stale_ack_surviving_a_fix_is_rejected(tmp_path, capsys, caplog):
 
         capsys.readouterr()
         caplog.clear()
-        rebroken = _load(tmp_path, {"enabled": False})
+        rebroken = _load(tmp_path, {"showSuggestions": False})
         assert _switch_notes(rebroken) == (stale,)
         assert switch_warning_messages(rebroken) == ({"role": "system", "content": stale},)
         assert len(capsys.readouterr().err.splitlines()) == 1
@@ -365,19 +394,19 @@ def test_stale_ack_surviving_a_fix_is_rejected(tmp_path, capsys, caplog):
         acknowledge_switch_deliveries(
             [stale], _cache(tmp_path), rebroken.switch_generations
         )
-        assert switch_warning_messages(_load(tmp_path, {"enabled": False})) == ()
+        assert switch_warning_messages(_load(tmp_path, {"showSuggestions": False})) == ()
 
 
-@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
-def test_aba_old_note_ack_rejected_both_switches(tmp_path, capsys, caplog, switch):
-    """Round 5 P2: the fix/rebreak ABA on either switch.
+def test_aba_old_note_ack_rejected(tmp_path, capsys, caplog):
+    """Round 5 P2: the fix/rebreak ABA.
 
-    Load broken A, capture its pending note and generation, fix (bumping the
-    generation), re-break the same A, then ack the OLD note with the OLD
+    Load broken, capture the pending note and generation, fix (bumping the
+    generation), re-break the same value, then ack the OLD note with the OLD
     generation: the pair is back in the seen set, but the generation bound
     rejects it, so the NEW generation's delivery still fires. The new note's
     own on-time ack then lands and suppresses.
     """
+    switch = "showSuggestions"
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
         off = _load(tmp_path, {switch: False})
         notes = _switch_notes(off)
@@ -411,93 +440,93 @@ def test_aba_old_note_ack_rejected_both_switches(tmp_path, capsys, caplog, switc
         assert switch_warning_messages(_load(tmp_path, {switch: False})) == ()
 
 
-def test_aba_unaffected_sibling_ack_stays_valid(tmp_path, capsys, caplog):
-    """Round 5 P2: through the ABA on one switch, the sibling's ack stays valid.
+def test_off_load_never_disturbs_a_pending_ack(tmp_path, capsys, caplog):
+    """D2: a pending ``showSuggestions`` ack stays valid across an off load.
 
-    Both switches off, capture both notes; fix one (bumping only its
-    generation), re-break it, then ack the sibling's note at its unchanged
-    generation: it lands. The fixed switch's old note at its old generation
-    is still rejected.
+    Capture the pending note and generation, run an ``enabled: false`` load
+    (which must neither warn nor touch state), then ack at the captured
+    generation: it still lands.
     """
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        notes = {note.split(":", 1)[0]: note for note in _switch_notes(both)}
-        assert set(notes) == {"enabled", "showSuggestions"}
-        captured = dict(both.switch_generations)
+        off = _load(tmp_path, {"showSuggestions": False})
+        note = _switch_notes(off)[0]
+        captured = dict(off.switch_generations)
 
-        def fixed_enabled():
-            return _load(tmp_path, {"enabled": True, "showSuggestions": False})
+        disabled = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        assert _switch_notes(disabled) == ()
+        assert switch_warning_messages(disabled) == ()
 
-        fixed_enabled()
-        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == ["enabled"]
-
-        acknowledge_switch_deliveries(
-            [notes["showSuggestions"]], _cache(tmp_path), captured
-        )
+        acknowledge_switch_deliveries([note], _cache(tmp_path), captured)
         assert {pair[0] for pair in _delivered(tmp_path)} == {"showSuggestions"}, (
-            "the untouched switch's ack stays valid through the ABA"
-        )
-        acknowledge_switch_deliveries(
-            [notes["enabled"]], _cache(tmp_path), captured
-        )
-        assert {pair[0] for pair in _delivered(tmp_path)} == {"showSuggestions"}, (
-            "the pre-fix note of the fixed switch stays rejected"
+            "the pending ack stays valid across an off load"
         )
 
 
-def test_stale_ack_for_the_other_switch_stays_accepted(tmp_path, capsys, caplog):
+def test_stale_ack_rejected_after_rebreak(tmp_path, capsys, caplog):
+    """The pre-fix note at its old generation stays rejected after a re-break."""
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        off = _load(tmp_path, {"showSuggestions": False})
+        note = _switch_notes(off)[0]
+        captured = dict(off.switch_generations)
+
+        _load(tmp_path, {"showSuggestions": True})
+        rebroken = _load(tmp_path, {"showSuggestions": False})
+        assert _switch_notes(rebroken) == (note,)
+
+        acknowledge_switch_deliveries([note], _cache(tmp_path), captured)
+        assert _delivered(tmp_path) == set(), (
+            "the pre-fix note at its old generation stays rejected"
+        )
+
+
+def test_ack_stays_valid_across_an_off_load(tmp_path, capsys, caplog):
     """Round 4 P2: an ack for a switch whose seen set was untouched is accepted.
 
-    Fixing one switch drops only its own sets; the other switch's pending ack
-    is still in its seen set and lands in delivered normally.
+    An ``enabled: false`` load leaves the ``showSuggestions`` sets untouched,
+    so its pending ack is still in the seen set and lands in delivered
+    normally.
     """
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        notes = _switch_notes(both)
-        assert {note.split(":", 1)[0] for note in notes} == {"enabled", "showSuggestions"}
-        show_note = next(note for note in notes if note.startswith("showSuggestions: "))
+        off = _load(tmp_path, {"showSuggestions": False})
+        note = _switch_notes(off)[0]
 
-        _load(tmp_path, {"enabled": True, "showSuggestions": False})
-        acknowledge_switch_deliveries([show_note], _cache(tmp_path), both.switch_generations)
+        _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        acknowledge_switch_deliveries([note], _cache(tmp_path), off.switch_generations)
         delivered = _delivered(tmp_path)
         assert {pair[0] for pair in delivered} == {"showSuggestions"}, (
             "the untouched switch's ack stays valid"
         )
-        after = _load(tmp_path, {"enabled": True, "showSuggestions": False})
+        after = _load(tmp_path, {"showSuggestions": False})
         assert switch_warning_messages(after) == ()
 
 
-@pytest.mark.parametrize("fixed", ["enabled", "showSuggestions"])
-def test_fixing_one_switch_keeps_the_other_delivered_through_delivery(
-    tmp_path, capsys, caplog, fixed
+def test_fix_drops_delivered_and_rebreak_delivers_again_through_delivery(
+    tmp_path, capsys, caplog
 ):
-    """Round 4 gap, parameterized over both switch directions in round 5:
-    reciprocal delivered-side fix, exercised through delivery.
+    """Round 4 gap: delivered-side fix, exercised through delivery.
 
-    Both warnings delivered and acknowledged; fixing one switch drops only its
-    delivered set, so on re-break it delivers again while the other switch's
-    delivered suppression survives a full load + message pass (no stale ack
-    involved: the healthy ack for the re-broken switch lands normally).
+    The warning is delivered and acknowledged; fixing the switch drops its
+    delivered set, so on re-break it delivers again through a full load +
+    message pass, and the re-broken switch's own ack lands normally and
+    suppresses again.
     """
-    other = "showSuggestions" if fixed == "enabled" else "enabled"
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        off = _load(tmp_path, {"showSuggestions": False})
         acknowledge_switch_deliveries(
-            [message["content"] for message in switch_warning_messages(both)],
+            [message["content"] for message in switch_warning_messages(off)],
             _cache(tmp_path),
-            both.switch_generations,
+            off.switch_generations,
         )
-        assert len(_delivered(tmp_path)) == 2
-        assert switch_warning_messages(_load(tmp_path, {"enabled": False, "showSuggestions": False})) == ()
+        assert len(_delivered(tmp_path)) == 1
+        assert switch_warning_messages(_load(tmp_path, {"showSuggestions": False})) == ()
 
-        _load(tmp_path, {fixed: True, other: False})
-        assert {pair[0] for pair in _delivered(tmp_path)} == {other}
+        _load(tmp_path, {"showSuggestions": True})
+        assert _delivered(tmp_path) == set()
 
         capsys.readouterr()
         caplog.clear()
-        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == [fixed]
+        rebroken = _load(tmp_path, {"showSuggestions": False})
+        assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == ["showSuggestions"]
         assert switch_warning_messages(rebroken) == (
             {"role": "system", "content": _switch_notes(rebroken)[0]},
         )
@@ -507,7 +536,7 @@ def test_fixing_one_switch_keeps_the_other_delivered_through_delivery(
             _cache(tmp_path),
             rebroken.switch_generations,
         )
-        settled = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        settled = _load(tmp_path, {"showSuggestions": False})
         assert switch_warning_messages(settled) == ()
 
 
@@ -517,7 +546,7 @@ def test_empty_cache_path_suppresses_via_default_location(
     """Round 3 P2: cachePath='' still suppresses once per value, across restart."""
     monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-    settings = {"enabled": False, "cachePath": "", "suggestionsPath": ""}
+    settings = {"showSuggestions": False, "cachePath": "", "suggestionsPath": ""}
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
         first = load(settings)
         assert len(_switch_notes(first)) == 1
@@ -544,26 +573,24 @@ def _generations(tmp_path):
     return dict(data.get("generations") or {}) if isinstance(data, dict) else {}
 
 
-@pytest.mark.parametrize("fixed,other", [("enabled", "showSuggestions"), ("showSuggestions", "enabled")])
 def test_concurrent_fix_load_cannot_be_overwritten_by_paused_ack(
-    tmp_path, capsys, caplog, monkeypatch, fixed, other
+    tmp_path, capsys, caplog, monkeypatch
 ):
     """Round 6 P2: the ack's read-modify-write is serialized with the fix load.
 
     Barrier-scheduled interleaving: the ack thread pauses between its read
-    and its write (inside the write hook), while a fix load for *fixed*
-    runs. After the fix, the ack must not restore the pre-fix snapshot:
-    the fixed switch's sets stay dropped (so a re-break warns again), its
-    generation stays bumped, and the sibling's sets and pending ack are
-    preserved. The on-time ack of the sibling still lands afterwards.
+    and its write (inside the write hook), while a fix load runs. After the
+    fix, the ack must not restore the pre-fix snapshot: the switch's sets
+    stay dropped (so a re-break warns again) and its generation stays
+    bumped.
     """
     import threading
 
+    fixed = "showSuggestions"
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        both = _load(tmp_path, {"enabled": False, "showSuggestions": False})
-        notes = {note.split(":", 1)[0]: note for note in _switch_notes(both)}
-        assert set(notes) == {"enabled", "showSuggestions"}
-        captured = dict(both.switch_generations)
+        off = _load(tmp_path, {"showSuggestions": False})
+        note = _switch_notes(off)[0]
+        captured = dict(off.switch_generations)
         capsys.readouterr()
         caplog.clear()
 
@@ -582,14 +609,14 @@ def test_concurrent_fix_load_cannot_be_overwritten_by_paused_ack(
         monkeypatch.setattr(config_module, "_write_switch_seen", hooked_write)
         ack_thread = threading.Thread(
             target=lambda: acknowledge_switch_deliveries(
-                [notes[fixed]], _cache(tmp_path), captured
+                [note], _cache(tmp_path), captured
             )
         )
         ack_thread.start()
         assert paused.wait(10), "the ack must reach its write"
 
         fix_thread = threading.Thread(
-            target=lambda: _load(tmp_path, {fixed: True, other: False})
+            target=lambda: _load(tmp_path, {fixed: True})
         )
         fix_thread.start()
         # The fix load must serialize behind the paused ack, not interleave.
@@ -602,30 +629,26 @@ def test_concurrent_fix_load_cannot_be_overwritten_by_paused_ack(
         fix_thread.join(10)
         assert not ack_thread.is_alive() and not fix_thread.is_alive()
 
-        # The fix survived: the fixed switch's sets are dropped and its
-        # generation bumped; the sibling's seen set is untouched.
-        assert {pair[0] for pair in _seen(tmp_path)} == {other}, (
+        # The fix survived: the switch's sets are dropped and its
+        # generation bumped.
+        assert _seen(tmp_path) == set(), (
             "the paused ack must not restore the fixed switch's seen set"
         )
         assert _generations(tmp_path).get(fixed, 0) == captured.get(fixed, 0) + 1, (
             "the fix's generation bump must survive the interleaving"
         )
-        # The sibling's on-time ack still lands and suppresses delivery.
-        acknowledge_switch_deliveries([notes[other]], _cache(tmp_path), captured)
-        assert {pair[0] for pair in _delivered(tmp_path)} == {other}
         # A re-break of the fixed switch warns and delivers again.
         monkeypatch.setattr(config_module, "_write_switch_seen", original_write)
         capsys.readouterr()
         caplog.clear()
-        rebroken = _load(tmp_path, {"enabled": False, "showSuggestions": False})
+        rebroken = _load(tmp_path, {"showSuggestions": False})
         assert [note.split(":", 1)[0] for note in _switch_notes(rebroken)] == [fixed]
         assert switch_warning_messages(rebroken) == (
             {"role": "system", "content": _switch_notes(rebroken)[0]},
         )
 
 
-@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
-def test_old_switches_file_without_generations_key(tmp_path, capsys, caplog, switch):
+def test_old_switches_file_without_generations_key(tmp_path, capsys, caplog):
     """Round 6 coverage: a schema-1 file written before generations existed.
 
     Seen and delivered are present but the generations key is absent. The
@@ -633,6 +656,7 @@ def test_old_switches_file_without_generations_key(tmp_path, capsys, caplog, swi
     suppressed pre-fix, a fix bumps to generation one, and the pre-fix
     captured ack (generation zero) is then rejected after the re-break.
     """
+    switch = "showSuggestions"
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
         off = _load(tmp_path, {switch: False})
         notes = _switch_notes(off)
@@ -671,10 +695,10 @@ def test_old_switches_file_without_generations_key(tmp_path, capsys, caplog, swi
         )
 
 
-@pytest.mark.parametrize("switch", ["enabled", "showSuggestions"])
 def test_many_fix_rebreak_cycles_replayed_stale_acks_never_consume(
-    tmp_path, capsys, caplog, switch
+    tmp_path, capsys, caplog
 ):
+    switch = "showSuggestions"
     """Round 6 coverage: repeated fix/rebreak cycles past the old TLA bound.
 
     Six cycles, each capturing the pending note and generation, fixing,
@@ -812,12 +836,12 @@ def test_cross_process_first_use_state_lock_serializes(tmp_path, precreate, monk
 def test_cross_process_first_use_loads_write_both_switches(tmp_path, precreate, monkeypatch):
     """Round 7 P2: two simultaneous first-use switch loads serialize.
 
-    Both processes load with both switches off, released together
+    Both processes load with the display switch off, released together
     with the directory initially absent (or, when *precreate*,
     existing). The written seen file must be one whole record
-    carrying both switches' entries, never a torn interleave of
-    two direct writes. Repeated so a race that needs overlap
-    shows up.
+    carrying the switch entry, never a torn interleave of two direct
+    writes, and no ``enabled`` entry appears (D2: the off path writes
+    nothing). Repeated so a race that needs overlap shows up.
     """
     monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
     monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
@@ -827,7 +851,7 @@ def test_cross_process_first_use_loads_write_both_switches(tmp_path, precreate, 
             absent.mkdir(parents=True)
         cache_path = str(absent / "index.json")
         suggestions_path = str(absent / "suggestions.json")
-        settings = {"enabled": False, "showSuggestions": False}
+        settings = {"showSuggestions": False}
         _run_two_first_use_processes(
             _first_use_load_worker,
             (settings, cache_path, suggestions_path),
@@ -836,8 +860,8 @@ def test_cross_process_first_use_loads_write_both_switches(tmp_path, precreate, 
         seen_file = absent / "config-switches.json"
         data = json.loads(seen_file.read_text(encoding="utf-8"))
         switches = {pair[0] for pair in data["seen"]}
-        assert switches == {"enabled", "showSuggestions"}, (
-            f"iteration {iteration}: both first-use effects must survive, got {data!r}"
+        assert switches == {"showSuggestions"}, (
+            f"iteration {iteration}: the first-use effect must survive, got {data!r}"
         )
 
 
@@ -894,7 +918,7 @@ def test_directory_that_cannot_be_created_stays_fail_open(tmp_path, capsys, capl
         "cachePath": cache_path,
     }
     with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
-        cfg = load({**assignments, "enabled": False})
+        cfg = load({**assignments, "showSuggestions": False})
     assert len(_switch_notes(cfg)) == 1, "the warning still shows under fail-open"
     # The ack is fail-open too: it never raises and writes nothing.
     acknowledge_switch_deliveries(
@@ -958,10 +982,10 @@ def _competitor_fix_rebreak_worker(cache_path, suggestions_path, switch, other, 
     )
 
 
-@pytest.mark.parametrize("switch,other", [("enabled", "showSuggestions"), ("showSuggestions", "enabled")])
 def test_first_use_healthy_load_cannot_clobber_competitor_generation(
-    tmp_path, monkeypatch, switch, other
+    tmp_path, monkeypatch
 ):
+    switch, other = "showSuggestions", "enabled"
     """Round 8 F2: no-lock healthy load must not write a stale snapshot.
 
     Schedule: the healthy child's directory open fails ENOENT (the
@@ -1059,13 +1083,13 @@ def test_first_use_healthy_load_shared_trap_directory(tmp_path, monkeypatch):
     try:
         assert open_attempted.wait(timeout=20), "the healthy child must attempt its lock-open"
         config_module.acknowledge_trap_notes([trap1], suggestions_path)
-        first = load({"suggestionsPath": suggestions_path, "cachePath": cache_path, "enabled": False})
+        first = load({"suggestionsPath": suggestions_path, "cachePath": cache_path, "showSuggestions": False})
         assert len(_switch_notes(first)) == 1
         first_writer_done.set()
         assert paused.wait(timeout=20), "the healthy child must pause before its write"
         competitor = ctx.Process(
             target=_competitor_fix_rebreak_worker,
-            args=(cache_path, suggestions_path, "enabled", "showSuggestions", str(competitor_out)),
+            args=(cache_path, suggestions_path, "showSuggestions", "enabled", str(competitor_out)),
         )
         competitor.start()
         competitor.join(timeout=20)
@@ -1084,6 +1108,6 @@ def test_first_use_healthy_load_shared_trap_directory(tmp_path, monkeypatch):
     assert {pair[0] for pair in traps_data["seen"]} == {"embedModelId", "rerankModel"}, (
         f"both trap fingerprints must survive, got {traps_data!r}"
     )
-    assert _generations(absent).get("enabled") == 2, (
+    assert _generations(absent).get("showSuggestions") == 2, (
         f"the healthy fix must bump the generation to 2, got {_generations(absent)!r}"
     )

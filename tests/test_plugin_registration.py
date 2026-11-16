@@ -469,8 +469,8 @@ def test_dispatcher_slices_the_keyword_set_for_a_narrow_callback(hermes, monkeyp
     assert result.changed is True
 
 
-def test_disabled_callback_injects_the_switch_warning_without_routing(plugin_module, monkeypatch):
-    """A disabled plugin never routes, but the model still gets one warning naming the switch."""
+def test_disabled_callback_returns_none_and_injects_no_message(plugin_module, monkeypatch):
+    """D2: a disabled plugin never routes and injects no warning; it returns None."""
     ctx = RecordingContext({"enabled": False})
     plugin_module.register(ctx)
     _kind, callback = ctx.middleware[0]
@@ -482,12 +482,11 @@ def test_disabled_callback_injects_the_switch_warning_without_routing(plugin_mod
     request = {"messages": [{"role": "user", "content": "route me"}]}
     result = callback(request=request, **DISPATCH_KWARGS)
 
+    assert result is None
     assert seen == []
-    messages = result["request"]["messages"]
-    assert len(messages) == 2
-    assert messages[0] == request["messages"][0]
-    assert messages[-1]["role"] == "system"
-    assert "enabled" in messages[-1]["content"] and " is off; " in messages[-1]["content"]
+    assert request == {"messages": [{"role": "user", "content": "route me"}]}, (
+        "the off path must not mutate the request"
+    )
 
 
 def test_callback_returns_none_when_it_raises_internally(plugin_module, monkeypatch):
