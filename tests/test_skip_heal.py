@@ -136,9 +136,17 @@ def _host_seams(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def heal_spy(no_live_heal, plugin_module, monkeypatch):
-    """Replace the C6 entry point in every copy with one recorder, and forget old attempts."""
+def heal_spy(no_live_heal, plugin_module, monkeypatch, tmp_path):
+    """Replace the C6 entry point in every copy with one recorder, and forget old attempts.
+
+    The session source is isolated to a missing file under the test's
+    tmp_path, so no source revisions exist: the C8 bootstrap (an in-memory
+    finished heal plus outstanding revisions, M1) stays off and the counts
+    below prove heal-once (C4) alone, rather than conflating a learning
+    scan, which shares the recorder entry point, with a second heal.
+    """
     spy = HealSpy()
+    no_source = str(tmp_path / "no-source.db")
     for module_name, module in list(sys.modules.items()):
         if not module_name.endswith("associations"):
             continue
@@ -146,6 +154,8 @@ def heal_spy(no_live_heal, plugin_module, monkeypatch):
             monkeypatch.setattr(module, "heal_store", functools.partial(spy.record, module_name))
         if hasattr(module, "reset_heal_state"):
             module.reset_heal_state()
+        if hasattr(module, "default_state_db_path"):
+            monkeypatch.setattr(module, "default_state_db_path", lambda: no_source)
     return spy
 
 

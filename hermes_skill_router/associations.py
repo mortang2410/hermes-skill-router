@@ -2539,6 +2539,17 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
     one-attempt rule (C2) still gates the heal, never this bootstrap, so
     a first heal that settled empty or failed cannot trap later data.
     An unsettled zero-watermark store is still the heal's to scan.
+
+    The persisted flag is consulted on the opened store before it closes.
+    The in-memory latch is read only after that close, in its own brief
+    :data:`_HEAL_LOCK` scope (via :func:`heal_state`, which holds the lock
+    only to copy one dict value), and never while holding the store handle
+    or another lock: callers such as :func:`request_learning_scan` invoke
+    this check before acquiring :data:`_HEAL_LOCK`, so reading the latch
+    here cannot nest the non-reentrant lock and cannot deadlock against the
+    heal thread's settle, which takes the same lock only to assign the
+    finished state. Only ``finished`` counts as settled; ``running`` and
+    ``None`` stay heal-owned.
     """
     path = os.path.expanduser(store_path)
     try:
@@ -2558,6 +2569,15 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
         return False
     finally:
         store.close()
+    if watermark <= 0 and not settled:
+        # Zero-watermark bootstrap also honours the in-memory finished latch:
+        # _run_heal records it even when the flag write failed transiently,
+        # and a thread-start failure records it without any heal pass. Both
+        # leave heal gated (C2) but must not trap later source data; an
+        # unsettled (None/running) first heal stays heal-owned.
+        settled = heal_state(store_path) == _HEAL_FINISHED or (
+            path != store_path and heal_state(path) == _HEAL_FINISHED
+        )
     if watermark <= 0 and not settled:
         return False
     try:

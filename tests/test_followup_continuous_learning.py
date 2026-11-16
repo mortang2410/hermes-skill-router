@@ -604,6 +604,117 @@ def test_an_empty_heal_then_a_new_session_bootstraps_learning(hermes, tmp_path):
     )
 
 
+def test_an_in_memory_finished_heal_after_a_failed_flag_write_bootstraps_learning(
+    hermes, tmp_path, monkeypatch
+):
+    """M1: first heal settles empty but its finished-flag write fails transiently.
+
+    ``_run_heal`` still records the attempt as finished in memory, so
+    ``request_heal`` refuses the latch; once writes recover and source data
+    arrives in the same process, ``learning_behind`` must still bootstrap.
+    The failure is fail-once (same-process recovery), not a restart.
+    """
+    store_path = tmp_path / "bootstrap-memory-flag.db"
+    real_write = associations_module._write_heal_finished
+    attempts = {"n": 0}
+
+    def flaky_write(store):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise sqlite3.Error("finished flag write failed (transient)")
+        return real_write(store)
+
+    monkeypatch.setattr(associations_module, "_write_heal_finished", flaky_write)
+
+    # First heal settles against an empty source via _run_heal, so the
+    # in-memory latch is finished even though no flag was persisted.
+    associations_module._run_heal(
+        associations_module.heal_store,
+        str(store_path),
+        str(hermes.path),
+        catalog=CATALOG,
+        now_ms=T0 + 10 * DAY,
+    )
+    assert attempts["n"] == 1
+    assert _watermark(store_path) == "0"
+    assert _finished_flag(store_path) is None, "the failed flag write was persisted"
+    assert associations_module.heal_state(str(store_path)) == "finished"
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the in-memory finished latch no longer gates the heal"
+    )
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "a settled empty store with no source data is behind"
+    )
+
+    _add_session(hermes, "s-new", T0)
+    assert _finished_flag(store_path) is None
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "an in-memory-finished zero-watermark store ignored a new session"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-new"}, "the bootstrapped scan did not ingest the new session"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a follow-up turn started another scan after the bootstrap ingest"
+    )
+
+
+def test_a_thread_start_failure_latch_bootstraps_learning(hermes, tmp_path, monkeypatch):
+    """M1: a thread that cannot start settles the heal in memory only,
+    and later data must still bootstrap.
+
+    The same store with data is asserted unsettled (heal-owned) before the
+    failure and settled (learning-owned) after it: the contrast isolates the
+    in-memory latch as the bootstrap signal.
+    """
+    store_path = tmp_path / "bootstrap-memory-thread.db"
+    store = associations_module.open_store(str(store_path))
+    store.close()
+    _add_session(hermes, "s-new", T0)
+    assert _watermark(store_path) == "0"
+    assert _finished_flag(store_path) is None
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "an unsettled zero-watermark store is not the heal's bootstrap"
+    )
+
+    real_start = threading.Thread.start
+    attempts = {"n": 0}
+
+    def flaky_start(self):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("cannot start heal thread (transient)")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the thread-start failure must refuse the heal launch"
+    )
+    assert associations_module.heal_state(str(store_path)) == "finished"
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the in-memory finished latch no longer gates the heal"
+    )
+    assert _finished_flag(store_path) is None
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "a thread-start-failure latch ignored later data"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-new"}, "the bootstrapped scan did not ingest the new session"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+
+
 def test_a_failed_first_heal_then_recovery_bootstraps_learning(hermes, tmp_path):
     """F1: a first heal whose pass failed (watermark 0) must not trap learning."""
     store_path = tmp_path / "bootstrap-failed.db"
@@ -791,15 +902,35 @@ while time.monotonic() < deadline:
 '''
 
 
-def _kill_scan_midflight(tmp_path: Path, hermes, store_path: Path) -> None:
+_NEVER_READY_DRIVER = '''\
+import sys
+import time
+
+deadline = time.monotonic() + 300
+while time.monotonic() < deadline:
+    time.sleep(0.05)
+'''
+
+
+def _kill_scan_midflight(
+    tmp_path: Path,
+    hermes,
+    store_path: Path,
+    *,
+    readiness_timeout: float = 20.0,
+    driver_source: str = _CHILD_DRIVER,
+    _proc_holder: Optional[dict] = None,
+) -> None:
     """Start a real scan in a subprocess, pause it after its first session
     commits, and SIGKILL it. Asserts the persisted watermark was not advanced.
-    Bounded: a 20 s readiness wait, a 10 s kill wait, and a file-count cap.
+    Bounded: a 20 s readiness wait, a 10 s kill wait (repeated as a
+    kill-if-running plus bounded wait inside ``finally``, so a readiness
+    failure cannot orphan the child), and a file-count cap.
     """
     ready = tmp_path / "child-ready"
     go = tmp_path / "child-go"
     driver = tmp_path / "kill_child.py"
-    driver.write_text(_CHILD_DRIVER)
+    driver.write_text(driver_source)
     driver_argv = [
         sys.executable,
         "-B",
@@ -820,8 +951,10 @@ def _kill_scan_midflight(tmp_path: Path, hermes, store_path: Path) -> None:
     except Exception:
         log.close()
         raise
+    if _proc_holder is not None:
+        _proc_holder["proc"] = proc
     try:
-        deadline = time.monotonic() + 20.0
+        deadline = time.monotonic() + readiness_timeout
         while time.monotonic() < deadline and not ready.exists():
             if proc.poll() is not None:
                 break
@@ -830,7 +963,16 @@ def _kill_scan_midflight(tmp_path: Path, hermes, store_path: Path) -> None:
         proc.kill()
         rc = proc.wait(timeout=10.0)
     finally:
-        log.close()
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10.0)
+        finally:
+            log.close()
     assert rc == -9, f"the child was not killed (rc={rc})"
     assert len(list(tmp_path.rglob("*"))) < 200, "the kill probe created too many files"
 
@@ -916,3 +1058,30 @@ def test_restart_killing_an_inflight_scan_retries_with_a_late_arrival(hermes, tm
     finally:
         store.close()
     assert associations_module.learning_behind(str(store_path)) is False
+
+
+def test_readiness_failure_reaps_the_child(hermes, tmp_path):
+    """M2: a child that never signals ready is still killed and waited for.
+
+    Uses the same tmp_path hygiene as the kill tests: the never-ready driver
+    mirrors the normal driver's 300 s loop, the readiness wait is short
+    (2 s), and the probe asserts the subprocess handle is reaped (poll is
+    not None) after the helper raises, so no orphan can race tmp cleanup.
+    """
+    _add_session(hermes, "s-first", T0)
+    store_path = tmp_path / "kill-never.db"
+    _scan(store_path, hermes)
+    holder = {}
+    with pytest.raises(AssertionError, match="never paused"):
+        _kill_scan_midflight(
+            tmp_path,
+            hermes,
+            store_path,
+            readiness_timeout=2.0,
+            driver_source=_NEVER_READY_DRIVER,
+            _proc_holder=holder,
+        )
+    proc = holder.get("proc")
+    assert proc is not None, "the helper exposed no child handle for the reaping check"
+    assert proc.poll() is not None, "the never-ready child was left alive after the failure"
+    assert len(list(tmp_path.rglob("*"))) < 200, "the readiness probe created too many files"
