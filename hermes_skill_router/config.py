@@ -84,6 +84,11 @@ FUSION_MODES = ("live", "shadow", "cosine")
 #: the opt-in value lets the one-shot header allow creating and editing skills.
 ONE_SHOT_MODES = ("oneshot_no_create_skill", "oneshot_can_create_skill")
 
+#: The curation modes. ``default_curation`` leaves the curator fork's full catalog
+#: untouched; ``delta_curation`` narrows it to skills changed since the last
+#: curation (contract C4).
+CURATION_MODES = ("default_curation", "delta_curation")
+
 _KIND_LABELS = {
     "bool": "boolean",
     "int": "integer",
@@ -95,6 +100,7 @@ _KIND_LABELS = {
     "provider": "provider name",
     "fusion_mode": "fusion mode (live, shadow or cosine)",
     "one_shot_mode": "one-shot mode (oneshot_no_create_skill or oneshot_can_create_skill)",
+    "curation_mode": "curation mode (default_curation or delta_curation)",
     "url": "endpoint URL",
 }
 
@@ -160,6 +166,9 @@ _SPECS: Tuple[_Spec, ...] = (
     # One-shot skill-creation rule: the no-create default keeps Hermes' rule,
     # the opt-in value lets the one-shot header allow creating and editing skills.
     _Spec("oneShotMode", "one_shot_mode", "one_shot_mode", "oneshot_no_create_skill"),
+    # Curator narrowing: default leaves the fork's full catalog untouched,
+    # the opt-in value narrows both candidate surfaces to the delta set (C4).
+    _Spec("curation", "curation_mode", "curation_mode", "default_curation"),
 )
 
 #: Manifest key -> default value.
@@ -238,6 +247,7 @@ class Config:
     deferred_skills: Tuple[str, ...]
     notes: Tuple[str, ...]
     one_shot_mode: str = "oneshot_no_create_skill"
+    curation_mode: str = "default_curation"
     trap_notes: Tuple[str, ...] = ()
     switch_message_notes: Tuple[str, ...] = ()
     switch_generations: Dict[str, int] = field(default_factory=dict)
@@ -415,6 +425,10 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
         return _invalid(spec, value, notes)
     if kind == "one_shot_mode":
         if isinstance(value, str) and value.strip().lower() in ONE_SHOT_MODES:
+            return value.strip().lower()
+        return _invalid(spec, value, notes)
+    if kind == "curation_mode":
+        if isinstance(value, str) and value.strip().lower() in CURATION_MODES:
             return value.strip().lower()
         return _invalid(spec, value, notes)
     if kind == "url":

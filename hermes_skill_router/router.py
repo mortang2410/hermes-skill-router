@@ -118,7 +118,8 @@ from .search import (
 from .select import Suggestion, select
 from .setup_check import BUNDLED_BASES, check_setup_state, setup_note
 from .tools import skill_path
-from .writeback import admit_block, derive_origin, generation, stored_blocks
+from .writeback import ORIGIN_CURATOR, admit_block, derive_origin, generation, stored_blocks
+from .curator import curator_rewrite
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +268,12 @@ def _compose(
         _log_once("unsupported api mode")
         return None
     messages = payload.get("messages")
+    # C4: the curator branch runs before any strip or route. Default mode
+    # returns the payload unmodified; delta mode narrows both candidate
+    # surfaces or fails open. Never a record, never embed/rerank.
+    origin = derive_origin(platform, messages)
+    if origin == ORIGIN_CURATOR:
+        return curator_rewrite(payload, cfg, messages)
     if _already_injected(messages):
         # The previous turn's block is the last message; injecting again would compound it.
         return None
@@ -292,7 +299,6 @@ def _compose(
     # request re-inserts. Re-insertion replays only same-origin,
     # same-generation blocks, deduped by byte search, on every outgoing
     # request regardless of routing success.
-    origin = derive_origin(platform, messages)
     store_key = session_id or task_id or ""
     stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
     base_messages = _reinsert(stripped.get("messages") or (), stored)

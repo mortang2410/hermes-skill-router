@@ -39,6 +39,7 @@ SPEC_DEFAULTS = {
         "actually need to carry out the current task correctly. Skill: "
     ),
     "deferredSkills": (),
+    "curation": "default_curation",
     "rerankTimeoutMs": 20000,
     "routingTimeoutMs": 30000,
     "shortlistSize": 50,
@@ -127,6 +128,7 @@ CONFIG_FIELDS = {
     "document_prefix",
     "eager_skills",
     "deferred_skills",
+    "curation_mode",
     "notes",
     "trap_notes",
     "switch_message_notes",

@@ -164,3 +164,8 @@ config_schema:
     default: oneshot_no_create_skill
     values: [oneshot_no_create_skill, oneshot_can_create_skill]
     description: "One-shot skill-creation rule. oneshot_no_create_skill keeps the no-create rule of the default Hermes one-shot prompt; oneshot_can_create_skill lets the one-shot header allow creating and editing skills. Unknown values render no-create."
+  curation:
+    type: str
+    default: default_curation
+    values: [default_curation, delta_curation]
+    description: "Curator narrowing. default_curation leaves the curator fork's full catalog untouched; delta_curation narrows its system catalog and upstream candidate list to skills changed since the last curation, failing open on any read failure."
