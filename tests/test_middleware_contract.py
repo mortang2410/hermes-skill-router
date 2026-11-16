@@ -731,3 +731,89 @@ def test_the_callback_tolerates_the_full_keyword_set(plugin_module, endpoints, t
 
     assert parameters[0].name == "request"
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
+# ---------------------------------------------------------------------------
+# C3 (ticket 03): review forks route through the normal rewrite path.
+# ---------------------------------------------------------------------------
+
+
+def _review_payload(tool_names=("skill_manage", "skill_view", "skills_list")):
+    payload = chat_payload()
+    payload["tools"] = [
+        {"type": "function", "function": {"name": name}} for name in tool_names
+    ]
+    payload["messages"][-1] = {
+        "role": "user",
+        "content": "Review the conversation above and extract durable memory.",
+    }
+    return payload
+
+
+def _review_kwargs(session, task):
+    # A fresh session/task per test: dumped() records persist in the plugin's search
+    # module copy, so sharing session-1 with the file's earlier tests would inherit
+    # a dumped window from a failure-path test.
+    return {**DISPATCH_KWARGS, "session_id": session, "task_id": task}
+
+
+def test_a_review_shaped_request_routes_and_keeps_its_tools(plugin_module, endpoints, tmp_path):
+    """A review fork runs the normal path: block admitted under origin review, tools untouched."""
+    from hermes_skill_router import writeback as wb
+
+    callback = _callback_for(plugin_module, settings_for(endpoints, tmp_path / "suggestions.json"))
+    payload = _review_payload()
+    kwargs = _review_kwargs("session-review-1", "task-review-1")
+
+    result = callback(request=payload, **kwargs)
+
+    assert set(result) == {"request"}
+    rewritten = result["request"]
+    assert rewritten["tools"] == payload["tools"], "the plugin never removes skill tools"
+    assert rewritten["messages"][-1]["role"] == "system"
+    gen = wb.generation("session-review-1", None)
+    stored = wb.stored_blocks("session-review-1", wb.ORIGIN_REVIEW, gen, None)
+    assert [block for _index, block in stored] == [rewritten["messages"][-1]["content"]]
+
+
+def test_prior_review_blocks_reinsert_and_suppress_without_carrying_them(
+    plugin_module, endpoints, tmp_path
+):
+    """The fork's earlier block is too old for the digest tail: the origin store carries it.
+
+    Turn 2's payload does not carry turn 1's block (the routed fork replays a digest),
+    yet the block re-inserts byte-identical and its names stay suppressed.
+    """
+    callback = _callback_for(plugin_module, settings_for(endpoints, tmp_path / "suggestions.json"))
+    kwargs = _review_kwargs("session-review-2", "task-review-2")
+
+    first = callback(request=_review_payload(), **kwargs)
+    block = first["request"]["messages"][-1]["content"]
+    assert "- beta:" in block
+
+    second = callback(request=_review_payload(), **kwargs)
+    assert second is not None
+    contents = [message["content"] for message in second["request"]["messages"]]
+    assert block in contents, "the stored review block re-inserts byte-identical"
+    assert sum(content.count("- beta:") for content in contents) == 1, "beta never repeats"
+
+
+def test_a_normal_block_never_reinserts_into_a_review_payload(plugin_module, endpoints, tmp_path):
+    """Re-insertion is same-origin only: the review fork neither reads nor suppresses
+    the parent turn's block (the beta row both turns would render is suggested again,
+    under the review origin in the store)."""
+    from hermes_skill_router import writeback as wb
+
+    callback = _callback_for(plugin_module, settings_for(endpoints, tmp_path / "suggestions.json"))
+    kwargs = _review_kwargs("session-review-3", "task-review-3")
+
+    callback(request=chat_payload(), **kwargs)
+    review = callback(request=_review_payload(), **kwargs)
+
+    session = "session-review-3"
+    gen = wb.generation(session, None)
+    normal_blocks = wb.stored_blocks(session, wb.ORIGIN_NORMAL, gen, None)
+    review_blocks = wb.stored_blocks(session, wb.ORIGIN_REVIEW, gen, None)
+    assert len(normal_blocks) == 1 and len(review_blocks) == 1
+    assert "- beta:" in review_blocks[0][1], "no cross-origin suppression leaked into the fork"
+    assert review["request"]["messages"][-1]["content"] == review_blocks[0][1]

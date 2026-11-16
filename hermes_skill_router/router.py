@@ -445,8 +445,17 @@ def _compose(
     if note.strip() and block == note.strip():
         # The renderer returned the degraded note on its own: no row is shown, so the catalog must
         # stay. The note rides as one standalone system message on the original request, which
-        # keeps the degraded state the provider context would otherwise lose.
+        # keeps the degraded state the provider context would otherwise lose. When the window
+        # already holds admitted blocks, the re-inserted blocks ride with the window's catalog
+        # state unchanged instead (C1, same as the empty-block path above).
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        if stored:
+            return {
+                "request": {
+                    **dict(payload),
+                    "messages": [*base_messages, {"role": "system", "content": block}],
+                }
+            }
         return {
             "request": {
                 **dict(payload),

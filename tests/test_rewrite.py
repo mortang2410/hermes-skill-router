@@ -558,7 +558,12 @@ def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path)
 
     assert result is not None, "every candidate was suppressed, so only the degraded note rides"
     messages = result["request"]["messages"]
-    assert messages[:-1] == before["messages"], "the catalog and the earlier block stay"
+    # The window already stripped the catalog in turn 1, so the note turn keeps the
+    # stripped state with the earlier block re-inserted (C1): no full-catalog re-dump.
+    from hermes_skill_router.catalog import strip_catalog
+
+    stripped, _partition = strip_catalog(second)
+    assert messages[:-1] == list(stripped["messages"]), "the stripped state and earlier block stay"
     assert suggested_names(messages[-1]["content"]) == [], "the note never poses as a suggestion"
     assert "Skills routed for this request" not in messages[-1]["content"]
     assert second == before, "the rewrite never mutates its input"
