@@ -79,8 +79,10 @@ def on_post_compaction(
     would keep that session's catalog dumped forever. A missing, empty or non-string id is nothing
     to do, a repeated id discards an absent mark, and the callback returns ``None`` and never
     raises, so a compaction can never abort a turn. The writeback store lives beside the
-    operator's configured ``cachePath``, so the resolved path is passed in at registration; a
-    directly invoked callback without one falls back to the default config.
+    operator's configured ``cachePath``, which can change while the process keeps running,
+    so the writeback module owns the paths it wrote and expires every one of them;
+    *cache_path* here is only the fallback for a session with no recorded store, and a
+    directly invoked callback falls back to the default config.
     """
     if cache_path is None:
         cache_path = load().cache_path
@@ -141,12 +143,7 @@ def register(ctx: Any) -> None:
 
     ctx.register_middleware("llm_request", on_llm_request)
     register_tools(ctx)
-    cache_path = load(read_settings(ctx)).cache_path
-
-    def _on_post_compaction(**kwargs: Any) -> None:
-        on_post_compaction(cache_path=cache_path, **kwargs)
-
-    ctx.register_hook("post_compaction", _on_post_compaction)
+    ctx.register_hook("post_compaction", on_post_compaction)
     ctx.register_hook("on_session_end", on_session_end)
 
 

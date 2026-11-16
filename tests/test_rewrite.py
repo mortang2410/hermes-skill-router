@@ -11,6 +11,7 @@ query, the scored shortlist, the cutoff, the suggestions and the stage timings.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -25,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from hermes_skill_router import config as hermes_config  # noqa: E402
 from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
@@ -2204,14 +2206,26 @@ def test_writeback_post_compaction_deactivates_rows_and_expires(tmp_path, monkey
 
 
 def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, monkeypatch):
-    """Ticket 01 review fix: the registered hook expires the operator's configured cache.
+    """Ticket 01 review fix: the registered hook expires the store the writes used.
 
     The middleware writes the store beside the configured ``cachePath``; the hook registered
-    through ``register`` must expire that same store, not the default path. A custom cachePath
-    with an admitted block and a fake SessionDB: after the registered callback runs, the row is
-    deactivated, the generation advances, and no window leaks into the default-path store.
+    through ``register`` must expire that same store, not the default path. The conftest
+    override points every store at one temp file and would mask the path, so this test
+    deletes it and re-points the default ``cachePath`` at ``tmp_path``: a custom cachePath
+    with an admitted block and a fake SessionDB, then the registered callback must
+    deactivate the row and advance the generation in the custom store, and write nothing at
+    the default path.
     """
     from hermes_skill_router import writeback as wb
+
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_WRITEBACK", raising=False)
+    default_cache = str(tmp_path / "default" / "index.json")
+    specs = []
+    for spec in hermes_config._SPECS:
+        if spec.key == "cachePath":
+            spec = dataclasses.replace(spec, default=default_cache)
+        specs.append(spec)
+    monkeypatch.setattr(hermes_config, "_SPECS", tuple(specs))
 
     custom_cache = str(tmp_path / "custom" / "index.json")
     payload = _payload()
@@ -2220,11 +2234,11 @@ def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, 
 
     cfg = make_config(tmp_path, cachePath=custom_cache)
     result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        payload, cfg=cfg, session_id="s-registered-hook", embed=FakeEmbedder(), rerank=FakeReranker()
     )
     assert result is not None
     row_id = fake.rows[-1]["id"]
-    assert wb.generation("s1", custom_cache) == 0
+    assert wb.generation("s-registered-hook", custom_cache) == 0
 
     plugin_module = _load_plugin_module()
     ctx = RecordingContext()
@@ -2239,13 +2253,46 @@ def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, 
     plugin_module.register(ctx)
     callback = {name: cb for name, cb in ctx.hooks}["post_compaction"]
 
-    callback(session_id="s1", old_session_id="", kind="summarize", reason="handoff_commit")
+    callback(session_id="s-registered-hook", old_session_id="", kind="summarize", reason="handoff_commit")
     assert fake.deactivated == [row_id]
-    assert wb.generation("s1", custom_cache) == 1
-    default_store = Path.home() / ".cache" / "hermes-skill-router" / "writeback-store.json"
-    if default_store.exists():
-        store = json.loads(default_store.read_text(encoding="utf-8"))
-        assert "s1" not in store.get("windows", {}), "the hook leaked the window into the default store"
+    assert wb.generation("s-registered-hook", custom_cache) == 1
+    assert not (tmp_path / "default" / "writeback-store.json").exists(), "the default store was materialized"
+
+
+def test_the_registered_hook_expires_every_store_a_settings_change_left_behind(tmp_path, monkeypatch):
+    """Review 2 finding 4: a live cachePath change must not orphan the old store.
+
+    The session writes beside path A, the operator changes ``cachePath`` to B, and the
+    session writes again. The registered ``post_compaction`` hook must deactivate both
+    rows and advance both generations: the writeback module expires the stores it wrote,
+    not the store the current setting names.
+    """
+    from hermes_skill_router import writeback as wb
+
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_WRITEBACK", raising=False)
+    cache_a = str(tmp_path / "a" / "index.json")
+    cache_b = str(tmp_path / "b" / "index.json")
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    for cache in (cache_a, cache_b):
+        cfg = make_config(tmp_path, cachePath=cache)
+        result = rewrite(
+            _payload(), cfg=cfg, session_id="s-moved-cache", embed=FakeEmbedder(), rerank=FakeReranker()
+        )
+        assert result is not None
+    row_ids = [row["id"] for row in fake.rows[len(_payload_messages(payload)):]]
+
+    plugin_module = _load_plugin_module()
+    ctx = RecordingContext()
+    plugin_module.register(ctx)
+    callback = {name: cb for name, cb in ctx.hooks}["post_compaction"]
+
+    callback(session_id="s-moved-cache", old_session_id="", kind="summarize", reason="handoff_commit")
+    assert fake.deactivated == row_ids
+    assert wb.generation("s-moved-cache", cache_a) == 1
+    assert wb.generation("s-moved-cache", cache_b) == 1
 
 
 def test_writeback_store_failure_sends_stored_blocks_never_none(tmp_path, monkeypatch):

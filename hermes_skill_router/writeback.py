@@ -60,6 +60,16 @@ STORE_PATH_ENV = "HERMES_SKILL_ROUTER_WRITEBACK"
 _STRIPPED_FALLBACK: Set[Tuple[Optional[str], str]] = set()
 _STRIPPED_LOCK = threading.Lock()
 
+#: In-process record of the cache paths a session has written stores beside
+#: (contract C5 fence): the operator's ``cachePath`` can change between
+#: writes while the plugin process keeps running, and ``post_compaction``
+#: must expire every store the session actually wrote to, not only the store
+#: the current setting names. A path is recorded at ``admit_block`` and
+#: ``mark_stripped`` time, and the record is dropped on ``expire_window`` and
+#: ``forget_session_ids``. Bounded by the sessions that wrote in this
+#: process; keyed by session id alone, the same granularity as the windows.
+_WRITTEN_PATHS: Dict[str, List[Any]] = {}
+
 ORIGIN_NORMAL = "normal"
 ORIGIN_REVIEW = "review"
 ORIGIN_CURATOR = "curator"
@@ -93,6 +103,36 @@ def store_path(cache_path: Any) -> Optional[str]:
         return None
     directory = os.path.dirname(os.path.abspath(os.path.expanduser(cache_path.strip())))
     return os.path.join(directory, STORE_FILENAME)
+
+
+def _record_path(session_id: str, cache_path: Any) -> None:
+    """Remember that *session_id* wrote beside *cache_path*. Never raises."""
+    if not isinstance(cache_path, str) or not cache_path.strip():
+        return
+    with _STRIPPED_LOCK:
+        paths = _WRITTEN_PATHS.setdefault(session_id, [])
+        if cache_path not in paths:
+            paths.append(cache_path)
+
+
+def _take_paths(session_id: str, fallback: Any) -> List[Any]:
+    """Return the recorded paths for *session_id* plus *fallback*, and drop them.
+
+    Paths are deduplicated by resolved store, so a store named by two
+    recorded paths (an env override, a settings change back and forth) is
+    expired once, never twice, and a session with no record falls back to
+    the single configured path.
+    """
+    with _STRIPPED_LOCK:
+        recorded = _WRITTEN_PATHS.pop(session_id, [])
+    paths: List[Any] = []
+    seen: Set[Optional[str]] = set()
+    for candidate in [*recorded, fallback]:
+        resolved = store_path(candidate)
+        if resolved not in seen:
+            seen.add(resolved)
+            paths.append(candidate)
+    return paths
 
 
 def _empty_store() -> Dict[str, Any]:
@@ -164,6 +204,7 @@ def mark_stripped(session_id: str, cache_path: Any) -> None:
     """
     with _STRIPPED_LOCK:
         _STRIPPED_FALLBACK.add((store_path(cache_path), session_id))
+    _record_path(session_id, cache_path)
     try:
         store = _read_store(cache_path)
         _window(store, session_id)["stripped"] = True
@@ -334,6 +375,7 @@ def admit_block(
         return False
     # An empty key is the single-anonymous bucket (search._key's "" fallback):
     # a caller with neither id still gets a window, never a dropped block.
+    _record_path(session_id, cache_path)
     try:
         store = _read_store(cache_path)
         window = _window(store, session_id)
@@ -393,8 +435,17 @@ def expire_window(session_id: str, cache_path: Any) -> None:
     with ``resolve_active_row_id`` (a race append may have been cloned with a
     new id) and the result deactivated with ``deactivate_message``, so no
     plugin block row survives past the close of any window. The store entry
-    expires as the generation advances. Never raises.
+    expires as the generation advances. Every store the session wrote to is
+    expired, not only the one the current setting names (the writeback
+    module owns the paths it wrote); a session with no recorded path falls
+    back to *cache_path*. Never raises.
     """
+    for path in _take_paths(session_id, cache_path):
+        _expire_at(session_id, path)
+
+
+def _expire_at(session_id: str, cache_path: Any) -> None:
+    """Expire the window for *session_id* in the store at *cache_path*."""
     with _STRIPPED_LOCK:
         _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
     try:
@@ -430,6 +481,7 @@ def forget_session_ids(session_id: str, cache_path: Any) -> None:
     """Drop all store state for *session_id* (end of session). Never raises."""
     with _STRIPPED_LOCK:
         _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
+        _WRITTEN_PATHS.pop(session_id, None)
     try:
         store = _read_store(cache_path)
         store["windows"].pop(session_id, None)
