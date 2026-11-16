@@ -904,3 +904,186 @@ def test_directory_that_cannot_be_created_stays_fail_open(tmp_path, capsys, capl
     )
     assert blocker.is_file(), "the blocking file must be left alone"
     assert not (blocker / "config-switches.json").exists()
+
+
+def _healthy_first_use_worker(cache_path, suggestions_path, events):
+    """Healthy load in a child process, paused after its lock-open attempt.
+
+    The first lock entry pauses after the directory open (which fails
+    ENOENT while the directory is absent) and before the state read;
+    a write, or a second lock entry on a retry, pauses again until the
+    competitor has finished. ``events`` is
+    ``(open_attempted, first_writer_done, paused, competitor_done)``.
+    """
+    import contextlib
+
+    open_attempted, first_writer_done, paused, competitor_done = events
+    original_lock = config_module._state_lock
+    original_write = config_module._write_switch_seen
+    lock_entries = [0]
+
+    @contextlib.contextmanager
+    def wrapped_lock(path, create_dir=False):
+        lock_entries[0] += 1
+        entry = lock_entries[0]
+        if entry == 2:
+            paused.set()
+            competitor_done.wait(timeout=20)
+        with original_lock(path, create_dir=create_dir) as held:
+            if entry == 1:
+                open_attempted.set()
+                first_writer_done.wait(timeout=20)
+            yield held
+
+    def wrapped_write(path, seen, delivered=None, generations=None):
+        paused.set()
+        competitor_done.wait(timeout=20)
+        return original_write(path, seen, delivered, generations)
+
+    config_module._state_lock = wrapped_lock
+    config_module._write_switch_seen = wrapped_write
+    load({"suggestionsPath": suggestions_path, "cachePath": cache_path})
+
+
+def _competitor_fix_rebreak_worker(cache_path, suggestions_path, switch, other, out_path):
+    """Fix both switches, then re-break *switch*; record its note/generations."""
+    settings = {"suggestionsPath": suggestions_path, "cachePath": cache_path}
+    load({**settings, "enabled": True, "showSuggestions": True})
+    cfg = load({**settings, switch: False, other: True})
+    notes = _switch_notes(cfg)
+    assert len(notes) == 1
+    Path(out_path).write_text(
+        json.dumps({"note": notes[0], "generations": dict(cfg.switch_generations)}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("switch,other", [("enabled", "showSuggestions"), ("showSuggestions", "enabled")])
+def test_first_use_healthy_load_cannot_clobber_competitor_generation(
+    tmp_path, monkeypatch, switch, other
+):
+    """Round 8 F2: no-lock healthy load must not write a stale snapshot.
+
+    Schedule: the healthy child's directory open fails ENOENT (the
+    directory is absent), so it proceeds thread-lock-only; the first
+    writer then creates the directory and the seen set; the healthy
+    child reads that state and pauses pre-write (or pre-retry); a
+    competitor process fixes and re-breaks, bumping the generation to
+    1 and capturing a note at 1. The healthy child's write must not
+    restore the generation-0 snapshot: the fix it performs on the
+    competitor's state bumps to 2, so the competitor's captured ack
+    (generation 1) stays stale after a fresh re-break.
+    """
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    absent = tmp_path / "absent-first-use"
+    cache_path = str(absent / "index.json")
+    suggestions_path = str(absent / "suggestions.json")
+    open_attempted = ctx.Event()
+    first_writer_done = ctx.Event()
+    paused = ctx.Event()
+    competitor_done = ctx.Event()
+    healthy = ctx.Process(
+        target=_healthy_first_use_worker,
+        args=(cache_path, suggestions_path, (open_attempted, first_writer_done, paused, competitor_done)),
+    )
+    healthy.start()
+    competitor_out = tmp_path / "competitor.json"
+    try:
+        assert open_attempted.wait(timeout=20), "the healthy child must attempt its lock-open"
+        first = load({"suggestionsPath": suggestions_path, "cachePath": cache_path, switch: False})
+        assert len(_switch_notes(first)) == 1
+        first_writer_done.set()
+        assert paused.wait(timeout=20), "the healthy child must pause before its write"
+        competitor = ctx.Process(
+            target=_competitor_fix_rebreak_worker,
+            args=(cache_path, suggestions_path, switch, other, str(competitor_out)),
+        )
+        competitor.start()
+        competitor.join(timeout=20)
+        assert competitor.exitcode == 0
+        competitor_done.set()
+        healthy.join(timeout=20)
+        assert healthy.exitcode == 0
+    finally:
+        first_writer_done.set()
+        competitor_done.set()
+        healthy.join(timeout=20)
+
+    competitor_data = json.loads(competitor_out.read_text(encoding="utf-8"))
+    assert _generations(absent).get(switch) == 2, (
+        "the healthy fix on the competitor state must bump the generation to 2, "
+        f"got {_generations(absent)!r}"
+    )
+    fresh = load({"suggestionsPath": suggestions_path, "cachePath": cache_path, switch: False})
+    acknowledge_switch_deliveries([competitor_data["note"]], cache_path, competitor_data["generations"])
+    assert _delivered(absent) == set(), "the stale generation-1 ack must not land"
+    assert switch_warning_messages(fresh) == (
+        {"role": "system", "content": _switch_notes(fresh)[0]},
+    ), "the stale ack must not suppress the current delivery"
+
+
+def test_first_use_healthy_load_shared_trap_directory(tmp_path, monkeypatch):
+    """Round 8 F2: the same race with traps and switches sharing a directory.
+
+    The traps and switches files live in one initially absent
+    directory. A trap ack creates the directory (the first writer in
+    the schedule), a switch load writes the seen set, and a second
+    trap ack lands while the no-lock healthy child is paused. Both
+    trap fingerprints must survive the healthy child's switch write,
+    and its generation bump must still land on the competitor state.
+    """
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", raising=False)
+    monkeypatch.delenv("HERMES_SKILL_ROUTER_TRAPS_PATH", raising=False)
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    absent = tmp_path / "absent-shared"
+    cache_path = str(absent / "index.json")
+    suggestions_path = str(absent / "suggestions.json")
+    trap1 = "embedModelId: 'a' is not a valid string; using default 'bge-m3'"
+    trap2 = "rerankModel: 'x' is not a valid string; using default 'y'"
+    open_attempted = ctx.Event()
+    first_writer_done = ctx.Event()
+    paused = ctx.Event()
+    competitor_done = ctx.Event()
+    healthy = ctx.Process(
+        target=_healthy_first_use_worker,
+        args=(cache_path, suggestions_path, (open_attempted, first_writer_done, paused, competitor_done)),
+    )
+    healthy.start()
+    competitor_out = tmp_path / "competitor.json"
+    try:
+        assert open_attempted.wait(timeout=20), "the healthy child must attempt its lock-open"
+        config_module.acknowledge_trap_notes([trap1], suggestions_path)
+        first = load({"suggestionsPath": suggestions_path, "cachePath": cache_path, "enabled": False})
+        assert len(_switch_notes(first)) == 1
+        first_writer_done.set()
+        assert paused.wait(timeout=20), "the healthy child must pause before its write"
+        competitor = ctx.Process(
+            target=_competitor_fix_rebreak_worker,
+            args=(cache_path, suggestions_path, "enabled", "showSuggestions", str(competitor_out)),
+        )
+        competitor.start()
+        competitor.join(timeout=20)
+        assert competitor.exitcode == 0
+        config_module.acknowledge_trap_notes([trap2], suggestions_path)
+        competitor_done.set()
+        healthy.join(timeout=20)
+        assert healthy.exitcode == 0
+    finally:
+        first_writer_done.set()
+        competitor_done.set()
+        healthy.join(timeout=20)
+
+    traps_file = absent / "config-traps.json"
+    traps_data = json.loads(traps_file.read_text(encoding="utf-8"))
+    assert {pair[0] for pair in traps_data["seen"]} == {"embedModelId", "rerankModel"}, (
+        f"both trap fingerprints must survive, got {traps_data!r}"
+    )
+    assert _generations(absent).get("enabled") == 2, (
+        f"the healthy fix must bump the generation to 2, got {_generations(absent)!r}"
+    )

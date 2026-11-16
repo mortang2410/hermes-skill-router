@@ -614,7 +614,7 @@ _SWITCH_LOCK_LOCAL = threading.local()
 
 
 @contextmanager
-def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[None]:
+def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[bool]:
     """Hold the process-local lock and, when possible, the cross-process lock.
 
     The cross-process lock is an advisory ``fcntl.flock`` on the state
@@ -647,17 +647,24 @@ def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[None]
     condition. Callers that may write nothing (a healthy no-write
     load) pass ``create_dir=False`` and create nothing: no file and
     no directory.
+
+    Yields whether the cross-process flock is actually held
+    (``True``) or the transaction runs thread-lock-only
+    (``False``). A write-producing caller must not write a snapshot
+    read under ``False`` when the state was discovered after the
+    open attempt: see :func:`_pending_switch_warnings`.
     """
     depth = getattr(_SWITCH_LOCK_LOCAL, "depth", 0)
     if depth:
         _SWITCH_LOCK_LOCAL.depth = depth + 1
         try:
-            yield
+            yield getattr(_SWITCH_LOCK_LOCAL, "flock_held", False)
         finally:
             _SWITCH_LOCK_LOCAL.depth = depth
         return
     _SWITCH_STATE_LOCK.acquire()
     _SWITCH_LOCK_LOCAL.depth = 1
+    _SWITCH_LOCK_LOCAL.flock_held = False
     fd = None
     try:
         if path is not None and fcntl is not None:
@@ -673,6 +680,7 @@ def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[None]
             try:
                 fd = os.open(directory, os.O_RDONLY)
                 fcntl.flock(fd, fcntl.LOCK_EX)
+                _SWITCH_LOCK_LOCAL.flock_held = True
             except OSError:
                 if fd is not None:
                     try:
@@ -680,9 +688,10 @@ def _state_lock(path: Optional[str], create_dir: bool = False) -> Iterator[None]
                     except OSError:
                         pass
                 fd = None
-        yield
+        yield _SWITCH_LOCK_LOCAL.flock_held
     finally:
         _SWITCH_LOCK_LOCAL.depth = 0
+        _SWITCH_LOCK_LOCAL.flock_held = False
         if fd is not None:
             try:
                 if fcntl is not None:
@@ -835,20 +844,52 @@ def _pending_switch_warnings(
         # directory before locking it; a load with nothing offending
         # writes nothing (a fix that clears sets implies the directory
         # already exists), so it creates nothing.
-        with _state_lock(path, create_dir=bool(offending)):
-            return _pending_switch_warnings_locked(offending, fixed, path)
+        #
+        # First-use race (round 8, F2): a no-offending load passes
+        # create_dir=False, so on a first use its directory open can
+        # fail ENOENT and it runs thread-lock-only. If state then
+        # appears (a concurrent writer created the directory and the
+        # file) and this load's fix has something to clear, writing
+        # the snapshot read without the flock could discard a
+        # competitor's update and recycle a generation. So when the
+        # flock is not held and the transaction would write, and the
+        # directory now exists, retry once under the flock and
+        # re-read: the retry never creates the directory itself
+        # (create_dir stays False; the directory already exists), so
+        # a genuinely healthy no-write load still creates no file
+        # and no directory. When the directory still cannot be
+        # opened, the documented fail-open applies.
+        for attempt in range(2):
+            with _state_lock(path, create_dir=bool(offending)) as flock_held:
+                result = _switch_transaction(offending, fixed, path)
+                pending, injected, generations, changed, new_seen, new_delivered = result
+                if changed and not flock_held and attempt == 0:
+                    directory = os.path.dirname(path) or "."
+                    if os.path.isdir(directory):
+                        continue
+                _emit_switch_warnings(pending)
+                if changed:
+                    _write_switch_seen(path, new_seen, new_delivered, generations)
+                return pending, injected, generations
     except Exception:  # load never raises; a failure keeps the warnings visible
         logger.debug("hermes-skill-router config: the switch warnings failed", exc_info=True)
         pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
         return pending, pending, {}
 
 
-def _pending_switch_warnings_locked(
+def _switch_transaction(
     offending: Dict[str, str],
     fixed: Any,
     path: str,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int]]:
-    """Run the switch load/fix read-modify-write; caller holds the state lock."""
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int], bool, Set[Tuple[str, str]], Set[Tuple[str, str]]]:
+    """Compute the switch load/fix read-modify-write without emitting or writing.
+
+    Return ``(pending, injected, generations, changed, new_seen,
+    new_delivered)``: *changed* says whether persisting the new sets
+    and generations is needed. The caller decides whether the lock
+    held justifies writing, so a no-lock first-use attempt never
+    writes a stale snapshot (see :func:`_pending_switch_warnings`).
+    """
     seen_before, delivered_before, generations_before = _read_switch_sets(path)
     generations = dict(generations_before)
     new_seen = set(seen_before)
@@ -879,12 +920,25 @@ def _pending_switch_warnings_locked(
         new_seen.add(pair)
     pending = tuple(pending_list)
     injected = tuple(injected_list)
-    _emit_switch_warnings(pending)
-    if (
+    changed = (
         new_seen != seen_before
         or new_delivered != delivered_before
         or generations != generations_before
-    ):
+    )
+    return pending, injected, generations, changed, new_seen, new_delivered
+
+
+def _pending_switch_warnings_locked(
+    offending: Dict[str, str],
+    fixed: Any,
+    path: str,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int]]:
+    """Run the switch load/fix read-modify-write; caller holds the state lock."""
+    pending, injected, generations, changed, new_seen, new_delivered = _switch_transaction(
+        offending, fixed, path
+    )
+    _emit_switch_warnings(pending)
+    if changed:
         _write_switch_seen(path, new_seen, new_delivered, generations)
     return pending, injected, generations
 
