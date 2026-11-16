@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .catalog import CatalogRows, Partition, strip_catalog
 from .writeback import ORIGIN_CURATOR, derive_origin
+from .writeback import _newest_user_text
 
 logger = logging.getLogger("hermes_skill_router.curator")
 
@@ -67,15 +68,6 @@ CURATOR_BLOCK_HEADER = (
     "Skills changed since the last curation. This is the candidate set "
     "for this review; run skills_list for the full catalog."
 )
-
-
-def is_curator(platform: Any, messages: Any) -> bool:
-    """Return True when *platform* plus prompt shape mark a curator request.
-
-    The platform kwarg is the primary discriminator; the curator prompt
-    shape is the fallback (module M4 detection, never a second rule).
-    """
-    return derive_origin(platform, messages) == ORIGIN_CURATOR
 
 
 def hermes_home() -> str:
@@ -213,27 +205,6 @@ def delta_names(usage: Mapping[str, Mapping[str, Any]], watermark: str) -> List[
         if created is not None and created > boundary:
             names.append(name)
     return names
-
-
-def _newest_user_text(messages: Any) -> Optional[str]:
-    """Return the newest user message's text, or ``None`` when there is none."""
-    if not isinstance(messages, (list, tuple)):
-        return None
-    for message in reversed(list(messages)):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [
-                part.get("text", "")
-                for part in content
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            ]
-            return "\n".join(parts) or None
-        return None
-    return None
 
 
 def is_dry_run(messages: Any) -> bool:

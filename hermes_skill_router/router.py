@@ -24,9 +24,9 @@ The strip is atomic with the injection: a request only loses its skills section 
 block replaces it. Any failure, such as an unreachable or timed-out endpoint, an unbuildable index,
 no user text or an empty block, returns ``None`` on the first failure in a compaction window, and
 ``_apply_request_chain`` then keeps the payload that arrived, catalog included (R5, D8). On a later
-failure in the same window the rewrite strips the catalog and appends one marker message instead,
-so the whole catalog never reaches the model twice in one window. The rewrite never raises and
-never mutates its input.
+failure in the same window the rewrite keeps the full catalog unchanged (catalog mode) or the
+stripped state, so the whole catalog never reaches the model twice in one window; no marker
+message is ever appended. The rewrite never raises and never mutates its input.
 
 Steps 3 and 4 are :func:`hermes_skill_router.search.rank`, the same pass the model's search tool
 runs, so a turn and a search for the same query and catalog can never disagree. The pass hands back
@@ -40,10 +40,10 @@ pass that reaches the end of it is abandoned with one log line naming the budget
 Suppression and the opening flag both come from the payload's own messages, never from module state.
 A message whose content opens with the block's shared first line is a block this plugin injected
 earlier in the compaction window: its suggested names are suppressed, and its presence means this is
-not the window's opening block. A message whose content opens with the dropped marker's first line
-is the proof that the whole catalog already went out in this window, so a later turn strips the
-catalog again and suggests nothing. A compaction that removes both leaves neither, so the names are
-suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
+not the window's opening block. The opening flag and suppression also read the origin store's
+stored blocks, so a store-only replay is never a new opening block. A compaction that removes both
+leaves neither, so the names are suggestable again and pinned rows are listed again. Routing the
+same payload twice therefore returns
 the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
 
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
@@ -436,7 +436,7 @@ def _compose(
         index,
         cfg,
         partition.one_shot,
-        opening=not previous,
+        opening=not previous and not stored,
         paths=paths,
         note=note,
     )
@@ -569,7 +569,7 @@ def _prior_blocks(messages: Any) -> List[str]:
     """Return the text of every message that opens with the block's shared first line.
 
     Only a message that opens with that line counts, so user text that merely mentions a skill name,
-    or quotes the marker later in a line, never seeds the suppressed set. The returned blocks are the
+    or quotes a block later in a line, never seeds the suppressed set. The returned blocks are the
     payload's own record of what earlier turns in this compaction window showed.
     """
     blocks: List[str] = []

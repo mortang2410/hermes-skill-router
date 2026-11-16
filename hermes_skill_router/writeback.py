@@ -42,7 +42,8 @@ import hashlib
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("hermes_skill_router.writeback")
 
@@ -50,6 +51,14 @@ STORE_FILENAME = "writeback-store.json"
 
 #: Environment override for the store path; tests point it at a temporary file.
 STORE_PATH_ENV = "HERMES_SKILL_ROUTER_WRITEBACK"
+
+#: In-process fallback latch for the stripped window flag (contract C5): when the
+#: store file cannot be written, the durable flag is lost, but a stripped payload
+#: that already went out must still keep later failures stripped, so the flag is
+#: also held in memory for the life of the process. It is cleared on expire.
+#: Keyed by (store path, session) so a new store path starts clean.
+_STRIPPED_FALLBACK: Set[Tuple[Optional[str], str]] = set()
+_STRIPPED_LOCK = threading.Lock()
 
 ORIGIN_NORMAL = "normal"
 ORIGIN_REVIEW = "review"
@@ -149,8 +158,12 @@ def mark_stripped(session_id: str, cache_path: Any) -> None:
 
     Once any stripped payload has gone out, every later failure in the
     window keeps the stripped state (contract C5, including a store-failure
-    turn): the strip is no longer undone by a full-catalog resend.
+    turn): the strip is no longer undone by a full-catalog resend. The flag is
+    held both in the store and in an in-process latch, so a store write
+    failure cannot lose it inside this process.
     """
+    with _STRIPPED_LOCK:
+        _STRIPPED_FALLBACK.add((store_path(cache_path), session_id))
     try:
         store = _read_store(cache_path)
         _window(store, session_id)["stripped"] = True
@@ -161,6 +174,9 @@ def mark_stripped(session_id: str, cache_path: Any) -> None:
 
 def stripped_sent(session_id: str, cache_path: Any) -> bool:
     """Return True when a stripped payload already went out in this window."""
+    with _STRIPPED_LOCK:
+        if (store_path(cache_path), session_id) in _STRIPPED_FALLBACK:
+            return True
     try:
         return bool(_window(_read_store(cache_path), session_id).get("stripped"))
     except Exception:
@@ -379,6 +395,8 @@ def expire_window(session_id: str, cache_path: Any) -> None:
     plugin block row survives past the close of any window. The store entry
     expires as the generation advances. Never raises.
     """
+    with _STRIPPED_LOCK:
+        _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
     try:
         store = _read_store(cache_path)
         window = _window(store, session_id)
@@ -405,6 +423,8 @@ def expire_window(session_id: str, cache_path: Any) -> None:
 
 def forget_session_ids(session_id: str, cache_path: Any) -> None:
     """Drop all store state for *session_id* (end of session). Never raises."""
+    with _STRIPPED_LOCK:
+        _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
     try:
         store = _read_store(cache_path)
         store["windows"].pop(session_id, None)

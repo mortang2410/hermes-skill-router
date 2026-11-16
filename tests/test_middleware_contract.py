@@ -507,6 +507,13 @@ def test_every_no_rewrite_path_delivers_on_the_first_supported_turn(
                 and hasattr(module, "clear_dumps")
             ):
                 module.clear_dumps()
+            if (
+                name.startswith(prefix)
+                and name.endswith(".writeback")
+                and hasattr(module, "_STRIPPED_FALLBACK")
+            ):
+                with module._STRIPPED_LOCK:
+                    module._STRIPPED_FALLBACK.clear()
         return callback
 
     # No catalog (first request carries no catalog section).

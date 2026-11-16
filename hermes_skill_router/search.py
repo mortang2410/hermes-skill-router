@@ -112,11 +112,11 @@ _PARTITIONS: Dict[str, Partition] = {}
 #: The sessions whose current compaction window already sent the whole catalog. A session is in the
 #: set until the host commits a compaction, which the plugin's ``post_compaction`` callback expires;
 #: no message text decides the boundary. Hermes rebuilds every request from message history and
-#: never copies the middleware's ``api_kwargs`` messages back into history, so a marker appended to
-#: that payload never reaches the next turn. This record is that fact instead: while the session is
-#: in the set, a later failed pass strips the catalog and leaves the dropped marker rather than
-#: sending the whole catalog twice. A shorter request list alone is not a boundary, because Hermes
-#: may replace the request-local messages for one call without compacting durable history.
+#: never copies the middleware's ``api_kwargs`` messages back into history. This record is that fact
+#: instead: while the session is in the set, a later failed pass repeats the full catalog unchanged
+#: (catalog mode) rather than sending the catalog a second time as a fresh dump. A shorter request
+#: list alone is not a boundary, because Hermes may replace the request-local messages for one call
+#: without compacting durable history.
 _DUMPED: set[str] = set()
 _PARTITIONS_LOCK = threading.Lock()
 

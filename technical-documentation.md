@@ -596,8 +596,9 @@ the budget above your own measured cold pass before lowering anything else.
 
 When a per-request embed or rerank call fails, because the endpoint is down, timed out, answered an
 error, or returned an unusable body, the pass ends the same way: the request keeps the full catalog
-on the first failure in a compaction window, a later failure strips it and leaves the dropped
-marker, and the once-per-window suggestion rule still applies. The endpoint is then not probed
+on the first failure in a compaction window, a later failure repeats the full catalog unchanged
+(catalog mode), and once a stripped payload went out, later failures keep the stripped state. No
+marker message is ever appended, and the once-per-window suggestion rule still applies. The endpoint is then not probed
 again for `healthCheckMs`, so a stopped service costs no per-request timeout on the next request.
 Each failure writes one warning to the host log naming the failed stage, once per process, and puts
 one line on the display record naming the unreachable endpoints. With the live clients that line is
@@ -695,14 +696,14 @@ window:
 The catalog is shown once per compaction window. The first failed pass in a window leaves the
 request unchanged and sends the whole catalog, a dump, and records that fact in a per-session
 durable record next to the search partitions, because Hermes rebuilds every request from message
-history and never copies the middleware's `api_kwargs` messages back into it, so a marker appended
-to that payload never reaches the next turn. On any further failed pass in that window the rewrite
-strips the catalog and appends one marker message, `Skill catalog dropped after a routing failure`,
-instead of dumping the catalog a second time. It also suggests nothing after a dump, because the
-dump showed every skill and nothing is suggestible for the rest of that window. A payload check for
-the marker is system-role only and reads list-shaped content, so a user message that quotes the
-marker text cannot silence routing. The marker names no skill and does not read as a routed block.
-A committed compaction event opens a new window. The host fires the `post_compaction` event after a
+history and never copies the middleware's `api_kwargs` messages back into it. On any further
+failed pass in that window the rewrite returns the original catalog payload unchanged (catalog
+mode) instead of dumping the catalog a second time, and no marker message is ever appended. Once
+a stripped payload has gone out (a routed block or a store-failure turn), a later failure keeps
+that stripped state with the stored blocks reinserted; a window flag records it in the writeback
+store and in an in-process latch, so a store write failure cannot lose it inside the process. It
+also suggests nothing after a dump, because the dump showed every skill and nothing is suggestible
+for the rest of that window. A committed compaction event opens a new window. The host fires the `post_compaction` event after a
 compaction commits, and the plugin registers the callback under that name; the callback expires the
 session's dump record, so the next failed pass may send the whole catalog once more. Every compaction
 kind opens a window, because the host fires the event after the commit whatever the kind and the
@@ -714,9 +715,10 @@ record is a per-session mark opened only by the event: a request that is merely 
 boundary, a leading message that pastes a host summary cannot open or keep a window, and two
 compactions whose summary text is byte-identical open two windows. When the first failure arrives in
 a window the request is left unchanged, and on a later failure in the same window the rewrite is a
-clean catalog strip plus one marker message, never a partial strip. `None` is still returned when
-there is no earlier block, no marker and no recorded dump for the session, so a strip without a
-replacement never loses the catalog for nothing. A completed pass whose selection is empty because
+clean result: catalog mode repeats the full catalog unchanged, and stripped mode returns the
+stripped payload with the stored blocks reinserted, never a partial strip. `None` is still returned
+when there is no earlier block, no stored block, no stripped window flag and no recorded dump for
+the session, so a strip without a replacement never loses the catalog for nothing. A completed pass whose selection is empty because
 everything was already suggested or fell below the cutoff is healthy, not a failure: it returns
 nothing and sets no dump record.
 

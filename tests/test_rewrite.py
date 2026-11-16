@@ -625,7 +625,13 @@ def test_pinned_rows_return_after_a_compaction_removes_the_block(tmp_path):
     assert PINNED not in block_of(later).split("\n"), "a later turn in the window listed pinned rows"
     assert "- alpha: Alpha skill" not in block_of(later).split("\n")
 
-    # The compaction removed the earlier block, so the next window opens with the pinned rows again.
+    # The compaction removed the earlier block, so the next window opens with the pinned rows
+    # again. A committed compaction also expires the window's stored blocks, so the reopened
+    # turn is not a store-only replay.
+    from hermes_skill_router import writeback as writeback_module
+
+    search_module.expire_dump("")
+    writeback_module.expire_window("", cfg.cache_path)
     reopened = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
     assert reopened is not None
     assert PINNED in block_of(reopened).split("\n")
@@ -1678,6 +1684,63 @@ def test_a_fresh_window_allows_the_catalog_again(tmp_path):
     assert "- beta: Beta skill" in block_of(good)
 
 
+def test_a_persistent_store_failure_keeps_the_stripped_state(tmp_path, monkeypatch):
+    """C5: a stripped payload that went out is never undone, even when the store cannot persist.
+
+    With the writeback store path a directory, every durable write fails. The first successful
+    route sends a stripped payload; the next failed pass must keep the stripped state (non-None,
+    no catalog), not fall through the first-failure gate and dump the catalog again. The
+    in-process latch carries the flag until the window expires (the reviewer's T05-1 probe).
+    """
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", str(tmp_path))
+    cfg = make_config(tmp_path)
+    index = make_index()
+    payload = _payload()
+
+    first = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="store-fail-session")
+    assert first is not None
+    assert "## Skills" not in first["request"]["messages"][0]["content"]
+
+    second = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(), session_id="store-fail-session")
+    assert second is not None, "the failure after a stripped payload dumped the catalog instead"
+    assert "## Skills" not in second["request"]["messages"][0]["content"]
+    assert "no marker" not in second["request"]["messages"][-1].get("content", "")
+
+    search_module.expire_dump("store-fail-session")
+    from hermes_skill_router import writeback as writeback_module
+
+    writeback_module.expire_window("store-fail-session", cfg.cache_path)
+    third = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(), session_id="store-fail-session")
+    assert third is None, "the expired window must allow the catalog dump again"
+
+
+def test_a_store_only_replay_is_not_an_opening_block(tmp_path):
+    """C5 unique appearance: a stored block counts as shown even when the payload carries none.
+
+    The first route stores a block; a fresh payload with no prior injected block (for example
+    after the compression lock kept the block store-only) must not re-render the Also listed
+    rows as if it were the window's opening block (the reviewer's T05-2 probe).
+    """
+    index = make_index()
+    payload = _payload()
+
+    # The first pass is capped at one suggestion, so the stored block shows one name and
+    # leaves candidates for the second pass to select fresh. An eager skill pins one row
+    # and a deferred skill gives the block an also-listed section to repeat.
+    first_cfg = make_config(tmp_path, maxSuggestions=1, eagerSkills=["gamma"], deferredSkills=["delta"])
+    first = rewrite(payload, cfg=first_cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="store-only-session")
+    assert first is not None
+
+    replay_cfg = make_config(tmp_path, eagerSkills=["gamma"], deferredSkills=["delta"])
+    replay = rewrite(payload, cfg=replay_cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="store-only-session")
+    assert replay is not None
+    messages = replay["request"]["messages"]
+    blocks = [m["content"] for m in messages if isinstance(m.get("content"), str) and m["content"].startswith(HEADER)]
+    assert len(blocks) >= 2, "the replay must carry the stored block and a fresh block"
+    occurrences = sum(m.get("content", "").count("Also listed:") for m in messages if isinstance(m.get("content"), str))
+    assert occurrences == 1, f"store-only replay repeated the also-listed rows ({occurrences} occurrences)"
+
+
 def test_a_dump_never_corrupts_the_request(tmp_path):
     """Invariant 4: catalog mode keeps every top-level key and the messages byte-identical."""
     cfg = make_config(tmp_path)
@@ -2194,3 +2257,6 @@ def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):
     )
 
     assert second is None or "## Skills" not in second["request"]["messages"][0]["content"]
+
+
+
