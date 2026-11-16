@@ -13,12 +13,17 @@ session arrives during that retry).
 Model: ``model/Learning.tla`` v2.1.0 (transitions ``new_session`` /
 ``turn_starts`` / ``scan_completes`` / ``scan_fails`` / ``restart`` /
 ``observe_complete`` / ``observe_incomplete``). The code maps ``behind``
-to the derived fact ``newest_session_stamp > watermark`` or an unseen
-session id, ``inflight`` to the one-attempt running latch, and ``late``
-to the derived behind being set again after a completion, so a mid-scan
-arrival is never missed. The finished-heal flag (C2) gates
-``request_heal`` only; it never gates the learning scan, though a scan
-settle writes the flag as any uncapped settle does.
+to the derived fact that some session's current source revision (its
+greatest message row id) differs from its durable ``scan_ledger`` row, so
+failed, skipped and merely-enumerated sessions stay behind even when a
+newer session advanced the global watermark; ``inflight`` maps to the
+one-attempt running latch, and ``late`` to the derived behind being set
+again after a completion, so a mid-scan arrival is never missed. The
+finished-heal flag (C2) gates ``request_heal`` only; it never gates the
+learning scan, though a scan settle writes the flag as any uncapped
+settle does. The per-session revision comparison is the implementation
+derivation inside these transitions, not a new transition: the model's
+state and invariants are unchanged (round 0607).
 
 Every association database and session store is a temporary file pytest
 owns, and every clock is a fixed epoch millisecond.
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -526,6 +532,387 @@ def test_the_completeness_window_only_picks_the_degraded_line_wording(hermes, tm
     ), f"the stale-store degraded line changed: {stale_note!r}"
 
     # The window observation flips the line only: behind is unaffected by it.
-    assert associations_module.learning_behind(str(store_path)) is True, (
-        "making the store stale/changing the window line changed behind"
+    # (Round 0607 retired the old form of this check, ``learning_behind is
+    # True`` after watermark surgery: behind now derives from per-session
+    # ledger progress, not the global watermark, so lowering the watermark
+    # by itself manufactures no outstanding work. s-first is fully scanned,
+    # hence behind is False by derivation, and the line flip still holds.)
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "lowering the watermark manufactured behind over fully scanned progress"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# F1: a settled zero-watermark store bootstraps learning (round 0607)
+# --------------------------------------------------------------------------------------------------
+
+
+def _finished_flag(store_path: Path) -> Optional[str]:
+    """Return the persisted heal finished flag, or None when unset."""
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        return associations_module.read_meta(store, associations_module.META_HEAL_FINISHED)
+    finally:
+        store.close()
+
+
+def _ledger_row(store_path: Path, session_id: str):
+    """Return the scan_ledger row (scanned_max_row_id, ...) for one session, or None."""
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        return store.conn.execute(
+            "SELECT scanned_max_row_id FROM scan_ledger WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    finally:
+        store.close()
+
+
+def test_an_empty_heal_then_a_new_session_bootstraps_learning(hermes, tmp_path):
+    """F1: a heal settled against an empty source (watermark 0) must not trap learning."""
+    store_path = tmp_path / "bootstrap-empty.db"
+    report = associations_module.heal_store(
+        str(store_path), str(hermes.path), catalog=CATALOG, now_ms=T0 + 10 * DAY
+    )
+    assert report.sessions_found == 0
+    assert _watermark(store_path) == "0"
+    assert _finished_flag(store_path) == "finished"
+
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "a settled empty store with no source data is behind"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False
+
+    _add_session(hermes, "s-new", T0)
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "a settled zero-watermark store ignored a new session"
+    )
+    associations_module.reset_heal_state()  # a restart keeps the bootstrap condition
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "a restart cleared the zero-watermark bootstrap"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-new"}, "the bootstrapped scan did not ingest the new session"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a follow-up turn started another scan after the bootstrap ingest"
+    )
+
+
+def test_a_failed_first_heal_then_recovery_bootstraps_learning(hermes, tmp_path):
+    """F1: a first heal whose pass failed (watermark 0) must not trap learning."""
+    store_path = tmp_path / "bootstrap-failed.db"
+    with pytest.raises(sqlite3.Error):
+        associations_module.heal_store(
+            str(store_path), str(tmp_path / "no-state.db"), catalog=CATALOG, now_ms=T0 + 10 * DAY
+        )
+    assert _watermark(store_path) == "0"
+    assert _finished_flag(store_path) == "finished"
+
+    _add_session(hermes, "s-recovered", T0)
+    associations_module.reset_heal_state()  # a restart keeps the bootstrap condition
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "a failed first heal with the flag settled ignored later data"
+    )
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False, (
+        "the finished flag no longer gates the heal (C2)"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-recovered"}, "the recovery scan did not ingest the new session"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+
+
+# --------------------------------------------------------------------------------------------------
+# F2: outstanding work derives from per-session scan progress (round 0607)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_transiently_unreadable_session_is_retried_after_a_newer_session_succeeds(
+    hermes, tmp_path, monkeypatch
+):
+    """F2: s2 fails to read once while newer s3 succeeds; the next turn must learn s2."""
+    _add_session(hermes, "s-first", T0)
+    store_path = tmp_path / "retry-skipped.db"
+    _scan(store_path, hermes)
+    _add_session(hermes, "s2", T0 + 1000)
+    _add_session(hermes, "s3", T0 + 2000)
+
+    real_rows = associations_module._session_rows
+    failed_once = {"done": False}
+
+    def flaky_rows(source, session_id):
+        if session_id == "s2" and not failed_once["done"]:
+            failed_once["done"] = True
+            return None
+        return real_rows(source, session_id)
+
+    monkeypatch.setattr(associations_module, "_session_rows", flaky_rows)
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-first", "s3"}, "the scan with the skipped session ingested the wrong set"
+    finally:
+        store.close()
+    assert _ledger_row(store_path, "s2") is None, "the skipped session gained a ledger row"
+    assert _watermark(store_path) == str(T0 + 2000 + 900_000), "the newer session did not advance the watermark"
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "the skipped session is hidden behind the newer session's watermark"
+    )
+
+    # The flake is over (the patched reader delegates after one failure): the
+    # next routed turn must learn s2.
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-first", "s2", "s3"}, "the retry did not ingest the skipped session"
+    finally:
+        store.close()
+    assert _ledger_row(store_path, "s2") is not None
+    assert associations_module.learning_behind(str(store_path)) is False
+
+
+def test_messages_arriving_in_an_empty_tied_session_are_ingested_next_turn(hermes, tmp_path):
+    """F2: messages landing in an already-enumerated empty session at a tied stamp are ingested."""
+    _add_session(hermes, "s-anchor", T0 + 8000)
+    store_path = tmp_path / "tied-empty.db"
+    _scan(store_path, hermes)
+    assert _watermark(store_path) == str(T0 + 8000 + 900_000)
+
+    hermes.session("s-empty", started_ms=T0 + 8000)  # stamp ties the anchor's
+    hermes.commit()
+    _scan(store_path, hermes)
+    row = _ledger_row(store_path, "s-empty")
+    assert row is not None and row[0] is None, "the empty session did not commit a NULL ledger row"
+    assert _newest_stamp(hermes) == int(_watermark(store_path)), "the fixture must tie the watermark"
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "an empty tied session is behind before its messages arrive"
+    )
+
+    hermes.user("s-empty", f"{SUBSTANTIVE} s-empty-late", T0 + 8000 + 100)
+    hermes.skill_view("s-empty", "code-review", T0 + 8000 + 200)
+    hermes.commit()
+    assert _newest_stamp(hermes) == int(_watermark(store_path)), "the late messages must not move the newest stamp"
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "messages in an already-enumerated session at a tied stamp are missed"
+    )
+
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-anchor", "s-empty"}, "the next turn did not ingest the late messages"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+
+
+def test_new_data_in_an_already_scanned_session_below_the_watermark_is_ingested(hermes, tmp_path):
+    """F2: a new message in a scanned session whose stamp is below the watermark is ingested."""
+    _add_session(hermes, "s-first", T0)
+    _add_session(hermes, "s-later", T0 + 9000)
+    store_path = tmp_path / "below-watermark.db"
+    _scan(store_path, hermes)
+    assert _watermark(store_path) == str(T0 + 9000 + 900_000)
+
+    hermes.user("s-first", f"{SUBSTANTIVE} s-first-again", T0 + 500)
+    hermes.skill_view("s-first", "code-review", T0 + 600)
+    hermes.commit()
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "new data in an already-scanned session below the watermark is missed"
+    )
+
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        prompts = rows(
+            store,
+            "SELECT count(*) FROM prompt_event WHERE session_id = 's-first'",
+        )[0][0]
+        assert prompts == 2, "the next turn did not ingest the second prompt of s-first"
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False
+
+
+# --------------------------------------------------------------------------------------------------
+# F3: restart kills a scan genuinely in flight (round 0607)
+# --------------------------------------------------------------------------------------------------
+
+_CHILD_DRIVER = '''\
+import sys
+import time
+from pathlib import Path
+
+root, store, state, ready, go = sys.argv[1:6]
+sys.path.insert(0, root)
+sys.path.insert(0, root + "/tests")
+from hermes_skill_router import associations as m
+from test_associations import CATALOG
+
+m.default_state_db_path = lambda: state
+real_write = m._write_session
+paused = {"done": False}
+
+
+def pausing_write(store_, session, scan, report):
+    out = real_write(store_, session, scan, report)
+    if not paused["done"]:
+        paused["done"] = True
+        Path(ready).write_text("ready")
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not Path(go).exists():
+            time.sleep(0.02)
+    return out
+
+
+m._write_session = pausing_write
+m.request_learning_scan(store, catalog=CATALOG)
+deadline = time.monotonic() + 300
+while time.monotonic() < deadline:
+    time.sleep(0.05)
+'''
+
+
+def _kill_scan_midflight(tmp_path: Path, hermes, store_path: Path) -> None:
+    """Start a real scan in a subprocess, pause it after its first session
+    commits, and SIGKILL it. Asserts the persisted watermark was not advanced.
+    Bounded: a 20 s readiness wait, a 10 s kill wait, and a file-count cap.
+    """
+    ready = tmp_path / "child-ready"
+    go = tmp_path / "child-go"
+    driver = tmp_path / "kill_child.py"
+    driver.write_text(_CHILD_DRIVER)
+    driver_argv = [
+        sys.executable,
+        "-B",
+        str(driver),
+        str(ROOT),
+        str(store_path),
+        str(hermes.path),
+        str(ready),
+        str(go),
+    ]
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    log = open(tmp_path / "child.log", "w")
+    try:
+        proc = subprocess.Popen(
+            driver_argv, stdout=log, stderr=subprocess.STDOUT, cwd=str(tmp_path), env=env
+        )
+    except Exception:
+        log.close()
+        raise
+    try:
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not ready.exists():
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert ready.exists(), "the child scan never paused before the kill"
+        proc.kill()
+        rc = proc.wait(timeout=10.0)
+    finally:
+        log.close()
+    assert rc == -9, f"the child was not killed (rc={rc})"
+    assert len(list(tmp_path.rglob("*"))) < 200, "the kill probe created too many files"
+
+
+def test_restart_killing_an_inflight_scan_retries_cleanly(hermes, tmp_path):
+    """F3 clean retry: the process dies mid-scan; the next turn retries and ingests once."""
+    _add_session(hermes, "s-first", T0)
+    store_path = tmp_path / "kill-clean.db"
+    _scan(store_path, hermes)
+    before = _watermark(store_path)
+    # Two sessions are behind; the child commits the newest first and then
+    # pauses, so one session stays genuinely unprocessed after the kill.
+    _add_session(hermes, "s-behind", T0 + 4000)
+    _add_session(hermes, "s-behind2", T0 + 5000)
+
+    _kill_scan_midflight(tmp_path, hermes, store_path)
+    assert _watermark(store_path) == before, "the killed scan advanced the watermark"
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "the killed scan cleared behind"
+    )
+
+    # The ledger for s-behind2 committed before the kill, so the retry
+    # rescans it but must store nothing twice.
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    assert _watermark(store_path) == str(_newest_stamp(hermes))
+    assert associations_module.learning_behind(str(store_path)) is False
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        loads = rows(store, "SELECT count(*) FROM load_event")[0][0]
+        assert loads == 3, "the retry after the kill duplicated or lost a load"
+    finally:
+        store.close()
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a follow-up turn started another scan after the clean retry"
+    )
+
+
+def test_restart_killing_an_inflight_scan_retries_with_a_late_arrival(hermes, tmp_path, monkeypatch):
+    """F3 late retry: after the kill, session s-late arrives during the retry."""
+    _add_session(hermes, "s-first", T0)
+    store_path = tmp_path / "kill-late.db"
+    _scan(store_path, hermes)
+    before = _watermark(store_path)
+    _add_session(hermes, "s-behind", T0 + 4000)
+    _add_session(hermes, "s-behind2", T0 + 5000)
+
+    _kill_scan_midflight(tmp_path, hermes, store_path)
+    assert _watermark(store_path) == before, "the killed scan advanced the watermark"
+
+    listed = threading.Event()
+    release = threading.Event()
+    real_list = associations_module._list_sessions
+    blocked_once = {"done": False}
+
+    def holding_list(source, max_sessions):
+        captured = real_list(source, max_sessions)
+        if not blocked_once["done"]:
+            blocked_once["done"] = True
+            listed.set()
+            release.wait(5.0)
+            return captured
+        return captured
+
+    monkeypatch.setattr(associations_module, "_list_sessions", holding_list)
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert listed.wait(2.0), "the retry never listed sessions"
+    _add_session(hermes, "s-late", T0 + 8000)
+    release.set()
+    assert _settled(str(store_path))
+
+    assert associations_module.learning_behind(str(store_path)) is True, (
+        "the retry cleared behind over the session that arrived during it"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is True
+    assert _settled(str(store_path))
+    store = associations_module.open_store(str(store_path), read_only=True)
+    try:
+        stored = {row[0] for row in rows(store, "SELECT DISTINCT session_id FROM prompt_event")}
+        assert stored == {"s-first", "s-behind", "s-behind2", "s-late"}, (
+            "the next turn did not ingest the session that arrived during the retry"
+        )
+    finally:
+        store.close()
+    assert associations_module.learning_behind(str(store_path)) is False

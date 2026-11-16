@@ -2486,45 +2486,59 @@ def _settle_flag_best_effort(store: AssociationStore, store_path: str) -> None:
 _LEARNING_RUNNING = False
 
 
-def _newest_and_session_ids(state_db_path: Optional[str]) -> Tuple[int, set]:
-    """Return ``(newest_session_stamp_ms, session_id_set)`` from the Hermes store.
+def _source_session_revisions(state_db_path: Optional[str]) -> Dict[str, Optional[int]]:
+    """Return each session's current source revision: its greatest message row id.
 
-    One read-only open answers both: the newest stamp and the identity set
-    the behind check compares against ``seen_sessions``. Raises when the
-    session store cannot be read, so the caller can answer "not behind".
+    A message-less session reads ``None``. Raises when the session store
+    cannot be read, so the caller can answer "not behind". The behind check
+    compares these revisions against the durable ``scan_ledger`` rows: one
+    listing plus one per-session greatest-id aggregate, in a single
+    read-only open.
     """
     source = _open_state_db(state_db_path or default_state_db_path())
     try:
-        ids = {
-            str(row["id"])
+        current: Dict[str, Optional[int]] = {
+            str(row["id"]): None
             for row in source.execute("SELECT id FROM sessions").fetchall()
         }
-        row = source.execute(
-            "SELECT MAX(COALESCE(last_activity_at, started_at)) AS stamp FROM sessions"
-        ).fetchone()
+        rows = source.execute(
+            "SELECT session_id, MAX(id) AS max_id FROM messages GROUP BY session_id"
+        ).fetchall()
     finally:
         source.close()
-    newest = _stamp_of(row["stamp"]) if row is not None else 0
-    return newest, ids
+    for row in rows:
+        session_id = str(row["session_id"])
+        if session_id in current:
+            max_id = row["max_id"]
+            current[session_id] = None if max_id is None else int(max_id)
+    return current
 
 
 def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> bool:
     """Return whether sessions exist that the learning watermark has not ingested.
 
-    ``behind`` is derived, never stored: a session stamp newer than
-    ``META_LAST_SCAN_MS``, or a session id the store's ``seen_sessions``
-    has never listed (a mid-scan arrival whose stamp ties or backdates the
-    watermark is still missed by the second check). A failed scan and a
-    restart therefore both keep ``behind``: the watermark and the session
-    store survive, and the next turn re-derives it. Never raises: an
-    unreadable session store is no evidence of new sessions, so the turn
-    starts no scan and the next turn retries.
+    ``behind`` is derived, never stored: any session whose current source
+    revision (its greatest message row id, ``None`` when message-less, see
+    :func:`_source_session_revisions`) differs from its durable
+    ``scan_ledger`` row ``scanned_max_row_id``. A missing ledger row reads
+    as ``None``, so a never-scanned session with messages is behind. Failed
+    and skipped sessions therefore keep ``behind`` even when a newer
+    session advanced the global watermark: their ledger row was never
+    committed, and the comparison re-derives outstanding work from progress,
+    never from ``seen_sessions`` (a listing inventory, not progress) or
+    from the global maximum stamp. A failed scan and a restart therefore
+    both keep ``behind``: the ledger and the session store survive, and
+    the next turn re-derives it. Never raises: an unreadable store or
+    session store is no evidence of new sessions, so the turn starts no
+    scan and the next turn retries.
 
-    A store that has never been scanned (missing, unreadable or an empty
-    zero-watermark store) is never behind: the heal (C4) owns creating one,
-    and its first uncapped pass walks every session, so nothing is missed.
-    Continuous learning ingests new sessions on a store that already has
-    a watermark.
+    A store that has never been scanned (missing or unreadable) is never
+    behind: the heal (C4) owns creating one. A settled zero-watermark
+    store -- the persisted finished flag set, or the in-memory finished
+    attempt -- is behind when source data needs ingestion: the heal's
+    one-attempt rule (C2) still gates the heal, never this bootstrap, so
+    a first heal that settled empty or failed cannot trap later data.
+    An unsettled zero-watermark store is still the heal's to scan.
     """
     path = os.path.expanduser(store_path)
     try:
@@ -2533,25 +2547,27 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
         return False
     try:
         watermark = _meta_int(store, META_LAST_SCAN_MS)
-        seen = {
-            str(row[0])
-            for row in store.conn.execute("SELECT session_id FROM seen_sessions").fetchall()
+        settled = heal_finished(store)
+        ledger = {
+            str(row[0]): (None if row[1] is None else int(row[1]))
+            for row in store.conn.execute(
+                "SELECT session_id, scanned_max_row_id FROM scan_ledger"
+            ).fetchall()
         }
     except Exception:
         return False
     finally:
         store.close()
-    if watermark <= 0:
+    if watermark <= 0 and not settled:
         return False
     try:
-        newest, ids = _newest_and_session_ids(state_db_path)
+        current = _source_session_revisions(state_db_path)
     except (sqlite3.Error, OSError, ValueError):
         return False
-    if not ids:
+    if not current:
         return False
-    if newest > watermark:
-        return True
-    return bool(ids - seen)
+    ledger_get = ledger.get
+    return any(ledger_get(session_id) != revision for session_id, revision in current.items())
 
 
 def request_learning_scan(
@@ -2749,8 +2765,8 @@ def reset_heal_state() -> None:
     """Forget every launched heal attempt and every in-flight learning scan.
 
     Tests call this; production never needs it. It simulates a restart: the
-    in-memory latches are gone, the persisted watermark and ``behind`` (which
-    is derived from it) survive.
+    in-memory latches are gone, the persisted watermark, the scan ledger
+    and ``behind`` (which is derived from them) survive.
     """
     global _LEARNING_RUNNING
     with _HEAL_LOCK:
