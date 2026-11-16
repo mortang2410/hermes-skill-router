@@ -41,7 +41,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .catalog import CatalogRows, Partition, strip_catalog
-from .writeback import ORIGIN_CURATOR, derive_origin
 from .writeback import _newest_user_text
 
 logger = logging.getLogger("hermes_skill_router.curator")

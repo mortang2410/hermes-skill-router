@@ -148,5 +148,5 @@ Plugin config keys that point at these endpoints:
 
 ## If the endpoint is down
 
-The plugin fails open. When the first routing pass in a compaction window fails because an endpoint is unreachable or times out, the plugin leaves the full catalog in the prompt and adds no suggestions, so routing degrades instead of failing. A later failure in the same window strips the catalog and leaves the dropped-catalog marker.
+The plugin fails open. When the first routing pass in a compaction window fails because an endpoint is unreachable or times out, the plugin leaves the full catalog in the prompt and adds no suggestions, so routing degrades instead of failing. A later failure in the same window repeats the full catalog unchanged (catalog mode); once a stripped payload went out, later failures keep the stripped state. No marker message is ever appended.
 `README.md` states this as the fallback, and `technical-documentation.md` lists the failure reasons and the `healthCheckMs` window that skips re-probing a failed endpoint.
