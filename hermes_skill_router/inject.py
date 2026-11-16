@@ -119,20 +119,6 @@ ALSO_LISTED = "Also listed:"
 #: Prefix of the read-path line under a suggestion or pinned row.
 PATH_PREFIX = "  path: "
 
-#: The one-line marker a stripped request carries when routing failed and the catalog went out
-#: instead. The first line is neither block header, so the recogniser never reads it as a
-#: suggestion, and carries no skill name, so it cannot pose as exposure of any one skill.
-#: The rewrite recognises it in a later request and strips the catalog again, which keeps the
-#: whole catalog out of the window after the first dump.
-DROPPED_HEADER = "Skill catalog dropped after a routing failure"
-
-DROPPED_MESSAGE = (
-    "Skill catalog dropped after a routing failure\n"
-    "The full skill catalog was already shown earlier in this compaction window, so it is not "
-    "shown again. Call skills_list to see every skill available, or load one with "
-    "skill_view(name). Do not guess a skill name: use the list or the loader."
-)
-
 #: Names whose pinned row was omitted for a missing path, so one warning is logged per process.
 _PINNED_WARNED: set[str] = set()
 
@@ -154,10 +140,14 @@ def render(
     ``Partition.one_shot``: it chooses between the two fixed headers that open the block, and
     ``cfg.one_shot_mode`` chooses which one-shot header (the no-create default, or the opt-in
     can-create form; an unknown or missing value renders no-create). *opening*
-    says the request's messages carry no earlier block, so the pinned rows are listed; a later turn
-    in the same compaction window omits them. *paths* maps a name to the absolute read path the host
-    lookup resolved, for both suggestions and pinned rows. *index* supplies the descriptions of
-    suggested rows and may be ``None``, in which case they are listed by name only.
+    says the request's messages carry no earlier block, so the pinned and
+    also-listed rows are listed; a later turn in the same compaction window
+    omits them (unique appearance per window, C5), so kept-row visibility
+    after the opening block comes from ``skills_list``. *paths* maps a name to
+    the absolute read path the host lookup resolved, for both suggestions and
+    pinned rows. *index* supplies the descriptions of suggested rows and may
+    be ``None``, in which case they are listed by name only.
+
     *note* is the turn's stored degraded line, or ``""`` when healthy: the same one line the
     display record carries, so this block, the desktop pane and the TUI widget all show one state.
 
@@ -201,6 +191,10 @@ def render(
             seen.add(name)
             pinned.append(_row(name, description, limit, path))
         else:
+            # Also-listed rows appear only in the opening block (C5 unique
+            # appearance); later turns in the window omit them.
+            if not opening:
+                continue
             seen.add(name)
             listed.append(_plain_row(name, description, limit))
     if not suggested and not pinned and not listed:
@@ -223,6 +217,27 @@ def render(
     if isinstance(note, str) and note.strip():
         parts.append(note.strip())
     return "\n\n".join(parts)
+
+
+def displayed_names(block_text: str) -> List[str]:
+    """Return every name a block displays, in any category, in order.
+
+    Suggestions, pinned rows and also-listed rows all count: unique appearance
+    per window covers every displayed category (contract C5), so the rewrite
+    suppresses a name shown in any section for the rest of the window.
+    """
+    names: List[str] = []
+    section = ""
+    for line in block_text.splitlines():
+        if line in (SUGGESTIONS, PINNED, ALSO_LISTED):
+            section = line
+            continue
+        if section not in (SUGGESTIONS, PINNED, ALSO_LISTED) or not line.startswith("- "):
+            continue
+        name = line[2:].split(": ", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def suggested_names(block_text: str) -> List[str]:

@@ -144,6 +144,29 @@ def generation(session_id: str, cache_path: Any) -> int:
     return int(_window(_read_store(cache_path), session_id)["generation"])
 
 
+def mark_stripped(session_id: str, cache_path: Any) -> None:
+    """Record that a stripped payload went out in this window. Never raises.
+
+    Once any stripped payload has gone out, every later failure in the
+    window keeps the stripped state (contract C5, including a store-failure
+    turn): the strip is no longer undone by a full-catalog resend.
+    """
+    try:
+        store = _read_store(cache_path)
+        _window(store, session_id)["stripped"] = True
+        _write_store(cache_path, store)
+    except Exception:
+        logger.debug("hermes-skill-router writeback: mark stripped failed", exc_info=True)
+
+
+def stripped_sent(session_id: str, cache_path: Any) -> bool:
+    """Return True when a stripped payload already went out in this window."""
+    try:
+        return bool(_window(_read_store(cache_path), session_id).get("stripped"))
+    except Exception:
+        return False
+
+
 def derive_origin(platform: Any, messages: Any) -> str:
     """Return the origin class for this request from *platform* plus prompt shape.
 
@@ -374,6 +397,7 @@ def expire_window(session_id: str, cache_path: Any) -> None:
         window["generation"] = int(window["generation"]) + 1
         window["blocks"] = []
         window["row_ids"] = []
+        window["stripped"] = False
         _write_store(cache_path, store)
     except Exception:
         logger.debug("hermes-skill-router writeback: expire failed", exc_info=True)

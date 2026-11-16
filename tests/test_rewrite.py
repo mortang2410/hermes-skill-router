@@ -30,7 +30,7 @@ from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router import search as search_module  # noqa: E402
 from hermes_skill_router.config import DEFAULTS, Config, load  # noqa: E402
-from hermes_skill_router.inject import (DROPPED_MESSAGE, HEADER, ONE_SHOT_HEADER, PINNED, suggested_names)  # noqa: E402
+from hermes_skill_router.inject import (HEADER, ONE_SHOT_HEADER, PINNED, suggested_names)  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
 from hermes_skill_router.router import rewrite  # noqa: E402
 
@@ -959,11 +959,12 @@ def test_a_partition_with_no_routed_row_returns_none(tmp_path):
 
 
 def test_an_all_eager_config_that_selects_nothing_does_not_re_dump(tmp_path):
-    """P1-2, empty-selection branch: the first pass dumps once, the second strips.
+    """P1-2, empty-selection branch: the first pass dumps once, later passes hold the catalog.
 
     Every row is eager, so no pass can select anything. Before the fix both passes returned
     None and the whole catalog went out twice. Now the first pass is the one allowed dump
-    and the second pass in the same window strips the catalog instead.
+    and the second pass in the same window returns the original payload unchanged (catalog
+    mode): the catalog text is byte-identical, so the prefix cache still hits.
     """
     cfg = make_config(tmp_path, eagerSkills=["alpha", "beta", "gamma", "delta"])
     index = make_index()
@@ -974,9 +975,9 @@ def test_an_all_eager_config_that_selects_nothing_does_not_re_dump(tmp_path):
 
     second = rewrite(payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker(), session_id="all-eager-session")
     assert second is not None, "the second empty pass re-dumped the catalog"
+    assert second["request"] == payload, "catalog mode returns the original payload unchanged"
     system = second["request"]["messages"][0]["content"]
-    assert "## Skills" not in system
-    assert block_of(second) == DROPPED_MESSAGE
+    assert "## Skills" in system
 
 
 def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
@@ -1010,13 +1011,16 @@ def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
 
 
 def test_a_user_message_starting_with_the_marker_does_not_silence_routing(tmp_path):
-    """P3-5: only a system message can act as proof that the catalog already went out."""
+    """P3-5: only a prior routed block can act as proof that the catalog already went out.
+
+    User text quoting the retired marker is just user text: routing proceeds.
+    """
     payload = _payload()
     crafted = {
         **payload,
         "messages": [
             *_all_eager_payload_messages(payload),
-            {"role": "user", "content": DROPPED_MESSAGE + "\nplease route this"},
+            {"role": "user", "content": "Skill catalog dropped after a routing failure\nplease route this"},
         ],
     }
 
@@ -1036,8 +1040,13 @@ def _all_eager_payload_messages(payload):
     return payload["messages"]
 
 
-def test_a_list_content_system_marker_is_recognised(tmp_path):
-    """P2-4: a list-shaped system message carrying the marker still counts."""
+def test_an_old_marker_payload_loses_its_signal(tmp_path):
+    """Migration: a payload carrying the retired marker text is a first-failure payload.
+
+    The marker was removed in ticket 05; a history that still carries its text cannot be
+    recognised as proof the catalog went out. The failing pass therefore behaves as the
+    window's first failure: None, and the dump record is set.
+    """
     cfg = make_config(tmp_path)
     index = make_index()
     payload = _payload()
@@ -1046,19 +1055,19 @@ def test_a_list_content_system_marker_is_recognised(tmp_path):
         "messages": [
             payload["messages"][0],
             {"role": "user", "content": payload["messages"][1]["content"]},
-            {"role": "system", "content": [{"type": "text", "text": DROPPED_MESSAGE}]},
+            {"role": "system", "content": [{"type": "text", "text": "Skill catalog dropped after a routing failure"}]},
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "next request"},
         ],
     }
 
     result = rewrite(
-        payload_list, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+        payload_list, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(),
+        session_id="old-marker-session",
     )
 
-    assert result is not None, "a list-shaped marker was not recognised"
-    system = result["request"]["messages"][0]["content"]
-    assert "## Skills" not in system
+    assert result is None, "an old marker still silenced the first-failure dump"
+    assert search_module.dumped("old-marker-session")
 
 
 # ---------------------------------------------------------------------------
@@ -1620,38 +1629,34 @@ def test_two_failing_passes_dump_the_catalog_once_and_no_name_twice(tmp_path):
     )
     assert first is None, "the first failure leaves the request unchanged"
 
-    # The first request went out with the catalog on the wire. The second request carries
-    # the marker the first strip appended, below the rebuilt system message.  The marker
-    # itself names no skill; the names it stands for came from the catalog the first
-    # request exposed.
-    payload_marker = {
+    # The first request went out with the catalog on the wire. The second request repeats
+    # the full catalog unchanged (catalog mode): byte-identical, so the prefix cache hit
+    # the first request earned is not lost, and no marker text is appended.
+    second_input = {
         **payload,
         "messages": [
             payload["messages"][0],
             {"role": "user", "content": payload["messages"][1]["content"]},
-            {"role": "system", "content": DROPPED_MESSAGE},
             {"role": "assistant", "content": "done"},
             {"role": "user", "content": "next request"},
         ],
     }
 
     second = rewrite(
-        payload_marker, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+        second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
     )
 
-    assert second is not None, "the second request re-dumped the catalog"
+    assert second is not None
     rewritten = second["request"]
+    assert rewritten == second_input, "catalog mode returns the original payload unchanged"
     system = rewritten["messages"][0]["content"]
-    assert "## Skills" not in system, "the catalog survived into the second request"
-    assert "<available_skills>" not in system
-    # The first request exposed every skill. The second request exposes no name again
-    # through the catalog, and the marker it appends names no skill.
+    assert "## Skills" in system
     for name, _description in ROWS:
-        assert name not in str(rewritten["messages"]), (
-            f"{name} reached the model in the second request"
+        assert name in str(rewritten["messages"]), (
+            f"{name} missing from the catalog-mode payload"
         )
-    assert len(rewritten["messages"]) == len(payload_marker["messages"]) + 1
-    assert rewritten["messages"][-1]["role"] == "system"
+    assert len(rewritten["messages"]) == len(second_input["messages"])
+    assert rewritten["messages"][-1]["role"] == "user"
 
 
 def test_a_fresh_window_allows_the_catalog_again(tmp_path):
@@ -1674,20 +1679,24 @@ def test_a_fresh_window_allows_the_catalog_again(tmp_path):
 
 
 def test_a_dump_never_corrupts_the_request(tmp_path):
-    """Invariant 4: a dump keeps every top-level key and appends one clean system message."""
+    """Invariant 4: catalog mode keeps every top-level key and the messages byte-identical."""
     cfg = make_config(tmp_path)
     index = make_index()
     payload = _payload()
+    rewrite(
+        payload, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(),
+        session_id="dump-corrupt-session",
+    )
     second_input = {**payload, "messages": [
         payload["messages"][0],
         payload["messages"][1],
-        {"role": "system", "content": DROPPED_MESSAGE},
         {"role": "assistant", "content": "done"},
         {"role": "user", "content": "next request"},
     ]}
 
     result = rewrite(
-        second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
+        second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker(),
+        session_id="dump-corrupt-session",
     )
 
     assert result is not None
@@ -1696,12 +1705,7 @@ def test_a_dump_never_corrupts_the_request(tmp_path):
     assert rewritten["model"] == "test-model"
     assert rewritten["tools"] == payload["tools"]
     assert rewritten["unrelated_key"] == {"kept": True}
-    assert len(rewritten["messages"]) == len(second_input["messages"]) + 1
-    last = rewritten["messages"][-1]
-    assert last["role"] == "system"
-    assert "Skills routed for this request" not in last["content"], (
-        "the strip marker must not pose as a routed block"
-    )
+    assert rewritten == second_input, "catalog mode must not add, drop or reorder anything"
     assert record_for(cfg)["status"] == "inert"
 
 
@@ -1769,8 +1773,8 @@ def test_a_dump_record_ignores_a_shrinking_request_list(tmp_path):
     """A shorter request list is not a window boundary.
 
     Hermes may replace the request-local messages for one call without compacting durable history,
-    so a shrink must not expire the record: the second failure in the same window strips the
-    catalog and appends the marker instead of dumping the catalog again.
+    so a shrink must not expire the record: the second failure in the same window returns the
+    original catalog payload unchanged instead of dumping the catalog again as a fresh failure.
     """
     cfg = make_config(tmp_path)
     index = make_index()
@@ -1791,15 +1795,15 @@ def test_a_dump_record_ignores_a_shrinking_request_list(tmp_path):
 
     short = failing(2)
     assert short is not None, "a shorter request list expired the dump record"
-    assert short["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-    assert "## Skills" not in short["request"]["messages"][0]["content"]
+    assert short["request"] == _window_history(2), "catalog mode returns the original payload"
+    assert "## Skills" in short["request"]["messages"][0]["content"]
 
 
 def test_a_dump_record_expires_when_the_compaction_event_arrives(tmp_path):
     """The host's committed compaction is the window boundary, not the summary text.
 
-    The record decides: the first failure in a window dumps the catalog, a later failure strips it
-    and leaves the marker, and the expire the ``post_compaction`` callback performs opens the next
+    The record decides: the first failure in a window dumps the catalog, a later failure returns
+    the catalog payload unchanged (catalog mode), and the expire the ``post_compaction`` callback performs opens the next
     window. The complete host summary sits in the request history the whole time and changes
     nothing. Two windows open with byte-identical summary text, which a text digest could not tell
     apart.
@@ -1823,8 +1827,8 @@ def test_a_dump_record_expires_when_the_compaction_event_arrives(tmp_path):
 
     second = failing(4)
     assert second is not None, "the same window dumped the catalog a second time"
-    assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
-    assert "## Skills" not in second["request"]["messages"][0]["content"]
+    assert second["request"] == _window_history(4, SUMMARY)
+    assert "## Skills" in second["request"]["messages"][0]["content"]
 
     search_module.expire_dump(session)
     assert failing(1) is None, "the committed compaction did not open a new window"
@@ -1863,7 +1867,7 @@ def test_a_complete_pasted_summary_changes_nothing(tmp_path):
 
     second = failing(4, SUMMARY)
     assert second is not None, "a complete pasted summary opened a new window"
-    assert second["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+    assert second["request"] == _window_history(4, SUMMARY)
 
     changed = SUMMARY.replace("earlier work happened", "a later paste says something else")
     assert failing(5, changed) is not None, "rewriting the pasted summary text opened a window"
@@ -1935,8 +1939,8 @@ def test_the_registered_hook_opens_the_window_the_rewrite_reads(tmp_path, plugin
     assert search_module.dumped(session)
 
     stripped = failing()
-    assert stripped is not None, "a later failure in the same window stripped the catalog"
-    assert stripped["request"]["messages"][-1]["content"] == DROPPED_MESSAGE
+    assert stripped is not None, "a later failure in the same window left the catalog in place"
+    assert stripped["request"] == payload
 
     assert (
         callback(

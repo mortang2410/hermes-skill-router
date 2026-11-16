@@ -126,6 +126,7 @@ def test_the_one_shot_header_keeps_the_restriction_the_prose_carried():
         make_index([("alpha", "Alpha skill")]),
         make_config(),
         one_shot=True,
+        opening=True,
         paths=paths_for("alpha"),
     )
 
@@ -307,6 +308,7 @@ def test_a_kept_row_is_listed_under_the_also_listed_marker():
         CatalogRows(("pinned",), ("Pinned skill",)),
         make_index([("alpha", "Alpha skill")]),
         make_config(),
+        opening=True,
         paths=paths_for("alpha"),
     )
     lines = lines_of(block)
@@ -318,7 +320,7 @@ def test_a_kept_row_is_listed_under_the_also_listed_marker():
 
 def test_a_kept_row_with_an_empty_description_is_listed_by_name_only():
     block = render(
-        [], CatalogRows(("pinned",), ("",)), make_index([]), make_config()
+        [], CatalogRows(("pinned",), ("",)), make_index([]), make_config(), opening=True
     )
 
     assert "- pinned" in row_lines(block)
@@ -358,6 +360,7 @@ def test_a_duplicate_kept_name_renders_once():
         CatalogRows(("pinned", "pinned"), ("Pinned skill", "Second line")),
         make_index([]),
         make_config(),
+        opening=True,
     )
 
     assert row_lines(block) == ["- pinned: Pinned skill"]
@@ -395,6 +398,7 @@ def test_a_kept_description_is_clipped_too():
         CatalogRows(("pinned",), ("0123456789abcdef",)),
         make_index([]),
         make_config(maxDescriptionChars=10),
+        opening=True,
     )
 
     assert "- pinned: 0123456789" in row_lines(block)
@@ -466,8 +470,8 @@ def test_pinned_rows_form_their_own_section_only_in_the_opening_block():
     assert "  path: /skills/pinned/SKILL.md" in lines_of(opening)
     assert PINNED not in lines_of(later)
     assert "pinned" not in row_lines(later)
-    # The kept row that is not eager stays listed on the later turn.
-    assert "- demoted" in row_lines(later)
+    # Also-listed rows appear only in the opening block (C5); later turns rely on skills_list.
+    assert "- demoted" not in row_lines(later)
 
 
 def test_a_pathless_pinned_row_is_omitted_with_one_warning(tmp_path, caplog):
@@ -503,6 +507,7 @@ def test_an_empty_suggestion_list_still_lists_the_kept_rows():
         CatalogRows(("pinned",), ("Pinned skill",)),
         make_index([]),
         make_config(),
+        opening=True,
     )
 
     assert block.startswith(HEADER)
@@ -515,7 +520,7 @@ def test_every_kept_name_is_listed_when_the_block_is_non_empty():
         ("Eager skill", "Excluded skill", ""),
     )
 
-    block = render([], kept, make_index([]), make_config())
+    block = render([], kept, make_index([]), make_config(), opening=True)
     rows = row_lines(block)
 
     assert "- eager-skill: Eager skill" in rows

@@ -715,7 +715,7 @@ def test_the_stand_in_chain_has_the_same_shape(plugin_module, endpoints, tmp_pat
     payload = chat_payload()
     before = copy.deepcopy(payload)
 
-    result = _stand_in(callback, payload, **DISPATCH_KWARGS)
+    result = _stand_in(callback, payload, **{**DISPATCH_KWARGS, "session_id": "session-stand-in"})
 
     assert result.changed is True
     assert result.original_payload == before

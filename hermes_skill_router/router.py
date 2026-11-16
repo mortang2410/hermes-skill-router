@@ -101,7 +101,7 @@ from .display import INERT, ROUTED, record
 from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
-from .inject import DROPPED_HEADER, DROPPED_MESSAGE, HEADER, render, suggested_names
+from .inject import HEADER, displayed_names, render, suggested_names
 from .library import Index, PathResolver, is_partial_view, load_or_build, path_resolver, will_embed
 from .rerank import rerank as default_rerank
 from .search import (
@@ -118,7 +118,15 @@ from .search import (
 from .select import Suggestion, select
 from .setup_check import BUNDLED_BASES, check_setup_state, setup_note
 from .tools import skill_path
-from .writeback import ORIGIN_CURATOR, admit_block, derive_origin, generation, stored_blocks
+from .writeback import (
+    ORIGIN_CURATOR,
+    admit_block,
+    derive_origin,
+    generation,
+    mark_stripped,
+    stored_blocks,
+    stripped_sent,
+)
 from .curator import curator_rewrite
 
 logger = logging.getLogger(__name__)
@@ -142,8 +150,8 @@ BUDGET_NOTE = (
 )
 
 #: The catalog already went out in this compaction window (failure tier): the loss is that no
-#: suggestions were made, and the fix is the list tool, the same fix the dropped marker names.
-DROPPED_NOTE = (
+#: suggestions were made, and the fix is the list tool.
+CATALOG_MODE_NOTE = (
     "Skill catalog was already shown earlier in this compaction window, so no suggestions were "
     "made this turn. Call skills_list to see every skill available."
 )
@@ -162,10 +170,6 @@ BUILD_NOTE = "Building the skill index; suggestions will appear once the build f
 #: Both headers share their first line, so the double-injection guard recognises either variant from
 #: the line alone. A last message that already starts with it was injected once already.
 INJECTED_HEADER = HEADER.split("\n", 1)[0]
-
-#: The dropped-catalog marker's first line. It is distinct from the block header on purpose: the
-#: strip guard below recognises the marker as its own proof that the catalog already went out.
-DROPPED_HEADER_LINE = DROPPED_HEADER.split("\n", 1)[0]
 
 #: The most preceding-context characters that join the newest typed message, counted over whole
 #: messages from the newest backwards. The newest message itself is never part of this cap.
@@ -278,13 +282,10 @@ def _compose(
         # The previous turn's block is the last message; injecting again would compound it.
         return None
     previous = _prior_blocks(messages)
-    dropped_before = _dropped_before(messages)
     # The dump record says whether a failed pass in this session's current window already sent the
     # whole catalog. The host's post_compaction event expires that mark when a compaction commits,
     # so no message text is inspected for a summary: a paste can neither open nor keep a window.
     dumped_before = dumped(session_id, task_id=task_id)
-    if dumped_before:
-        dropped_before = True
     stripped, partition = strip_catalog(
         payload, eager=cfg.eager_skills, deferred=cfg.deferred_skills
     )
@@ -295,37 +296,36 @@ def _compose(
     # The tool ranks the routed half of this partition, so it remembers the rows this prompt
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition, task_id=task_id)
-    # C1: the origin class and this window's stored blocks decide what this
-    # request re-inserts. Re-insertion replays only same-origin,
-    # same-generation blocks, deduped by byte search, on every outgoing
-    # request regardless of routing success.
+    # C1: the origin class (derived above) and this window's stored blocks
+    # decide what this request re-inserts. Re-insertion replays only
+    # same-origin, same-generation blocks, deduped by byte search, on every
+    # outgoing request regardless of routing success.
     store_key = session_id or task_id or ""
     stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
     base_messages = _reinsert(stripped.get("messages") or (), stored)
+    stripped_already = stripped_sent(store_key, cfg.cache_path)
     def _fail(reason: str, note: str = ""):
-        """Return the failure result for this pass.
+        """Return the failure result for this pass (contract C5).
 
         The first failure in a window returns ``None`` and the request keeps its catalog, which
-        is one clean dump. A later failure in the same window strips the catalog and appends the
-        dropped marker, so the model never reads the whole catalog twice. Both paths record
-        inert and log once, and both leave the input payload untouched. *note* is contract C7's
-        one line when a per-request call failed, which outranks every other note this turn; it
+        is one clean dump; it puts the window in catalog mode, and every later payload in
+        catalog mode repeats the full catalog unchanged. Once a stripped payload has gone
+        out (a routed block, a store-failure turn, or any stripped state), every later
+        failure keeps the stripped state with the stored blocks and appends no fresh
+        block. No failure result is ``None`` after a stripped payload went out, and no
+        marker message is ever appended (contract C5). *note* is contract C7's one line
+        when a per-request call failed, which outranks every other note this turn; it
         rides on the inert record only, so the surfaces can say no suggestions were made.
         """
         _log_once(reason)
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
-        if not previous and not dropped_before and not dumped_before:
+        if dumped_before:
+            return {"request": dict(payload)}
+        if not previous and not stored and not stripped_already:
             remember_dump(session_id, task_id=task_id)
             return None
-        return {
-            "request": {
-                **dict(payload),
-                "messages": [
-                    *base_messages,
-                    {"role": "system", "content": DROPPED_MESSAGE},
-                ],
-            }
-        }
+        mark_stripped(store_key, cfg.cache_path)
+        return {"request": {**dict(payload), "messages": base_messages}}
 
     query = _query_text(messages)
     if not query:
@@ -369,12 +369,12 @@ def _compose(
             return _fail("index build failed", note)
     if not index.names:
         return _fail("the skill index carries no row")
-    if dropped_before or dumped_before:
+    if dumped_before:
         # A dump earlier in this window already showed every skill, so nothing is suggestible
-        # for the rest of the window even when ranking would succeed now. The dropped-window
-        # part rides this failed turn: every build failure above pre-empts this check, so this
-        # point is reached only when no build failure happened.
-        return _fail("catalog already dumped in this window", DROPPED_NOTE)
+        # for the rest of the window even when ranking would succeed now: the window keeps the
+        # catalog byte-identical (C5 catalog mode). Every build failure above pre-empts this
+        # check, so this point is reached only when no build failure happened.
+        return _fail("catalog already dumped in this window", CATALOG_MODE_NOTE)
     # One memo for the whole pass: the recency gate and the selection both resolve through the
     # same saved map, so a candidate is looked up at most once a pass and never again once known.
     resolve = path_resolver(cfg, index, skill_path)
@@ -411,10 +411,12 @@ def _compose(
     # the association store's background thread under its one-attempt lock,
     # and a failure here costs the turn nothing.
     _request_learning_scan(cfg, index)
-    # The payload's own prior blocks decide both what this turn must not repeat and whether the
-    # pinned rows belong here. Nothing is remembered between calls.
-    suppressed = {name for block in previous for name in suggested_names(block)}
-    suppressed.update(name for _index, block in stored for name in suggested_names(block))
+    # The payload's own prior blocks plus the origin store decide both what this turn must
+    # not repeat and whether the pinned rows belong here. Unique appearance covers every
+    # displayed category (C5): the reader returns all displayed names, so a kept row shown
+    # in any section never reappears in the window.
+    suppressed = {name for block in previous for name in displayed_names(block)}
+    suppressed.update(name for _index, block in stored for name in displayed_names(block))
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
     wanted.extend(name for name in partition.kept.names if name in eager)
@@ -447,6 +449,7 @@ def _compose(
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if not stored:
             return None
+        mark_stripped(store_key, cfg.cache_path)
         return {"request": {**dict(payload), "messages": base_messages}}
     if note.strip() and block == note.strip():
         # The renderer returned the degraded note on its own: no row is shown, so the catalog must
@@ -456,6 +459,7 @@ def _compose(
         # state unchanged instead (C1, same as the empty-block path above).
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if stored:
+            mark_stripped(store_key, cfg.cache_path)
             return {
                 "request": {
                     **dict(payload),
@@ -475,6 +479,10 @@ def _compose(
     admitted = admit_block(
         payload, store_key, block, len(base_messages), origin, cfg.cache_path
     )
+    # A stripped payload goes out either way (fresh block, or admitted blocks
+    # with the catalog state unchanged on a store failure): later failures in
+    # this window keep the stripped state (C5).
+    mark_stripped(store_key, cfg.cache_path)
     rewritten = {
         **dict(payload),
         "messages": (
@@ -608,22 +616,6 @@ def _message_text(message: Any) -> str:
         )
     return ""
 
-
-def _dropped_before(messages: Any) -> bool:
-    """Return whether any message opens with the dropped-catalog marker's first line.
-
-    The marker is this plugin's own proof that the whole catalog already went out in this window
-    on a failed pass. A compaction that removes it starts a new window and the catalog may go
-    out again, exactly as with a routed block.
-    """
-    if not isinstance(messages, list):
-        return False
-    for message in messages:
-        if not isinstance(message, Mapping) or message.get("role") != "system":
-            continue
-        if _message_text(message).startswith(DROPPED_HEADER_LINE):
-            return True
-    return False
 
 
 def _resolve_paths(names: Sequence[str], resolve: PathResolver) -> Dict[str, str]:
