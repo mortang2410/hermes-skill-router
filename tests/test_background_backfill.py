@@ -350,10 +350,10 @@ def test_a_failed_heal_warns_in_the_host_log_and_hands_one_note_to_c5(
     assert capsys.readouterr().err == "", "the background job wrote to stderr"
 
 
-def test_a_completed_heal_logs_only_completion_and_injects_no_note(
+def test_a_completed_heal_logs_start_and_completion_and_injects_no_note(
     hermes, tmp_path, caplog, capsys, monkeypatch
 ):
-    """A completed heal logs one completion line and injects no failure note."""
+    """A completed heal logs start then completion lines and injects no failure note."""
     _populate(hermes)
     store_path = str(tmp_path / "recovering.db")
     real_heal = associations_module.heal_store
@@ -377,9 +377,10 @@ def test_a_completed_heal_logs_only_completion_and_injects_no_note(
         for record in caplog.records
         if record.levelno == logging.INFO and "background heal" in record.getMessage()
     ]
-    assert len(completions) == 1, "a completed heal did not log exactly one host-logger line"
-    assert "finished" in completions[0].getMessage()
-    assert "sessions" in completions[0].getMessage(), "the completion line did not report the pass"
+    assert len(completions) == 2, "a completed heal did not log start and finish host-logger lines"
+    assert "started" in completions[0].getMessage(), "the first heal line did not announce the start"
+    assert "finished" in completions[1].getMessage()
+    assert "sessions" in completions[1].getMessage(), "the completion line did not report the pass"
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING], (
         "a successful heal warned"
     )

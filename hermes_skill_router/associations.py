@@ -2855,6 +2855,7 @@ def _run_heal(
     a pass that finishes clears the note. A store that the pass left complete drops the note too,
     so a stale failure is never surfaced.
     """
+    logger.info("skill associations: the background heal of %s started", store_path)
     report: Optional[BackfillReport] = None
     try:
         report = entry(store_path, state_db_path, catalog=catalog, now_ms=now_ms)
