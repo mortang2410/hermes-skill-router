@@ -2476,6 +2476,140 @@ def _settle_flag_best_effort(store: AssociationStore, store_path: str) -> None:
         )
 
 
+#: Whether a continuous-learning scan is in flight, across stores. One scan
+#: runs at a time, exactly like one heal: the one-attempt lock serializes
+#: both. This flag is separate from :data:`_HEAL_STATE` on purpose: the heal
+#: attempt state feeds the degraded-line wording (C1), and a learning scan
+#: settling must not flip that wording. A restart clears it along with the
+#: heal latch (see :func:`reset_heal_state`); ``behind`` is derived, so it
+#: survives.
+_LEARNING_RUNNING = False
+
+
+def _newest_and_session_ids(state_db_path: Optional[str]) -> Tuple[int, set]:
+    """Return ``(newest_session_stamp_ms, session_id_set)`` from the Hermes store.
+
+    One read-only open answers both: the newest stamp and the identity set
+    the behind check compares against ``seen_sessions``. Raises when the
+    session store cannot be read, so the caller can answer "not behind".
+    """
+    source = _open_state_db(state_db_path or default_state_db_path())
+    try:
+        ids = {
+            str(row["id"])
+            for row in source.execute("SELECT id FROM sessions").fetchall()
+        }
+        row = source.execute(
+            "SELECT MAX(COALESCE(last_activity_at, started_at)) AS stamp FROM sessions"
+        ).fetchone()
+    finally:
+        source.close()
+    newest = _stamp_of(row["stamp"]) if row is not None else 0
+    return newest, ids
+
+
+def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> bool:
+    """Return whether sessions exist that the learning watermark has not ingested.
+
+    ``behind`` is derived, never stored: a session stamp newer than
+    ``META_LAST_SCAN_MS``, or a session id the store's ``seen_sessions``
+    has never listed (a mid-scan arrival whose stamp ties or backdates the
+    watermark is still missed by the second check). A failed scan and a
+    restart therefore both keep ``behind``: the watermark and the session
+    store survive, and the next turn re-derives it. Never raises: an
+    unreadable session store is no evidence of new sessions, so the turn
+    starts no scan and the next turn retries.
+
+    A store that has never been scanned (missing, unreadable or an empty
+    zero-watermark store) is never behind: the heal (C4) owns creating one,
+    and its first uncapped pass walks every session, so nothing is missed.
+    Continuous learning ingests new sessions on a store that already has
+    a watermark.
+    """
+    path = os.path.expanduser(store_path)
+    try:
+        store = open_store(path, read_only=True)
+    except Exception:
+        return False
+    try:
+        watermark = _meta_int(store, META_LAST_SCAN_MS)
+        seen = {
+            str(row[0])
+            for row in store.conn.execute("SELECT session_id FROM seen_sessions").fetchall()
+        }
+    except Exception:
+        return False
+    finally:
+        store.close()
+    if watermark <= 0:
+        return False
+    try:
+        newest, ids = _newest_and_session_ids(state_db_path)
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    if not ids:
+        return False
+    if newest > watermark:
+        return True
+    return bool(ids - seen)
+
+
+def request_learning_scan(
+    store_path: str,
+    state_db_path: Optional[str] = None,
+    *,
+    catalog: Sequence[CatalogSkill] = (),
+    now_ms: Optional[int] = None,
+) -> bool:
+    """Start one continuous-learning scan for *store_path* and return whether it started.
+
+    :data:`_LEARNING_RUNNING` is the in-flight flag this request sets and
+    clears; it is read and written only under :data:`_HEAL_LOCK`.
+
+    The C8 counterpart of :func:`request_heal`: a routed turn calls this on
+    every turn and it starts a scan only when the store is behind (see
+    :func:`learning_behind`) and no scan is in flight — the one-attempt
+    lock serializes scans on the background thread, so a second routed
+    turn while a scan runs starts no parallel scan. The persisted heal
+    finished flag never gates this request: it gates the heal (C2), and
+    the scan's retry after a failure or a restart is exactly what
+    "behind is kept" means. The job is the same uncapped backfill entry
+    point :func:`request_heal` runs (:func:`heal_store`), resolved before
+    the thread starts, so a test that replaces it for one turn cannot have
+    a late thread fall back to the real scan; a settle is therefore an
+    uncapped settle for C2's finished flag as well. A thread that cannot
+    start is a failed scan: it warns in the host logger and starts no
+    scan, so the next turn retries. Never raises into the turn.
+    """
+    global _LEARNING_RUNNING
+    if not learning_behind(store_path, state_db_path):
+        return False
+    path = os.path.expanduser(store_path)
+    entry = heal_store
+    with _HEAL_LOCK:
+        if _HEAL_RUNNING in _HEAL_STATE.values():
+            return False
+        if _LEARNING_RUNNING:
+            return False
+        _LEARNING_RUNNING = True
+    try:
+        thread = threading.Thread(
+            target=_run_learning_scan,
+            args=(entry, path, state_db_path, tuple(catalog), now_ms),
+            name="hermes-skill-router-learning",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as exc:  # no thread can be started; never carry the failure into a turn
+        logger.warning(
+            "skill associations: cannot start the background learning scan of %s: %s", path, exc
+        )
+        with _HEAL_LOCK:
+            _LEARNING_RUNNING = False
+        return False
+    return True
+
+
 def request_heal(
     store_path: str,
     state_db_path: Optional[str] = None,
@@ -2508,6 +2642,8 @@ def request_heal(
         if _HEAL_STATE.get(store_path) is not None:
             return False
         if _HEAL_RUNNING in _HEAL_STATE.values():
+            return False
+        if _LEARNING_RUNNING:
             return False
         _HEAL_STATE[store_path] = _HEAL_RUNNING
     try:
@@ -2610,10 +2746,17 @@ def heal_failure_note(store_path: str) -> Optional[str]:
 
 
 def reset_heal_state() -> None:
-    """Forget every launched heal attempt. Tests call this; production never needs it."""
+    """Forget every launched heal attempt and every in-flight learning scan.
+
+    Tests call this; production never needs it. It simulates a restart: the
+    in-memory latches are gone, the persisted watermark and ``behind`` (which
+    is derived from it) survive.
+    """
+    global _LEARNING_RUNNING
     with _HEAL_LOCK:
         _HEAL_STATE.clear()
         _HEAL_FAILURES.clear()
+        _LEARNING_RUNNING = False
 
 
 def _run_heal(
@@ -2661,6 +2804,46 @@ def _run_heal(
         _HEAL_STATE[store_path] = _HEAL_FINISHED
     if complete:
         note_store_complete(store_path)
+
+
+def _run_learning_scan(
+    entry: Callable[..., BackfillReport],
+    store_path: str,
+    state_db_path: Optional[str],
+    catalog: Sequence[CatalogSkill],
+    now_ms: Optional[int],
+) -> None:
+    """Run one continuous-learning scan, then clear the in-flight flag.
+
+    Failure is logged in the host logger and never raised: a scan thread
+    has no listener, so this is the only place that failure can be reported
+    from. It touches no heal bookkeeping: no failure note (the degraded
+    line keeps its heal wording), no attempt state, and the persisted
+    finished flag is whatever the entry point's own settle wrote. The
+    watermark is untouched by a failed pass, and ``behind`` re-derives from
+    it, so the next routed turn retries; a successful pass advances the
+    watermark and ``behind`` clears unless a session arrived mid-scan,
+    which ``behind`` re-derives from the session store.
+    """
+    global _LEARNING_RUNNING
+    report: Optional[BackfillReport] = None
+    try:
+        report = entry(store_path, state_db_path, catalog=catalog, now_ms=now_ms)
+    except Exception as exc:  # a failed scan must not kill the thread or the process
+        logger.warning(
+            "skill associations: the background learning scan of %s failed: %s", store_path, exc
+        )
+    if report is not None:
+        logger.info(
+            "skill associations: the background learning scan of %s finished: %d sessions, "
+            "%d loads, %d ms",
+            store_path,
+            report.sessions_found,
+            report.loads,
+            report.ms,
+        )
+    with _HEAL_LOCK:
+        _LEARNING_RUNNING = False
 
 
 def _open_state_db(path: str) -> sqlite3.Connection:

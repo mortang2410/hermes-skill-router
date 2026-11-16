@@ -386,6 +386,13 @@ def _compose(
         index=index,
         partial_view=built_index and is_partial_view(cfg, partition.routed),
     )
+    # C8: this successful routed turn ingests new sessions regardless of the
+    # completeness window; the window only picked the wording above, never
+    # the ingest. The degraded line was already composed, so the scan's own
+    # attempt state never rewrites this turn's wording. The scan runs on
+    # the association store's background thread under its one-attempt lock,
+    # and a failure here costs the turn nothing.
+    _request_learning_scan(cfg, index)
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
@@ -693,6 +700,28 @@ def _degraded_note(
         if trap:
             parts.append(trap)
     return " ".join(parts)
+
+
+def _request_learning_scan(cfg: Config, index: Optional[Index]) -> None:
+    """Ask the association store for one continuous-learning scan, never raising.
+
+    The store path is the same one the pass read; the catalog rides along
+    so the scan's reconcile names skills the router can suggest. The
+    associations module owns the behind check and the one-attempt lock:
+    this helper only carries the configured path and index names, and a
+    failure is swallowed because the turn's routing never depends on
+    learned history.
+    """
+    path = _configured_store_path(cfg)
+    if path is None or index is None:
+        return
+    try:
+        associations.request_learning_scan(
+            path,
+            catalog=[associations.CatalogSkill(name) for name in index.names],
+        )
+    except Exception:  # the scan is best effort; the turn's routing does not wait for it
+        logger.debug("skill router: the learning scan request raised", exc_info=True)
 
 
 def _setup_probe(
