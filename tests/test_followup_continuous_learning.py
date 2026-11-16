@@ -818,6 +818,97 @@ def test_an_existing_corrupt_store_with_finished_latch_stays_heal_owned(
     assert store_path.read_bytes() == before, "the corrupt store was modified by the check"
 
 
+def test_an_inaccessible_existing_store_with_finished_latch_stays_heal_owned(
+    hermes, tmp_path, monkeypatch
+):
+    """Errno lens: an existing store under a parent without search permission.
+
+    ``os.path.lexists`` returns False for any ``lstat`` error, so an
+    existing store under a ``chmod 000`` parent reads as absent (EACCES,
+    probe-confirmed identical to a genuinely missing path). With a
+    finished in-memory latch and source data present, the bootstrap
+    branch must still fail closed: ``learning_behind`` stays False and
+    no learning scan starts, exactly as for an existing corrupt store.
+    The store bytes are unchanged once the parent is searchable again.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    store_path = locked / "inaccessible.db"
+    store_path.write_text("existing store bytes\n", encoding="utf-8")
+    before = store_path.read_bytes()
+    _add_session(hermes, "s-new", T0)
+
+    real_start = threading.Thread.start
+    attempts = {"n": 0}
+
+    def flaky_start(self):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("cannot start heal thread (transient)")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False
+    assert attempts["n"] == 1
+    assert associations_module.heal_state(str(store_path)) == "finished"
+
+    locked.chmod(0o000)
+    try:
+        if os.path.lexists(str(store_path)):
+            pytest.skip("platform opened a path under a 000 parent anyway")
+        assert associations_module.learning_behind(str(store_path)) is False, (
+            "an inaccessible existing store with a finished latch claimed the bootstrap"
+        )
+        assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+            "a scan started over an inaccessible existing store"
+        )
+    finally:
+        locked.chmod(0o755)
+    assert store_path.read_bytes() == before, "the inaccessible store was modified by the check"
+
+
+def test_a_dangling_symlink_store_with_finished_latch_stays_heal_owned(
+    hermes, tmp_path, monkeypatch
+):
+    """Errno lens: a dangling symlink is existing, never bootstrap-eligible.
+
+    ``lstat`` succeeds on a dangling symlink even though ``exists``
+    follows the link and returns False, so the absence test must count
+    it as existing: with a finished latch and source data present,
+    ``learning_behind`` stays False, no scan starts, and neither the
+    link nor its missing target is created.
+    """
+    store_path = tmp_path / "dangling.db"
+    target_path = tmp_path / "no-such-target.db"
+    store_path.symlink_to(target_path)
+    assert store_path.is_symlink()
+    assert not os.path.exists(str(store_path)), "the fixture precreated the symlink target"
+    _add_session(hermes, "s-new", T0)
+
+    real_start = threading.Thread.start
+    attempts = {"n": 0}
+
+    def flaky_start(self):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("cannot start heal thread (transient)")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    assert associations_module.request_heal(str(store_path), str(hermes.path)) is False
+    assert attempts["n"] == 1
+    assert associations_module.heal_state(str(store_path)) == "finished"
+
+    assert associations_module.learning_behind(str(store_path)) is False, (
+        "a dangling-symlink store with a finished latch claimed the bootstrap"
+    )
+    assert associations_module.request_learning_scan(str(store_path), catalog=CATALOG) is False, (
+        "a scan started over a dangling-symlink store"
+    )
+    assert store_path.is_symlink(), "the check replaced the dangling symlink"
+    assert not target_path.exists(), "the check created the symlink target"
+
+
 def test_a_failed_first_heal_then_recovery_bootstraps_learning(hermes, tmp_path):
     """F1: a first heal whose pass failed (watermark 0) must not trap learning."""
     store_path = tmp_path / "bootstrap-failed.db"

@@ -54,6 +54,7 @@ bit-identical: both apply the same recurrence to the same events in ``load_event
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -2540,7 +2541,10 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
     a first heal that settled empty or failed cannot trap later data.
     An unsettled zero-watermark store is still the heal's to scan.
 
-    A read-only open failure splits two cases. A genuinely absent path
+    A read-only open failure splits two cases. Absence is proven by
+    ``lstat`` errno (``ENOENT``/``ENOTDIR`` only); any other ``lstat``
+    error means the path exists or is unprovable and fails closed as
+    heal-owned. A genuinely absent path
     (never created) with an in-memory finished attempt is
     bootstrap-eligible: a thread-start failure records that attempt
     before any file exists, so without this branch learning would stay
@@ -2570,12 +2574,22 @@ def learning_behind(store_path: str, state_db_path: Optional[str] = None) -> boo
         # Only a genuinely absent path (never created) is creatable. An
         # existing path whose read-only open failed is unreadable,
         # corrupt or foreign, and stays heal-owned even when the latch
-        # reads finished. lexists counts a dangling symlink as existing.
+        # reads finished. Absence is proven by lstat errno, never by
+        # lexists: lexists returns False for any lstat error, so an
+        # existing path under a search-less parent (EACCES) would read
+        # as absent. Only ENOENT/ENOTDIR mean absent; any other OSError
+        # (EACCES, ELOOP, ENAMETOOLONG, ...) means the path exists or
+        # is unprovable, and fails closed as heal-owned. An lstat
+        # success counts as existing, which retains dangling-symlink
+        # protection: a dangling link lstats fine.
         try:
-            exists = os.path.lexists(path)
-        except (OSError, ValueError):
+            os.lstat(path)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                return False
+        except ValueError:
             return False
-        if exists:
+        else:
             return False
         # Absent path: an in-memory finished attempt makes it
         # bootstrap-eligible against source data; an unsettled first
