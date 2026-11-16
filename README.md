@@ -179,6 +179,30 @@ the ones most setups touch:
 Every other key, with its bound and its effect, is in the
 [configuration reference](technical-documentation.md#configuration).
 
+## Analytics
+
+[tools/analytics_scores.py](tools/analytics_scores.py) is a read-only score-drift check.
+It recomputes the search score for every catalog skill and replays the historical
+association score as of each logged decision, then flags every skill whose
+history-minus-search divergence reaches 0.4 and prints its top-5 diverging prompts,
+or `no anomalies`. Run it from the checkout root with the logged run's values:
+
+```bash
+python3 tools/analytics_scores.py \
+  --store <copy of associations.db> \
+  --log <plugin log with decision lines> \
+  --catalog <saved-index JSON copy> \
+  --embed-url <embeddings endpoint URL> \
+  --max-description-chars <the logged run's value> \
+  --state-db <Hermes session store> \
+  --assert-complete-source-history
+```
+
+`--embed-model` and `--embed-timeout-ms` are optional. When omitted, each defaults to
+the workspace config's `embedModelId` and `embedTimeoutMs`, then to the built-in
+default where no custom config exists. The script opens the store and the session
+store read-only and never writes either.
+
 ## Documentation
 
 - [technical-documentation.md](technical-documentation.md) covers routing end to end, the request
