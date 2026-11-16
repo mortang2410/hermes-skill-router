@@ -399,6 +399,11 @@ def expire_window(session_id: str, cache_path: Any) -> None:
         _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
     try:
         store = _read_store(cache_path)
+        if session_id not in store.get("windows", {}):
+            # No window was ever opened for this session: nothing to deactivate
+            # and no generation to advance, and no empty store is materialized
+            # (the default-path store never springs into existence for it).
+            return
         window = _window(store, session_id)
         row_ids = [r for r in window["row_ids"] if isinstance(r, int)]
         db = _session_db() if row_ids else None

@@ -350,10 +350,15 @@ def test_register_records_one_middleware_one_search_tool_and_two_hooks(plugin_mo
     plugin_module.register(ctx)
 
     assert ctx.tools == ["skill_router_search"]
-    assert ctx.hooks == [
-        ("post_compaction", plugin_module.on_post_compaction),
-        ("on_session_end", plugin_module.on_session_end),
-    ]
+    # The post_compaction hook is registered through a closure that carries the
+    # operator's configured cachePath (F1 fix), so identity is not asserted;
+    # its behavior against a custom cache is pinned by
+    # test_the_registered_post_compaction_hook_expires_the_custom_cache.
+    assert [name for name, _cb in ctx.hooks] == ["post_compaction", "on_session_end"]
+    post_compaction_cb = ctx.hooks[0][1]
+    assert callable(post_compaction_cb)
+    post_compaction_cb(session_id="no-such-session", old_session_id="", kind="summarize")
+    assert ctx.hooks[1] == ("on_session_end", plugin_module.on_session_end)
     assert ctx.commands == []
     assert len(ctx.middleware) == 1
     kind, callback = ctx.middleware[0]

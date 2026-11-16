@@ -64,7 +64,13 @@ else:  # imported as a bare module, e.g. by a test collector walking this reposi
 logger = logging.getLogger(__name__)
 
 
-def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs: Any) -> None:
+def on_post_compaction(
+    session_id: str = "",
+    old_session_id: str = "",
+    *,
+    cache_path: Any = None,
+    **kwargs: Any,
+) -> None:
     """Open a new compaction window for every session the committed compaction names.
 
     The host calls this after a compaction commits, with the event's fields as keywords plus a
@@ -72,9 +78,12 @@ def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs:
     record, because a fork moves the conversation to a new id and a record left on the old one
     would keep that session's catalog dumped forever. A missing, empty or non-string id is nothing
     to do, a repeated id discards an absent mark, and the callback returns ``None`` and never
-    raises, so a compaction can never abort a turn.
+    raises, so a compaction can never abort a turn. The writeback store lives beside the
+    operator's configured ``cachePath``, so the resolved path is passed in at registration; a
+    directly invoked callback without one falls back to the default config.
     """
-    cache_path = load().cache_path
+    if cache_path is None:
+        cache_path = load().cache_path
     for named in (session_id, old_session_id):
         if isinstance(named, str) and named:
             expire_dump(named)
@@ -132,7 +141,12 @@ def register(ctx: Any) -> None:
 
     ctx.register_middleware("llm_request", on_llm_request)
     register_tools(ctx)
-    ctx.register_hook("post_compaction", on_post_compaction)
+    cache_path = load(read_settings(ctx)).cache_path
+
+    def _on_post_compaction(**kwargs: Any) -> None:
+        on_post_compaction(cache_path=cache_path, **kwargs)
+
+    ctx.register_hook("post_compaction", _on_post_compaction)
     ctx.register_hook("on_session_end", on_session_end)
 
 

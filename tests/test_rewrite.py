@@ -2203,6 +2203,51 @@ def test_writeback_post_compaction_deactivates_rows_and_expires(tmp_path, monkey
     assert wb.stored_blocks("s1", wb.ORIGIN_NORMAL, 0, cfg.cache_path) == []
 
 
+def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, monkeypatch):
+    """Ticket 01 review fix: the registered hook expires the operator's configured cache.
+
+    The middleware writes the store beside the configured ``cachePath``; the hook registered
+    through ``register`` must expire that same store, not the default path. A custom cachePath
+    with an admitted block and a fake SessionDB: after the registered callback runs, the row is
+    deactivated, the generation advances, and no window leaks into the default-path store.
+    """
+    from hermes_skill_router import writeback as wb
+
+    custom_cache = str(tmp_path / "custom" / "index.json")
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    cfg = make_config(tmp_path, cachePath=custom_cache)
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    row_id = fake.rows[-1]["id"]
+    assert wb.generation("s1", custom_cache) == 0
+
+    plugin_module = _load_plugin_module()
+    ctx = RecordingContext()
+    default_get_config = ctx.get_config
+
+    def get_config(key, default=None):
+        if key == "cachePath":
+            return custom_cache
+        return default_get_config(key, default)
+
+    ctx.get_config = get_config
+    plugin_module.register(ctx)
+    callback = {name: cb for name, cb in ctx.hooks}["post_compaction"]
+
+    callback(session_id="s1", old_session_id="", kind="summarize", reason="handoff_commit")
+    assert fake.deactivated == [row_id]
+    assert wb.generation("s1", custom_cache) == 1
+    default_store = Path.home() / ".cache" / "hermes-skill-router" / "writeback-store.json"
+    if default_store.exists():
+        store = json.loads(default_store.read_text(encoding="utf-8"))
+        assert "s1" not in store.get("windows", {}), "the hook leaked the window into the default store"
+
+
 def test_writeback_store_failure_sends_stored_blocks_never_none(tmp_path, monkeypatch):
     from hermes_skill_router import writeback as wb
 
