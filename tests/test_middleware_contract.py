@@ -492,7 +492,7 @@ def test_every_no_rewrite_path_delivers_on_the_first_supported_turn(
     callback = _callback_for(plugin_module, settings)
 
     def fresh_cache():
-        for name in ("index.json", "config-switches.json", "suggestions.json"):
+        for name in ("index.json", "config-switches.json", "suggestions.json", "writeback-store.json"):
             path = tmp_path / name
             if path.exists():
                 path.unlink()

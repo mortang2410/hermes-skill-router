@@ -418,6 +418,10 @@ def test_a_search_leaves_the_next_turn_unchanged(tmp_path, fake_clients, session
         ],
     }
     rewrite(payload, cfg=cfg, embed=embedder, rerank=reranker, session_id="session-1")
+    # Baseline: the next turn with no search in between. Under the write-back window
+    # that next turn legitimately suppresses the opening turn's names (D4), so the
+    # search is isolated by comparing against this baseline, not the opening turn.
+    rewrite(payload, cfg=cfg, embed=embedder, rerank=reranker, session_id="session-1")
     before = read(cfg.suggestions_path)["names"]
 
     handle({"query": QUERY}, settings=settings(tmp_path), session_id="session-1")
@@ -426,7 +430,10 @@ def test_a_search_leaves_the_next_turn_unchanged(tmp_path, fake_clients, session
 
     assert after["names"] == before
     assert after["origin"] == "turn"
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["suggestions.json"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "suggestions.json",
+        "writeback-store.json",
+    ]
 
 
 def test_the_tool_repeats_the_turn_selection_on_the_same_catalog(tmp_path, fake_clients):

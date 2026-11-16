@@ -48,6 +48,7 @@ if __package__:
     from .hermes_skill_router.router import CHAT_COMPLETIONS, INJECTED_HEADER, rewrite
     from .hermes_skill_router.search import expire_dump, forget_session
     from .hermes_skill_router.tools import register_tools
+    from .hermes_skill_router.writeback import expire_window
 else:  # imported as a bare module, e.g. by a test collector walking this repository
     from hermes_skill_router.config import (
         acknowledge_switch_deliveries,
@@ -58,6 +59,7 @@ else:  # imported as a bare module, e.g. by a test collector walking this reposi
     from hermes_skill_router.router import CHAT_COMPLETIONS, INJECTED_HEADER, rewrite
     from hermes_skill_router.search import expire_dump, forget_session
     from hermes_skill_router.tools import register_tools
+    from hermes_skill_router.writeback import expire_window
 
 logger = logging.getLogger(__name__)
 
@@ -72,9 +74,11 @@ def on_post_compaction(session_id: str = "", old_session_id: str = "", **kwargs:
     to do, a repeated id discards an absent mark, and the callback returns ``None`` and never
     raises, so a compaction can never abort a turn.
     """
+    cache_path = load().cache_path
     for named in (session_id, old_session_id):
         if isinstance(named, str) and named:
             expire_dump(named)
+            expire_window(named, cache_path)
 
 
 def on_session_end(session_id: str = "", task_id: str = "", **kwargs: Any) -> None:
@@ -116,6 +120,7 @@ def register(ctx: Any) -> None:
                 session_id=kwargs.get("session_id") or "",
                 turn_id=kwargs.get("turn_id") or "",
                 task_id=kwargs.get("task_id") or "",
+                platform=kwargs.get("platform") or "",
                 api_mode=kwargs.get("api_mode") or "chat_completions",
             )
         except Exception:  # a plugin bug must never abort a model call
@@ -138,6 +143,7 @@ def _route(
     session_id: str = "",
     turn_id: str = "",
     task_id: str = "",
+    platform: str = "",
     api_mode: str = "chat_completions",
 ) -> Any:
     """Validate the config, then hand the request to the rewrite. Returns ``None`` for no change.
@@ -168,7 +174,13 @@ def _route(
         return None
     switch_messages = switch_warning_messages(cfg)
     result = rewrite(
-        request, cfg=cfg, session_id=session_id, turn_id=turn_id, task_id=task_id, api_mode=api_mode
+        request,
+        cfg=cfg,
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id=task_id,
+        platform=platform,
+        api_mode=api_mode,
     )
     if not isinstance(result, Mapping):
         # No catalog, first failure, already injected, or an exception inside the

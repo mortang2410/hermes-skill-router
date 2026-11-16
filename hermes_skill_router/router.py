@@ -118,6 +118,7 @@ from .search import (
 from .select import Suggestion, select
 from .setup_check import BUNDLED_BASES, check_setup_state, setup_note
 from .tools import skill_path
+from .writeback import admit_block, derive_origin, generation, stored_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,7 @@ def rewrite(
     session_id: str = "",
     turn_id: str = "",
     task_id: str = "",
+    platform: str = "",
     notify: Optional[Notify] = None,
 ) -> Optional[Mapping[str, Any]]:
     """Return ``{"request": <rewritten payload>}``, or ``None`` when the request must stay as it is.
@@ -231,6 +233,7 @@ def rewrite(
             session_id=session_id,
             turn_id=turn_id,
             task_id=task_id,
+            platform=platform,
             notify=notify,
         )
     except Exception:  # a plugin bug must never abort the model call
@@ -249,6 +252,7 @@ def _compose(
     session_id: str,
     turn_id: str,
     task_id: str,
+    platform: str,
     notify: Optional[Notify],
 ) -> Optional[Mapping[str, Any]]:
     """Run the pipeline once and return the middleware result, or ``None`` for no change."""
@@ -284,6 +288,14 @@ def _compose(
     # The tool ranks the routed half of this partition, so it remembers the rows this prompt
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition, task_id=task_id)
+    # C1: the origin class and this window's stored blocks decide what this
+    # request re-inserts. Re-insertion replays only same-origin,
+    # same-generation blocks, deduped by byte search, on every outgoing
+    # request regardless of routing success.
+    origin = derive_origin(platform, messages)
+    store_key = session_id or task_id or ""
+    stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
+    base_messages = _reinsert(stripped.get("messages") or (), stored)
     def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass.
 
@@ -303,7 +315,7 @@ def _compose(
             "request": {
                 **dict(payload),
                 "messages": [
-                    *list(stripped.get("messages") or ()),
+                    *base_messages,
                     {"role": "system", "content": DROPPED_MESSAGE},
                 ],
             }
@@ -396,6 +408,7 @@ def _compose(
     # The payload's own prior blocks decide both what this turn must not repeat and whether the
     # pinned rows belong here. Nothing is remembered between calls.
     suppressed = {name for block in previous for name in suggested_names(block)}
+    suppressed.update(name for _index, block in stored for name in suggested_names(block))
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
     wanted.extend(name for name in partition.kept.names if name in eager)
@@ -421,9 +434,14 @@ def _compose(
     )
     if not block:
         # No selected suggestion and no kept row: stripping without a replacement would lose the
-        # catalog for nothing, so the whole request is returned untouched.
+        # catalog for nothing, so the whole request is returned untouched, unless the window
+        # already holds admitted blocks: then the re-inserted blocks ride with the window's
+        # catalog state unchanged and no fresh block (C1 re-insertion on every outgoing
+        # request regardless of routing success).
         _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
-        return None
+        if not stored:
+            return None
+        return {"request": {**dict(payload), "messages": base_messages}}
     if note.strip() and block == note.strip():
         # The renderer returned the degraded note on its own: no row is shown, so the catalog must
         # stay. The note rides as one standalone system message on the original request, which
@@ -438,12 +456,17 @@ def _compose(
                 ],
             }
         }
+    final_messages = [*base_messages, {"role": "system", "content": block}]
+    admitted = admit_block(
+        payload, store_key, block, len(base_messages), origin, cfg.cache_path
+    )
     rewritten = {
         **dict(payload),
-        "messages": [
-            *list(stripped.get("messages") or ()),
-            {"role": "system", "content": block},
-        ],
+        "messages": (
+            final_messages
+            if admitted
+            else base_messages
+        ),
     }
     _recorder(
         cfg,
@@ -536,6 +559,25 @@ def _prior_blocks(messages: Any) -> List[str]:
         if text.startswith(INJECTED_HEADER):
             blocks.append(text)
     return blocks
+
+
+def _reinsert(messages: Any, stored: Any) -> List[Any]:
+    """Return *messages* with every stored block replayed at its recorded index.
+
+    A stored block whose bytes already appear in a message is skipped (byte-search
+    dedupe: the conversation append already put it in history), so re-insertion
+    never duplicates a block the payload already carries. Same-origin,
+    same-generation blocks only; entries come from
+    :func:`hermes_skill_router.writeback.stored_blocks` already filtered.
+    """
+    result = list(messages)
+    for index, block in stored:
+        if any(
+            isinstance(item, Mapping) and block in _message_text(item) for item in result
+        ):
+            continue
+        result.insert(min(int(index), len(result)), {"role": "system", "content": block})
+    return result
 
 
 def _message_text(message: Any) -> str:

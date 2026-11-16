@@ -363,6 +363,8 @@ def test_the_display_costs_no_token(tmp_path):
         notify=lambda _turn_id: None,
     )
     # The second rewrite runs the same pipeline with the record writer replaced by a no-op.
+    # It runs in its own session: under the write-back window a second call in the same
+    # session is a later turn whose suppression legitimately changes the payload.
     original_record = router_module.record
     try:
         router_module.record = lambda *args, **kwargs: None
@@ -371,7 +373,7 @@ def test_the_display_costs_no_token(tmp_path):
             cfg=hidden,
             embed=fake_embed,
             rerank=fake_rerank,
-            session_id="session-1",
+            session_id="session-2",
             turn_id="turn-1",
             notify=lambda _turn_id: None,
         )

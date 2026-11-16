@@ -366,6 +366,8 @@ def test_the_payload_the_caller_passed_is_never_mutated(tmp_path):
 
 
 def test_the_same_payload_and_index_rewrite_deterministically(tmp_path):
+    from hermes_skill_router.writeback import expire_window
+
     cfg = make_config(tmp_path)
     index = make_index()
     payload = _payload()
@@ -373,11 +375,12 @@ def test_the_same_payload_and_index_rewrite_deterministically(tmp_path):
     first = rewrite(
         payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker()
     )
+    expire_window("", cfg.cache_path)
     second = rewrite(
         payload, cfg=cfg, index=index, embed=FakeEmbedder(), rerank=FakeReranker()
     )
 
-    assert first == second
+    assert first == second, "same payload, same index, expired window: same rewrite"
 
 
 def test_a_supplied_index_is_not_rebuilt(tmp_path):
@@ -563,14 +566,19 @@ def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path)
 
 
 def test_a_request_without_the_block_can_suggest_the_names_again(tmp_path):
+    from hermes_skill_router.writeback import expire_window
+
     cfg = make_config(tmp_path)
     payload = _payload()
 
     first = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
+    expire_window("", cfg.cache_path)
     second = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
 
     assert first is not None
-    assert second == first, "module state, not the messages, decided the suppressed set"
+    assert second == first, (
+        "after the window expires (post_compaction), the names are suggestible again"
+    )
 
 
 def test_user_text_that_merely_quotes_the_block_does_not_suppress_its_names(tmp_path):
@@ -1966,6 +1974,197 @@ def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatc
     assert len(calls) == len(set(calls)), f"a candidate was looked up twice: {calls}"
     assert sorted(calls) == ["alpha", "beta", "delta", "gamma"], (
         "a candidate was looked up twice in one pass, or a pathless candidate was dropped"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C1 write-back: conversation append, origin-tagged store, fence, expiry.
+# ---------------------------------------------------------------------------
+
+
+class FakeSessionDB:
+    """Stand-in for hermes_state.SessionDB: records rows, never touches disk."""
+
+    def __init__(self, rows=(), holder=None):
+        self.rows = [dict(row) for row in rows]
+        self.next_id = 100
+        self.holder = holder
+        self.deactivated = []
+        self.resolved = []
+
+    def get_messages(self, session_id, include_inactive=False, include_compacted=False):
+        return [dict(row) for row in self.rows]
+
+    def append_message(self, session_id, role, content=None, **kwargs):
+        self.next_id += 1
+        self.rows.append({"id": self.next_id, "role": role, "content": content})
+        return self.next_id
+
+    def get_compression_lock_holder(self, session_id):
+        return self.holder
+
+    def resolve_active_row_id(self, session_id, row_id):
+        self.resolved.append(row_id)
+        return row_id
+
+    def deactivate_message(self, session_id, row_id):
+        self.deactivated.append(row_id)
+        return 1
+
+
+def _payload_messages(payload):
+    return [{"role": m["role"], "content": m["content"]} for m in payload["messages"]]
+
+
+def test_writeback_two_turns_append_once_and_reinsert_byte_identical(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    first = rewrite(payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker())
+    assert first is not None
+    block = block_of(first)
+    assert block.startswith(HEADER)
+    assert len(fake.rows) == 3, "one DB append for the fresh block"
+    assert fake.rows[-1]["content"] == block
+
+    second_input = _second_turn(payload, block)
+    second = rewrite(
+        second_input, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert second is not None
+    contents = [m["content"] for m in second["request"]["messages"]]
+    assert block in contents, "the turn-1 block is re-inserted byte-identical"
+    assert len(fake.rows) == 3, "a retried/next-turn write appends at most once per hash"
+    for name in suggested_names(block):
+        fresh = block_of(second)
+        assert f"- {name}:" not in fresh, "turn-2 block suppresses turn-1 names"
+
+
+def test_writeback_retried_call_admits_once(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    for _ in range(2):
+        result = rewrite(
+            payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        )
+        assert result is not None
+    assert len(fake.rows) == 3, "the same block bytes admit once however often retried"
+
+
+def test_writeback_review_fork_writes_no_db_row(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload(user="Review the conversation above and consider saving to memory.")
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    assert block_of(result).startswith(HEADER)
+    assert len(fake.rows) == 2, "a review-origin block never writes a DB row"
+    stored = wb.stored_blocks("s1", wb.ORIGIN_REVIEW, 0, cfg.cache_path)
+    assert len(stored) == 1, "the review block lives in the store only"
+
+
+def test_writeback_compression_in_flight_skips_the_append(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload), holder="compressor")
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    assert len(fake.rows) == 2, "with a compression lock held, the append is skipped"
+    stored = wb.stored_blocks("s1", wb.ORIGIN_NORMAL, 0, cfg.cache_path)
+    assert len(stored) == 1, "the block stays store-only, generation-tagged"
+
+
+def test_writeback_tail_mismatch_skips_the_append(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=[{"role": "user", "content": "stale snapshot"}])
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    assert len(fake.rows) == 1, "a detached fork on a stale snapshot never appends"
+
+
+def test_writeback_post_compaction_deactivates_rows_and_expires(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    row_id = fake.rows[-1]["id"]
+
+    wb.expire_window("s1", cfg.cache_path)
+    assert fake.resolved == [row_id]
+    assert fake.deactivated == [row_id]
+    assert wb.generation("s1", cfg.cache_path) == 1
+    assert wb.stored_blocks("s1", wb.ORIGIN_NORMAL, 0, cfg.cache_path) == []
+
+
+def test_writeback_store_failure_sends_stored_blocks_never_none(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", str(tmp_path))
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None, "a store failure never returns None"
+    contents = [m["content"] for m in result["request"]["messages"]]
+    assert not any(c.startswith(HEADER) for c in contents), "no fresh block on store failure"
+
+
+def test_writeback_prefix_before_fresh_block_is_byte_identical(tmp_path, monkeypatch):
+    from hermes_skill_router import writeback as wb
+
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    fake = FakeSessionDB(rows=_payload_messages(payload))
+    monkeypatch.setattr(wb, "_session_db", lambda: fake)
+
+    result = rewrite(
+        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+    )
+    assert result is not None
+    messages = result["request"]["messages"]
+    assert messages[-1]["content"].startswith(HEADER)
+    from hermes_skill_router.catalog import strip_catalog
+
+    stripped, _partition = strip_catalog(payload)
+    assert list(messages[:-1]) == list(stripped.get("messages") or ()), (
+        "every message before the fresh block is byte-identical"
     )
 
 

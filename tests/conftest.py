@@ -52,4 +52,5 @@ def isolate_config_traps(tmp_path, monkeypatch):
     """Point the persisted trap and switch sets at per-test files, never the home cache."""
     monkeypatch.setenv("HERMES_SKILL_ROUTER_TRAPS_PATH", str(tmp_path / "config-traps.json"))
     monkeypatch.setenv("HERMES_SKILL_ROUTER_SWITCHES_PATH", str(tmp_path / "config-switches.json"))
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", str(tmp_path / "writeback-store.json"))
     yield
