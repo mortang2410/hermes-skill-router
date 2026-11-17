@@ -297,14 +297,14 @@ Fields:
 
 The record never carries request text. The newest record wins, with one exception: one user turn
 makes several API requests, and the request that opens the turn writes the turn's record. Later
-requests in the same turn whose pass selects nothing new, or fails, write no record and leave the
-turn's routed record in place, so the panel shows what the turn routed; a later request that routes
-fresh candidates writes a new routed record instead, replacing the turn's earlier one (and any
-search marker written between the turn's requests). The block itself normally lives in the
+requests in the same turn rank nothing and write no record, leaving the turn's routed record in
+place, so the panel shows what the turn routed and only the opening call can show a new skill.
+The block itself normally lives in the
 writeback store, never in the conversation history (Hermes rebuilds every request from history and
-never copies the middleware's messages back); the rewrite recognises the continuation from that
-store, from the payload's own block when the host does carry one, and from the newest user message
-no longer being the last message in either case. A new user message after the block opens a new
+never copies the middleware's messages back); the rewrite recognises the continuation from loop
+evidence alone: the newest user message is no longer the last message and an assistant or tool
+message follows it. No block is required, so an opening call that routed nothing still opens its
+turn, and a trailing system message alone never makes a continuation. A new user message after the block opens a new
 turn, which records its own decision, inert included. A later failed pass in the same turn writes
 nothing too, so a mid-turn dead endpoint or exhausted budget does not reach the panel until the next
 turn opens. A byte-identical retry of the turn's opening request (no model-loop message yet) is a
@@ -320,12 +320,13 @@ Write rules:
 - A record identical to the one on disk is not rewritten. Identity ignores `at`, so a turn that
   routes to the same names keeps the timestamp of the decision that first produced them. `origin` is
   part of that identity, so a search with the same names still rewrites the marker.
-- A later API request in the same user turn (the turn's block in the writeback store or in the
-  payload, and the newest user message no longer the last message) writes no record when its pass selects nothing new or
-  fails, so it cannot overwrite the turn's routed names with inert or clobber a search record
-  written between the turn's API requests with inert. A later pass that routes fresh candidates
-  writes a routed record instead, replacing the turn's earlier record and any search marker.
-  Its payload is unchanged by this rule.
+- A later API request in the same user turn (the newest user message no longer the last message and
+  the model loop has produced an assistant or tool message after it, whether or not the opening
+  call routed a block) ranks nothing and writes no
+  record, so it cannot overwrite the turn's routed names with inert or clobber a search record
+  written between the turn's API requests. Its payload is the re-inserted stored state, plus the
+  degraded note on its own when one is recomputed, which is the payload it returned when it
+  selected nothing new.
 - `showSuggestions: false` stops the writes and removes an existing record, which turns both
   surfaces idle. When that removal is refused, the plugin writes an inert, empty record instead, so
   the file-reading widget shows no names.

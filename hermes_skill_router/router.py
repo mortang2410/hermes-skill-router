@@ -52,11 +52,9 @@ request clears the previous one first, so a search never ranks rows from an earl
 The display record through :mod:`hermes_skill_router.display` carries
 ``routed`` with the selected suggestion names, or ``inert`` with no names. One user turn makes several API requests: the
 request that opens the turn writes its decision, and a later request in the
-same turn writes nothing when it selects nothing new or fails, because the
-turn's block (admitted to the writeback store, and sometimes also carried in
-the payload) suppresses its own names; a later request that routes fresh
-candidates writes a new routed record instead. With the silence rule the panel
-shows what the turn routed rather than an inert overwrite. A new user message
+same turn ranks nothing and writes nothing, returning the re-inserted stored
+state (with the degraded note on its own when one is recomputed), so only the
+opening call can show a new skill. With that rule the panel shows what the turn routed rather than an inert overwrite. A new user message
 after the block opens a new turn, which records its own decision. A
 byte-identical retry of a turn's opening request is a known limit: the payload
 and the writeback store alone cannot tell it from a new turn, and the router
@@ -114,7 +112,7 @@ from .display import INERT, ROUTED, record
 from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
-from .inject import HEADER, displayed_names, render, suggested_names
+from .inject import HEADER, displayed_names, render
 from .library import Index, PathResolver, is_partial_view, load_or_build, path_resolver, will_embed
 from .rerank import rerank as default_rerank
 from .search import (
@@ -317,12 +315,56 @@ def _compose(
     stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
     base_messages = _reinsert(stripped.get("messages") or (), stored)
     stripped_already = stripped_sent(store_key, cfg.cache_path)
-    # A later API call inside the same user turn selects nothing new (the
-    # turn's block suppresses its own names, whether the block rides in this
-    # payload or only in the writeback store), so it must not overwrite the
-    # turn's routed display record with an inert one. The payload is built the
-    # same either way; the gate below only decides whether a record is written.
-    continuation = _turn_continuation(messages, stored)
+    # A later API call inside the same user turn selects nothing new, so it
+    # must not overwrite the turn's display record, routed or inert. The
+    # payload is built the same either way; the gate below only decides
+    # whether to rank and whether a record is written.
+    continuation = _turn_continuation(messages)
+    if continuation:
+        # Rank once per prompt: a later API call in the same user turn ranks
+        # nothing. It skips the query embed, the rerank, the learning scan
+        # and the decision log, and it writes no record, so the turn's routed
+        # record from the opening call stands. The payload it returns is the
+        # one the same call returns today when it selects nothing new: the
+        # re-inserted stored state, plus the degraded note on its own when
+        # this pass recomputes one. The degraded line is computed without
+        # building the index, so the BM25-missing part, which needs the built
+        # index, can be absent from that line; the saved-index partial-view
+        # part is checked without the index, so it still matches. Every
+        # other part matches the opening call's line.
+        if dumped_before:
+            return {"request": dict(payload)}
+        note = _degraded_note(
+            cfg,
+            index=index,
+            partial_view=index is None and is_partial_view(cfg, partition.routed),
+        )
+        if note.strip():
+            if stored:
+                mark_stripped(store_key, cfg.cache_path)
+                return {
+                    "request": {
+                        **dict(payload),
+                        "messages": [
+                            *base_messages,
+                            {"role": "system", "content": note.strip()},
+                        ],
+                    }
+                }
+            return {
+                "request": {
+                    **dict(payload),
+                    "messages": [
+                        *list(payload.get("messages") or ()),
+                        {"role": "system", "content": note.strip()},
+                    ],
+                }
+            }
+        if not stored:
+            return None
+        mark_stripped(store_key, cfg.cache_path)
+        return {"request": {**dict(payload), "messages": base_messages}}
+
     def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass (contract C5).
 
@@ -610,70 +652,39 @@ def _prior_blocks(messages: Any) -> List[str]:
     return blocks
 
 
-def _stored_suggested(stored: Any) -> bool:
-    """Return whether the latest stored block suggested a name.
-
-    The writeback store keeps one block per routed turn until the window
-    expires, so the latest entry is the current turn's block. Its recorded
-    position is not compared with the payload length: the position is over
-    the re-inserted message list, whose stored blocks accumulate, while the
-    raw payload never carries them, so the two coordinate systems drift apart
-    from the third routed turn on.
-    """
-    entries = [
-        (index, block)
-        for index, block in (stored or ())
-        if isinstance(index, int) and isinstance(block, str)
-    ]
-    if not entries:
-        return False
-    latest = max(entries, key=lambda entry: entry[0])
-    return bool(suggested_names(latest[1]))
-
-
-def _turn_continuation(messages: Any, stored: Any = ()) -> bool:
-    """Return whether *messages* continue a user turn that already routed.
+def _turn_continuation(messages: Any) -> bool:
+    """Return whether *messages* continue a user turn whose opening call ran.
 
     One user turn makes several API requests (the model loop, with assistant and
-    tool messages between them). The first request of the turn routes, admits
-    its block to the writeback store and writes the display record. A later
-    request of the same turn selects nothing new, because that block suppresses
-    its own names, and must leave the routed record in place.
+    tool messages between them). The first request of the turn ranks and writes
+    the display record, routed or inert. A later request of the same turn
+    selects nothing new and must leave that record in place.
 
-    The test runs in raw payload coordinates. Loop evidence comes first: the
-    newest user-role message is not the last message, which only the model
-    loop produces; a new turn's opening request ends with its user message.
-    Then either home for the block is enough:
+    The test runs in raw payload coordinates. Loop evidence is the whole test:
+    the newest user-role message is not the last message, and the model loop
+    has produced an assistant or tool message after it. No block is required,
+    so an opening call that routed nothing still opens its turn: without the
+    block a gate on the stored or payload block would mistake every later
+    call for a new turn and rank it again. A trailing system message alone
+    is not loop evidence: an opening request that ends with a system message
+    after the user message still ranks as a new turn. A user-role message of
+    any shape (text, image-only or empty) starts a new turn the same way.
 
-    * in this payload, when the host copies the earlier request's messages into
-      history: the last injected block comes after the newest user message and
-      suggested a name;
-    * in the writeback store (the normal home on this host: the block is
-      store-only and the payload carries no block at all): the latest stored
-      block suggested a name, with the loop evidence above.
-
-    A user-role message of any shape (text, image-only or empty) starts a new
-    turn, which must record its own decision, inert included. Only the last
-    injected block, and only the latest stored block, count: an earlier routing
-    never makes a later turn a continuation. The test reads only the payload
-    and the already-loaded store, so it works even when the dispatcher
+    The test reads only the payload, so it works even when the dispatcher
     supplies no turn id.
     """
     if not isinstance(messages, list) or not messages:
         return False
     last_user = -1
-    last_block = -1
     for index, message in enumerate(messages):
-        role = message.get("role") if isinstance(message, Mapping) else None
-        if role == "user":
+        if isinstance(message, Mapping) and message.get("role") == "user":
             last_user = index
-        elif role == "system" and _message_text(message).startswith(INJECTED_HEADER):
-            last_block = index
     if last_user < 0 or last_user == len(messages) - 1:
         return False
-    if last_block > last_user:
-        return bool(suggested_names(_message_text(messages[last_block])))
-    return _stored_suggested(stored)
+    return any(
+        isinstance(message, Mapping) and message.get("role") in ("assistant", "tool")
+        for message in messages[last_user + 1 :]
+    )
 
 
 def _reinsert(messages: Any, stored: Any) -> List[Any]:

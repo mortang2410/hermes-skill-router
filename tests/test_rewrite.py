@@ -168,19 +168,6 @@ class FakeReranker:
 SKILL_ROWS8 = tuple((f"skill{i}", f"Skill number {i}") for i in range(1, 9))
 
 
-class TurnReranker:
-    """High scores on each turn's opening call, zeros on the same turn's later calls."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def __call__(self, cfg, query, documents):
-        self.calls += 1
-        if self.calls % 2 == 0:
-            return [0.0 for _ in documents]
-        return [0.9 - 0.01 * i for i in range(len(documents))]
-
-
 class RecordingContext:
     """Fake plugin context: records the surface ``register`` adds and answers no settings."""
 
@@ -655,6 +642,250 @@ def test_a_later_api_call_in_the_same_turn_keeps_the_routed_record(tmp_path):
     assert contents[-2] == "tool output", "the turn's own messages precede the note"
 
 
+def test_a_store_only_continuation_makes_no_embed_or_rerank_calls(tmp_path):
+    """Rank once per prompt: the live store-only continuation ranks nothing.
+
+    Call 1 routes with the fake clients; call 2 is the live shape (the host
+    rebuilds from history, so the payload carries no block and the block
+    lives only in the writeback store). Call 2 must not call the embedder or
+    the reranker, must not request a learning scan, must not write a record,
+    and its payload is the re-inserted stored state with the degraded note on
+    its own: byte-identical to the payload the same call returned when it
+    selected nothing new. A fresh turn after it ranks again and records its
+    own decision.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    assert first_record["status"] == "routed"
+    embed_calls = len(embedder.calls)
+    rerank_calls = len(reranker.calls)
+    assert embed_calls > 0 and rerank_calls == 1
+
+    second = rewrite(
+        _store_only_continuation(payload),
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert second is not None
+    assert len(embedder.calls) == embed_calls, "a continuation must not embed again"
+    assert len(reranker.calls) == rerank_calls, "a continuation must not rerank again"
+    record = record_for(cfg)
+    assert record["status"] == "routed", "a continuation must not overwrite routed"
+    assert record["names"] == first_record["names"]
+
+    # The continuation payload is the re-inserted stored state plus the
+    # degraded note on its own, byte-identical to the old select-nothing
+    # payload: pin the whole outbound message list by digest.
+    messages = second["request"]["messages"]
+    from hermes_skill_router.inject import HEADER as _HEADER  # noqa: E402
+
+    blocks = [
+        message["content"]
+        for message in messages
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith(_HEADER)
+    ]
+    assert len(blocks) == 1 and suggested_names(blocks[0]) == first_record["names"]
+    assert "Cache persistence is off" in messages[-1]["content"]
+    digest = hashlib.sha256(
+        json.dumps(messages, sort_keys=True).encode()
+    ).hexdigest()
+    assert digest == "dc15478d0f048149bee178031ea638b1b9fae64f5c9da07c101a6137be853aa2", (
+        f"the continuation payload must not change byte, got {digest}"
+    )
+
+    # A genuinely new turn ranks again and records its own decision.
+    third = rewrite(
+        _second_turn(payload, block_of(first)),
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-2",
+        notify=lambda _turn_id: None,
+    )
+    assert third is not None
+    assert len(embedder.calls) > embed_calls, "a new turn must rank again"
+    assert len(reranker.calls) > rerank_calls, "a new turn must rerank again"
+    assert record_for(cfg)["status"] == "inert", "a new turn records its own decision"
+
+
+def test_a_block_in_payload_continuation_makes_no_embed_or_rerank_calls(tmp_path):
+    """Rank once per prompt in the host-carries-block shape too.
+
+    Call 2 carries call 1's block in the payload history. It must rank
+    nothing, write no record, and return the re-inserted state with the
+    degraded note on its own, exactly as the old select-nothing path did:
+    one copy of the prior block and the note message last.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    embed_calls = len(embedder.calls)
+    rerank_calls = len(reranker.calls)
+
+    second_payload = {
+        **payload,
+        "messages": [
+            *payload["messages"],
+            {"role": "system", "content": block_of(first)},
+            {"role": "assistant", "content": "calling a tool"},
+            {"role": "tool", "content": "tool output"},
+        ],
+    }
+    second = rewrite(
+        second_payload,
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert second is not None
+    assert len(embedder.calls) == embed_calls
+    assert len(reranker.calls) == rerank_calls
+    assert record_for(cfg)["names"] == first_record["names"]
+    contents = [message["content"] for message in second["request"]["messages"]]
+    assert contents.count(block_of(first)) == 1
+    assert "Cache persistence is off" in contents[-1]
+    assert contents[-2] == "tool output"
+
+
+def test_an_inert_opening_ranks_nothing_later_in_the_same_turn(tmp_path):
+    """Rank once per prompt when the opening call routed nothing.
+
+    Call 1 scores below the cutoff, so it writes an inert record and admits
+    no block. Call 2 is the live same-turn shape (assistant/tool messages
+    after the user message, no block in the payload) with scores that would
+    now clear the cutoff. It must not embed or rerank again, must not add a
+    routed block, and must leave the inert record in place. A new turn after
+    it ranks again and records its own decision.
+    """
+
+    class LowThenHighReranker:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, cfg, query, documents):
+            self.calls.append((query, list(documents)))
+            if len(self.calls) == 1:
+                return [0.01 for _ in documents]
+            return [0.9 for _ in documents]
+
+    cfg = make_config(tmp_path, cutoff=0.5)
+    payload = _payload()
+    embedder = FakeEmbedder()
+    reranker = LowThenHighReranker()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert record_for(cfg)["status"] == "inert"
+    assert record_for(cfg)["names"] == []
+    embed_calls = len(embedder.calls)
+    assert len(reranker.calls) == 1
+
+    second = rewrite(
+        _store_only_continuation(payload),
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert len(embedder.calls) == embed_calls, "a later call must not embed again"
+    assert len(reranker.calls) == 1, "a later call must not rerank again"
+    record = record_for(cfg)
+    assert record["status"] == "inert", "a later call must not overwrite inert"
+    assert record["names"] == []
+    if second is not None:
+        contents = [message["content"] for message in second["request"]["messages"]]
+        assert not any(
+            isinstance(content, str) and content.startswith(HEADER) for content in contents
+        ), "a later call must not inject a routed block"
+
+    third = rewrite(
+        _payload(user="next request"),
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-2",
+        notify=lambda _turn_id: None,
+    )
+    assert third is not None
+    assert len(reranker.calls) == 2, "a new turn must rank again"
+    assert record_for(cfg)["status"] == "routed", "a new turn records its own decision"
+
+
+def test_a_new_turn_with_a_trailing_system_message_ranks(tmp_path):
+    """A new turn whose payload ends with a system message opens a prompt.
+
+    The newest user message is not the last message, but no assistant or
+    tool message follows it, so the model loop has not produced anything
+    since the user spoke: this is the opening request, not a same-turn
+    continuation, and it must rank and record its own decision.
+    """
+    cfg = make_config(tmp_path)
+    embedder = FakeEmbedder()
+    reranker = FakeReranker()
+    payload = {
+        **_payload(),
+        "messages": [
+            *_payload()["messages"],
+            {"role": "system", "content": "a system note after the user message"},
+        ],
+    }
+    result = rewrite(
+        payload,
+        cfg=cfg,
+        embed=embedder,
+        rerank=reranker,
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert result is not None
+    assert len(reranker.calls) == 1, "the opening request must rerank"
+    assert record_for(cfg)["status"] == "routed"
+
+
 def test_a_genuinely_new_turn_still_records_inert(tmp_path):
     """A new user message after the block opens a new turn with its own decision.
 
@@ -974,7 +1205,9 @@ def test_three_store_only_turns_in_one_window_keep_their_routed_records(tmp_path
         shortlistSize=50,
     )
     embedder = FakeEmbedder(table={}, default=[1.0, 0.0, 0.0])
-    reranker = TurnReranker()
+    # Always high scores: every opening call routes the next unscored chunk
+    # of names. Later calls rank nothing, so they never ask the reranker.
+    reranker = FakeReranker(scores=[0.9 - 0.01 * i for i in range(8)])
     payload = _payload(rows=SKILL_ROWS8, user="warmup")
     history = [payload["messages"][0]]
     expected = [
@@ -1023,13 +1256,16 @@ def test_three_store_only_turns_in_one_window_keep_their_routed_records(tmp_path
         history = [*history, {"role": "assistant", "content": f"done turn {turn}"}]
 
 
-def test_four_routed_calls_in_one_turn_keep_the_last_routed_record(tmp_path):
-    """One long turn admits a block per routed call; the fourth call selects nothing.
+def test_four_calls_in_one_turn_rank_once_and_keep_the_first_routed_record(tmp_path):
+    """Rank once per prompt: only the opening call ranks and records.
 
-    Calls 1-3 each route fresh candidates (the suppressed names from earlier
-    blocks leave others admissible) and each writes its routed record, which
-    is the documented exception to opening-only writes. Call 4 has all eight
-    names suppressed, selects nothing, and keeps call 3's routed record.
+    Four calls in one user turn (the loop's assistant/tool messages after
+    each). Only call 1 ranks, so the embed and rerank totals stay at call 1's
+    and every later call keeps call 1's routed record, even though fresh
+    candidates would clear the cutoff on calls 2-3: no later call shows a new
+    skill. Each later call returns the re-inserted stored state (with the
+    degraded note on its own when one is recomputed) and a fresh block
+    naming no new skill.
     """
     cfg = make_config(
         tmp_path,
@@ -1041,13 +1277,9 @@ def test_four_routed_calls_in_one_turn_keep_the_last_routed_record(tmp_path):
     reranker = FakeReranker(scores=[0.9 - 0.01 * i for i in range(8)])
     payload = _payload(rows=SKILL_ROWS8)
     messages = list(payload["messages"])
-    expected = [
-        ["skill1", "skill2", "skill3"],
-        ["skill4", "skill5", "skill6"],
-        ["skill7", "skill8"],
-        ["skill7", "skill8"],
-    ]
-    for call, names in enumerate(expected, start=1):
+    expected = ["skill1", "skill2", "skill3"]
+    first_calls = None
+    for call in range(1, 5):
         result = rewrite(
             {"model": "test-model", "messages": list(messages)},
             cfg=cfg,
@@ -1060,7 +1292,23 @@ def test_four_routed_calls_in_one_turn_keep_the_last_routed_record(tmp_path):
         assert result is not None, f"call {call} must rewrite"
         record = record_for(cfg)
         assert record["status"] == "routed", f"call {call} must keep a routed record"
-        assert sorted(record["names"]) == names, f"call {call} routed names"
+        assert sorted(record["names"]) == expected, f"call {call} routed names"
+        if first_calls is None:
+            first_calls = (len(embedder.calls), len(reranker.calls))
+            assert first_calls[0] > 0 and first_calls[1] == 1
+        else:
+            assert (len(embedder.calls), len(reranker.calls)) == first_calls, (
+                f"call {call} must not rank again"
+            )
+        blocks = [
+            message["content"]
+            for message in result["request"]["messages"]
+            if isinstance(message.get("content"), str)
+            and message["content"].startswith(HEADER)
+        ]
+        assert suggested_names(blocks[0]) == expected, (
+            f"call {call} must not inject a fresh block"
+        )
         messages = [
             *messages,
             {"role": "assistant", "content": "calling a tool"},
