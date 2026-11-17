@@ -49,10 +49,20 @@ the same result, and the second pass of an unchanged payload is left untouched b
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
 request clears the previous one first, so a search never ranks rows from an earlier prompt (D10).
 
-On every request that carried the catalog on Chat Completions the same decision is written to the
-display record through :mod:`hermes_skill_router.display`: ``routed`` with the selected suggestion
-names, or ``inert`` with no names. One degraded line rides on that record whenever routing is
-degraded: history incomplete with its skip state and heal outcome, missing BM25,
+The display record through :mod:`hermes_skill_router.display` carries
+``routed`` with the selected suggestion names, or ``inert`` with no names. One user turn makes several API requests: the
+request that opens the turn writes its decision, and a later request in the
+same turn writes nothing when it selects nothing new or fails, because the
+turn's block (admitted to the writeback store, and sometimes also carried in
+the payload) suppresses its own names; a later request that routes fresh
+candidates writes a new routed record instead. With the silence rule the panel
+shows what the turn routed rather than an inert overwrite. A new user message
+after the block opens a new turn, which records its own decision. A
+byte-identical retry of a turn's opening request is a known limit: the payload
+and the writeback store alone cannot tell it from a new turn, and the router
+does not read the record's turn id, so it records inert as a new turn would.
+One degraded line rides on that record whenever routing is degraded:
+history incomplete with its skip state and heal outcome, missing BM25,
 fusion off, cache persistence off, budget expiry, dead endpoint, or a newly-seen
 config trap. The dropped-catalog compaction window rides the failure tier whenever
 the turn is rejected because the catalog was already dumped in this window and no
@@ -61,7 +71,10 @@ whenever the build refused a truncated catalog. A cold index build announces
 itself with a temporary build-in-progress record before ``load_or_build`` blocks.
 When a
 per-request call fails, contract C7's one line rides on the inert record instead,
-so the surfaces can say the endpoints were unreachable and no suggestions were made; with the live
+so the surfaces can say the endpoints were unreachable and no suggestions were made.
+A failed pass inside the same turn writes nothing like any other continuation, so
+its endpoint or budget line does not reach the panel until the next turn opens;
+with the live
 clients the setup-needed line
 (:func:`hermes_skill_router.setup_check.setup_note`), probed fresh every dead-endpoint turn,
 refines that line to name the failing ``embedBaseUrl`` or ``rerankBaseUrl``; that line outranks
@@ -304,6 +317,12 @@ def _compose(
     stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
     base_messages = _reinsert(stripped.get("messages") or (), stored)
     stripped_already = stripped_sent(store_key, cfg.cache_path)
+    # A later API call inside the same user turn selects nothing new (the
+    # turn's block suppresses its own names, whether the block rides in this
+    # payload or only in the writeback store), so it must not overwrite the
+    # turn's routed display record with an inert one. The payload is built the
+    # same either way; the gate below only decides whether a record is written.
+    continuation = _turn_continuation(messages, stored)
     def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass (contract C5).
 
@@ -318,7 +337,8 @@ def _compose(
         rides on the inert record only, so the surfaces can say no suggestions were made.
         """
         _log_once(reason)
-        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        if not continuation:
+            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if dumped_before:
             return {"request": dict(payload)}
         if not previous and not stored and not stripped_already:
@@ -339,7 +359,7 @@ def _compose(
         # build-in-progress record is written and broadcast now, so the desktop
         # pane and the TUI show it while ``load_or_build`` embeds. The settled
         # record below replaces it, so it never claims the build is still running.
-        if will_embed(cfg, partition.routed):
+        if will_embed(cfg, partition.routed) and not continuation:
             _recorder(cfg, INERT, (), session_id, turn_id, notify, note=BUILD_NOTE)()
         # Snapshot the embed gate's failure count before the build, so the
         # note below is attributed to this build's own embed attempt only.
@@ -445,8 +465,12 @@ def _compose(
         # catalog for nothing, so the whole request is returned untouched, unless the window
         # already holds admitted blocks: then the re-inserted blocks ride with the window's
         # catalog state unchanged and no fresh block (C1 re-insertion on every outgoing
-        # request regardless of routing success).
-        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        # request regardless of routing success). A same-turn continuation keeps
+        # the turn's routed record: this call selected nothing new only because
+        # the turn's block is already admitted, so an inert write here would
+        # hide what the turn routed.
+        if not continuation:
+            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if not stored:
             return None
         mark_stripped(store_key, cfg.cache_path)
@@ -456,8 +480,10 @@ def _compose(
         # stay. The note rides as one standalone system message on the original request, which
         # keeps the degraded state the provider context would otherwise lose. When the window
         # already holds admitted blocks, the re-inserted blocks ride with the window's catalog
-        # state unchanged instead (C1, same as the empty-block path above).
-        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        # state unchanged instead (C1, same as the empty-block path above). A
+        # same-turn continuation keeps the turn's routed record, as above.
+        if not continuation:
+            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if stored:
             mark_stripped(store_key, cfg.cache_path)
             return {
@@ -582,6 +608,72 @@ def _prior_blocks(messages: Any) -> List[str]:
         if text.startswith(INJECTED_HEADER):
             blocks.append(text)
     return blocks
+
+
+def _stored_suggested(stored: Any) -> bool:
+    """Return whether the latest stored block suggested a name.
+
+    The writeback store keeps one block per routed turn until the window
+    expires, so the latest entry is the current turn's block. Its recorded
+    position is not compared with the payload length: the position is over
+    the re-inserted message list, whose stored blocks accumulate, while the
+    raw payload never carries them, so the two coordinate systems drift apart
+    from the third routed turn on.
+    """
+    entries = [
+        (index, block)
+        for index, block in (stored or ())
+        if isinstance(index, int) and isinstance(block, str)
+    ]
+    if not entries:
+        return False
+    latest = max(entries, key=lambda entry: entry[0])
+    return bool(suggested_names(latest[1]))
+
+
+def _turn_continuation(messages: Any, stored: Any = ()) -> bool:
+    """Return whether *messages* continue a user turn that already routed.
+
+    One user turn makes several API requests (the model loop, with assistant and
+    tool messages between them). The first request of the turn routes, admits
+    its block to the writeback store and writes the display record. A later
+    request of the same turn selects nothing new, because that block suppresses
+    its own names, and must leave the routed record in place.
+
+    The test runs in raw payload coordinates. Loop evidence comes first: the
+    newest user-role message is not the last message, which only the model
+    loop produces; a new turn's opening request ends with its user message.
+    Then either home for the block is enough:
+
+    * in this payload, when the host copies the earlier request's messages into
+      history: the last injected block comes after the newest user message and
+      suggested a name;
+    * in the writeback store (the normal home on this host: the block is
+      store-only and the payload carries no block at all): the latest stored
+      block suggested a name, with the loop evidence above.
+
+    A user-role message of any shape (text, image-only or empty) starts a new
+    turn, which must record its own decision, inert included. Only the last
+    injected block, and only the latest stored block, count: an earlier routing
+    never makes a later turn a continuation. The test reads only the payload
+    and the already-loaded store, so it works even when the dispatcher
+    supplies no turn id.
+    """
+    if not isinstance(messages, list) or not messages:
+        return False
+    last_user = -1
+    last_block = -1
+    for index, message in enumerate(messages):
+        role = message.get("role") if isinstance(message, Mapping) else None
+        if role == "user":
+            last_user = index
+        elif role == "system" and _message_text(message).startswith(INJECTED_HEADER):
+            last_block = index
+    if last_user < 0 or last_user == len(messages) - 1:
+        return False
+    if last_block > last_user:
+        return bool(suggested_names(_message_text(messages[last_block])))
+    return _stored_suggested(stored)
 
 
 def _reinsert(messages: Any, stored: Any) -> List[Any]:

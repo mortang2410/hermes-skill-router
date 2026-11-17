@@ -165,6 +165,22 @@ class FakeReranker:
         return self.scores[: len(documents)]
 
 
+SKILL_ROWS8 = tuple((f"skill{i}", f"Skill number {i}") for i in range(1, 9))
+
+
+class TurnReranker:
+    """High scores on each turn's opening call, zeros on the same turn's later calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, cfg, query, documents):
+        self.calls += 1
+        if self.calls % 2 == 0:
+            return [0.0 for _ in documents]
+        return [0.9 - 0.01 * i for i in range(len(documents))]
+
+
 class RecordingContext:
     """Fake plugin context: records the surface ``register`` adds and answers no settings."""
 
@@ -570,6 +586,486 @@ def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path)
     assert "Skills routed for this request" not in messages[-1]["content"]
     assert second == before, "the rewrite never mutates its input"
     assert record_for(cfg)["status"] == "inert"
+
+
+def test_a_later_api_call_in_the_same_turn_keeps_the_routed_record(tmp_path):
+    """One user turn makes several API requests; the record shows what the turn routed.
+
+    Call 1 routes names and writes the routed record. Call 2 is the same user
+    turn (same turn_id, same newest user text, the block from call 1 in the
+    history, assistant/tool continuations, no new user text): every candidate
+    is suppressed, so it selects nothing new and must leave the routed record
+    in place instead of overwriting it with an inert one. The payload is
+    untouched by the rule: no fresh block and no duplicate of the prior block.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    notified = []
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    assert first_record["status"] == "routed"
+    assert first_record["names"] == ["beta", "delta", "alpha", "gamma"]
+    # The cold-build announcement and the settled record each announce once.
+    assert set(notified) == {"turn-1"}
+    notified_after_first = list(notified)
+
+    # The host prepends the catalog system prompt again on the next API
+    # request; the block from call 1 sits in the history after the user text.
+    second_payload = {
+        **payload,
+        "messages": [
+            *payload["messages"],
+            {"role": "system", "content": block_of(first)},
+            {"role": "assistant", "content": "calling a tool"},
+            {"role": "tool", "content": "tool output"},
+        ],
+    }
+    before = copy.deepcopy(second_payload)
+    second = rewrite(
+        second_payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+
+    record = record_for(cfg)
+    assert record["status"] == "routed", "a same-turn continuation must not overwrite routed"
+    assert record["names"] == first_record["names"]
+    assert record["turn_id"] == "turn-1"
+    assert notified == notified_after_first, "no new record means no new announcement"
+    assert second_payload == before, "the rewrite never mutates its input"
+    assert second is not None
+    contents = [message["content"] for message in second["request"]["messages"]]
+    assert contents.count(block_of(first)) == 1, "no duplicate block is injected"
+    assert "Cache persistence is off" in contents[-1], (
+        "the degraded note rides as its own message, as on an empty selection"
+    )
+    assert contents[-2] == "tool output", "the turn's own messages precede the note"
+
+
+def test_a_genuinely_new_turn_still_records_inert(tmp_path):
+    """A new user message after the block opens a new turn with its own decision.
+
+    The second request carries a fresh user prompt after the earlier block and
+    a fresh turn_id, so it is a new turn: its record is inert even though the
+    earlier turn routed, and a fresh turn with no candidates at all records
+    inert too.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert first is not None
+    assert record_for(cfg)["status"] == "routed"
+
+    second_payload = _second_turn(payload, block_of(first))
+    second = rewrite(
+        second_payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-2",
+        notify=lambda _turn_id: None,
+    )
+    assert second is not None
+    record = record_for(cfg)
+    assert record["status"] == "inert", "a new turn records its own decision"
+    assert record["names"] == []
+    assert record["turn_id"] == "turn-2"
+
+    nothing_cfg = make_config(tmp_path, cutoff=0.99)
+    nothing = rewrite(
+        _payload(),
+        cfg=nothing_cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-3",
+        notify=lambda _turn_id: None,
+    )
+    assert nothing is not None
+    assert record_for(nothing_cfg)["status"] == "inert"
+    assert record_for(nothing_cfg)["names"] == []
+
+
+def _store_only_continuation(payload):
+    """The live host shape for a later request in the same turn.
+
+    Hermes rebuilds every request from history and never copies the previous
+    request's rewritten messages back, and the block row append never happens
+    on this host, so the block lives only in the writeback store: the payload
+    carries the catalog system prompt, the user prompt and the model loop's
+    assistant/tool messages, and no injected block.
+    """
+    return {
+        **payload,
+        "messages": [
+            *payload["messages"],
+            {"role": "assistant", "content": "calling a tool"},
+            {"role": "tool", "content": "tool output"},
+        ],
+    }
+
+
+def test_a_store_only_same_turn_call_keeps_the_routed_record_on_the_empty_path(
+    tmp_path, monkeypatch
+):
+    """The live shape: the block is store-only, so the payload carries none.
+
+    Suppression comes from the stored blocks. With no degraded note the empty
+    selection renders an empty block, which is the path the live 8-call turn
+    took: the later call must keep the routed record, not overwrite it inert.
+    A complete association store and a cache path keep the degraded note
+    empty, so this test really exercises the empty-block gate and not the
+    note-only one.
+    """
+    import sqlite3
+
+    from hermes_skill_router import associations as associations_module
+
+    newest = 1_800_000_000_000
+    state_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(state_path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            started_at REAL NOT NULL,
+            last_activity_at REAL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, started_at, last_activity_at)"
+        " VALUES (?, ?, ?, ?)",
+        ("s-newest", "cli", newest / 1000.0, newest / 1000.0),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        associations_module, "default_state_db_path", lambda home=None: str(state_path)
+    )
+    store_path = tmp_path / "associations.db"
+    store = associations_module.open_store(str(store_path))
+    try:
+        associations_module.write_meta(
+            store, associations_module.META_LAST_SCAN_MS, str(newest)
+        )
+    finally:
+        store.close()
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        associationDbPath=str(store_path),
+    )
+    payload = _payload()
+    notified = []
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    assert first_record["status"] == "routed"
+    assert first_record["names"], "the first call must route something"
+    assert first_record["note"] == "", "this config keeps the degraded note empty"
+    notified_after_first = list(notified)
+
+    second_payload = _store_only_continuation(payload)
+    assert "Skills routed for this request" not in str(second_payload["messages"])
+    second = rewrite(
+        second_payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+
+    record = record_for(cfg)
+    assert record["status"] == "routed", "a store-only continuation must not overwrite routed"
+    assert record["names"] == first_record["names"]
+    assert record["note"] == "", "an empty note proves the empty-block path ran"
+    assert notified == notified_after_first, "no new record means no new announcement"
+    assert second is not None
+    blocks = [
+        message["content"]
+        for message in second["request"]["messages"]
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith(HEADER)
+    ]
+    assert len(blocks) == 1, "the stored block is re-inserted once, never duplicated"
+    assert suggested_names(blocks[0]) == first_record["names"]
+
+
+def test_a_store_only_new_turn_still_records_inert(tmp_path):
+    """A new user message after the stored block opens a new turn.
+
+    The second request carries no block either, but its fresh user prompt sits
+    at and after the stored block's position, so it is a new turn and its own
+    inert decision is recorded.
+    """
+    cfg = make_config(
+        tmp_path, cachePath=str(tmp_path / "index.json"), fusionMode="cosine"
+    )
+    payload = _payload()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert first is not None
+    assert record_for(cfg)["status"] == "routed"
+
+    second_payload = {
+        **payload,
+        "messages": [
+            *payload["messages"],
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "next request"},
+        ],
+    }
+    second = rewrite(
+        second_payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-2",
+        notify=lambda _turn_id: None,
+    )
+    assert second is not None
+    record = record_for(cfg)
+    assert record["status"] == "inert", "a new turn records its own decision"
+    assert record["names"] == []
+    assert record["turn_id"] == "turn-2"
+
+
+def test_a_store_only_same_turn_failure_keeps_the_routed_record(tmp_path):
+    """A failed pass inside the same turn writes nothing (the _fail gate).
+
+    Call 2's rerank call fails, so the pass fails with the endpoint line. The
+    line is logged once but does not overwrite the turn's routed record: the
+    panel shows what the turn routed, and the failure surfaces on the next
+    turn instead.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    assert first_record["status"] == "routed"
+
+    second = rewrite(
+        _store_only_continuation(payload),
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(result=None),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=lambda _turn_id: None,
+    )
+    assert second is not None, "the stripped state still goes out (C5)"
+    record = record_for(cfg)
+    assert record["status"] == "routed", "a same-turn failure must not flip the panel inert"
+    assert record["names"] == first_record["names"]
+    assert record["note"] == first_record["note"], (
+        "the endpoint line does not reach the panel inside this turn"
+    )
+    assert record["note"] != router_module.ENDPOINT_NOTE
+
+
+def test_a_store_only_same_turn_cold_build_keeps_the_routed_record(tmp_path):
+    """A cold-build call inside the same turn writes no announcement (pin).
+
+    The index memo is cleared before call 2, so that call rebuilds and would
+    announce a build-in-progress record. The continuation gate suppresses the
+    announcement, so the turn's routed record survives; reverting any single
+    gate (cold build, then empty/note selection) flips this test.
+    """
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    notified = []
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+    assert first is not None
+    first_record = record_for(cfg)
+    assert first_record["status"] == "routed"
+    notified_after_first = list(notified)
+
+    library_module._MEMO.clear()
+    second = rewrite(
+        _store_only_continuation(payload),
+        cfg=cfg,
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+        session_id="session-1",
+        turn_id="turn-1",
+        notify=notified.append,
+    )
+    assert second is not None
+
+    record = record_for(cfg)
+    assert record["status"] == "routed", "a same-turn cold build must not announce inert"
+    assert record["names"] == first_record["names"]
+    assert record["note"] == first_record["note"]
+    assert notified == notified_after_first, "no announcement and no new record"
+
+
+def test_three_store_only_turns_in_one_window_keep_their_routed_records(tmp_path):
+    """Blocks accumulate one per routed turn; the third turn's later call too.
+
+    Every routed turn admits another store-only block, and each block's
+    recorded position grows past the raw payload length. The continuation test
+    must therefore not compare the stored position with the payload length:
+    three turns in one window, two calls each, and every later call keeps its
+    turn's routed names.
+    """
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        maxSuggestions=3,
+        shortlistSize=50,
+    )
+    embedder = FakeEmbedder(table={}, default=[1.0, 0.0, 0.0])
+    reranker = TurnReranker()
+    payload = _payload(rows=SKILL_ROWS8, user="warmup")
+    history = [payload["messages"][0]]
+    expected = [
+        ["skill1", "skill2", "skill3"],
+        ["skill4", "skill5", "skill6"],
+        ["skill7", "skill8"],
+    ]
+    for turn, names in enumerate(expected, start=1):
+        history = [*history, {"role": "user", "content": f"turn {turn}: {QUERY}"}]
+        opening = rewrite(
+            {"model": "test-model", "messages": list(history)},
+            cfg=cfg,
+            embed=embedder,
+            rerank=reranker,
+            session_id="session-mt",
+            turn_id=f"turn-{turn}",
+            notify=lambda _turn_id: None,
+        )
+        assert opening is not None
+        record = record_for(cfg)
+        assert record["status"] == "routed"
+        assert sorted(record["names"]) == names
+
+        # The store-only continuation: the loop's messages, and no block in the
+        # inbound payload (the host rebuilds from history).
+        later = rewrite(
+            {
+                "model": "test-model",
+                "messages": [
+                    *history,
+                    {"role": "assistant", "content": "calling a tool"},
+                    {"role": "tool", "content": "tool output"},
+                ],
+            },
+            cfg=cfg,
+            embed=embedder,
+            rerank=reranker,
+            session_id="session-mt",
+            turn_id=f"turn-{turn}",
+            notify=lambda _turn_id: None,
+        )
+        assert later is not None
+        record = record_for(cfg)
+        assert record["status"] == "routed", f"turn {turn} call 2 must keep its names"
+        assert sorted(record["names"]) == names
+        history = [*history, {"role": "assistant", "content": f"done turn {turn}"}]
+
+
+def test_four_routed_calls_in_one_turn_keep_the_last_routed_record(tmp_path):
+    """One long turn admits a block per routed call; the fourth call selects nothing.
+
+    Calls 1-3 each route fresh candidates (the suppressed names from earlier
+    blocks leave others admissible) and each writes its routed record, which
+    is the documented exception to opening-only writes. Call 4 has all eight
+    names suppressed, selects nothing, and keeps call 3's routed record.
+    """
+    cfg = make_config(
+        tmp_path,
+        cachePath=str(tmp_path / "index.json"),
+        maxSuggestions=3,
+        shortlistSize=50,
+    )
+    embedder = FakeEmbedder(table={}, default=[1.0, 0.0, 0.0])
+    reranker = FakeReranker(scores=[0.9 - 0.01 * i for i in range(8)])
+    payload = _payload(rows=SKILL_ROWS8)
+    messages = list(payload["messages"])
+    expected = [
+        ["skill1", "skill2", "skill3"],
+        ["skill4", "skill5", "skill6"],
+        ["skill7", "skill8"],
+        ["skill7", "skill8"],
+    ]
+    for call, names in enumerate(expected, start=1):
+        result = rewrite(
+            {"model": "test-model", "messages": list(messages)},
+            cfg=cfg,
+            embed=embedder,
+            rerank=reranker,
+            session_id="session-1",
+            turn_id="turn-1",
+            notify=lambda _turn_id: None,
+        )
+        assert result is not None, f"call {call} must rewrite"
+        record = record_for(cfg)
+        assert record["status"] == "routed", f"call {call} must keep a routed record"
+        assert sorted(record["names"]) == names, f"call {call} routed names"
+        messages = [
+            *messages,
+            {"role": "assistant", "content": "calling a tool"},
+            {"role": "tool", "content": "tool output"},
+        ]
 
 
 def test_a_request_without_the_block_can_suggest_the_names_again(tmp_path):
