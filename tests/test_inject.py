@@ -605,3 +605,11 @@ def test_the_suggestion_marker_opens_the_suggestions_section():
     )
 
     assert SUGGESTIONS in lines_of(block)
+
+
+def test_no_failure_marker_is_emitted_by_the_renderer():
+    """C5/D6: marker emission is gone; displayed names stay a reader only."""
+    assert not hasattr(inject_module, "DROPPED_MESSAGE")
+    source = Path(inject_module.__file__).read_text(encoding="utf-8")
+    assert "Skill catalog dropped after a routing failure" not in source
+    assert "def displayed_names(" in source, "the display-name reader is retained"

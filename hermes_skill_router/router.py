@@ -111,7 +111,7 @@ from .display import INERT, ROUTED, record
 from .embed import HEALTH as EMBED_HEALTH
 from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
-from .inject import HEADER, displayed_names, render
+from .inject import HEADER, render
 from .library import Index, PathResolver, is_partial_view, load_or_build, path_resolver, will_embed
 from .loader_records import loaded_skills, path_candidates, request_records, tool_name_set
 from .rerank import rerank as default_rerank
@@ -463,11 +463,9 @@ def _compose(
             if isinstance(path, str) and path:
                 path_map[name] = path
     loaded = loaded_skills(records, results, known, path_map, tool_name_set(cfg))
-    # The payload's own prior blocks plus the origin store decide both what this turn must
-    # not repeat and whether the pinned rows belong here. Unique appearance covers every
-    # displayed category (C5): the reader returns all displayed names, so a kept row shown
-    # in any section never reappears in the window.
-    suppressed = {name for block in previous for name in displayed_names(block)}
+    # D6/D7: suppression is decided only by C9 structured tool records in this
+    # request. Displayed names in prior blocks are bookkeeping, not a suppression
+    # source, so a shortlist-only loser stays suggestable in the next turn.
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
     wanted.extend(name for name in partition.kept.names if name in eager)
@@ -477,7 +475,6 @@ def _compose(
         [name for name, _score in ranked.candidates],
         cfg,
         paths,
-        suppressed,
         loaded=loaded,
     )
     _log_decision(cfg, query, ranked, selected)

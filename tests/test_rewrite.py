@@ -551,28 +551,28 @@ def _second_turn(payload, block):
     }
 
 
-def test_a_second_request_carrying_the_block_does_not_repeat_its_names(tmp_path):
+def test_a_second_request_carrying_the_block_can_repeat_its_names(tmp_path):
+    """D6: displayed names are not suppression input; a shortlist-only loser returns."""
     cfg = make_config(tmp_path)
     payload = _payload()
     first = rewrite(payload, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
     assert first is not None
+    first_names = suggested_names(block_of(first))
     second = _second_turn(payload, block_of(first))
     before = copy.deepcopy(second)
 
     result = rewrite(second, cfg=cfg, embed=FakeEmbedder(), rerank=FakeReranker())
 
-    assert result is not None, "every candidate was suppressed, so only the degraded note rides"
+    assert result is not None, "the fresh turn renders its own shortlist"
     messages = result["request"]["messages"]
-    # The window already stripped the catalog in turn 1, so the note turn keeps the
-    # stripped state with the earlier block re-inserted (C1): no full-catalog re-dump.
     from hermes_skill_router.catalog import strip_catalog
 
     stripped, _partition = strip_catalog(second)
-    assert messages[:-1] == list(stripped["messages"]), "the stripped state and earlier block stay"
-    assert suggested_names(messages[-1]["content"]) == [], "the note never poses as a suggestion"
-    assert "Skills routed for this request" not in messages[-1]["content"]
+    assert messages[:-1] == list(stripped["messages"]), "the prefix is unchanged"
+    assert messages[-1]["content"].startswith(HEADER)
+    assert suggested_names(messages[-1]["content"]) == first_names, "no displayed-name suppression"
     assert second == before, "the rewrite never mutates its input"
-    assert record_for(cfg)["status"] == "inert"
+    assert record_for(cfg)["status"] == "routed"
 
 
 def test_a_later_api_call_in_the_same_turn_keeps_the_routed_record(tmp_path):
@@ -721,7 +721,7 @@ def test_a_store_only_continuation_makes_no_embed_or_rerank_calls(tmp_path):
     assert third is not None
     assert len(embedder.calls) > embed_calls, "a new turn must rank again"
     assert len(reranker.calls) > rerank_calls, "a new turn must rerank again"
-    assert record_for(cfg)["status"] == "inert", "a new turn records its own decision"
+    assert record_for(cfg)["status"] == "routed", "a new turn with no structured load routes again"
 
 
 def test_a_block_in_payload_continuation_makes_no_embed_or_rerank_calls(tmp_path):
@@ -883,13 +883,12 @@ def test_a_new_turn_with_a_trailing_system_message_ranks(tmp_path):
     assert record_for(cfg)["status"] == "routed"
 
 
-def test_a_genuinely_new_turn_still_records_inert(tmp_path):
+def test_a_genuinely_new_turn_routes_again_without_a_structured_load(tmp_path):
     """A new user message after the block opens a new turn with its own decision.
 
     The second request carries a fresh user prompt after the earlier block and
-    a fresh turn_id, so it is a new turn: its record is inert even though the
-    earlier turn routed, and a fresh turn with no candidates at all records
-    inert too.
+    a fresh turn_id. Displayed names from that block are bookkeeping only, so
+    the new turn routes the same names again; only C9 structured records suppress.
     """
     cfg = make_config(tmp_path)
     payload = _payload()
@@ -917,8 +916,8 @@ def test_a_genuinely_new_turn_still_records_inert(tmp_path):
     )
     assert second is not None
     record = record_for(cfg)
-    assert record["status"] == "inert", "every candidate stays suppressed in this shape"
-    assert record["names"] == []
+    assert record["status"] == "routed", "displayed names never suppress a later turn"
+    assert record["names"]
     assert record["turn_id"] == "turn-2"
 
     nothing_cfg = make_config(tmp_path, cutoff=0.99)
@@ -2983,3 +2982,109 @@ def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):
 
 
 
+
+
+def _structured_load_payload():
+    """A fresh user turn after an earlier turn loaded beta through a structured result."""
+    payload = _payload()
+    return {
+        **payload,
+        "messages": [
+            payload["messages"][0],
+            {"role": "user", "content": "load the beta skill"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c9-load",
+                        "type": "function",
+                        "function": {
+                            "name": "skill_view",
+                            "arguments": json.dumps({"name": "beta"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c9-load",
+                "name": "skill_view",
+                "content": json.dumps({"success": True, "name": "beta"}),
+            },
+            {"role": "user", "content": QUERY},
+        ],
+    }
+
+
+def test_a_structured_load_suppresses_only_the_loaded_name(tmp_path):
+    cfg = make_config(tmp_path, cutoff=0.1)
+    result = rewrite(
+        _structured_load_payload(),
+        cfg=cfg,
+        session_id="c9-loaded",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+    assert result is not None
+    block = block_of(result)
+    assert "- beta:" not in block, "the loaded name is suppressed by C9"
+    assert suggested_names(block), "an unloaded loser is still suggested"
+
+
+def test_a_compaction_makes_loaded_names_suggestible_again(tmp_path):
+    from hermes_skill_router.writeback import expire_window
+
+    cfg = make_config(tmp_path, cutoff=0.1)
+    first = rewrite(
+        _structured_load_payload(),
+        cfg=cfg,
+        session_id="c9-compact",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+    assert first is not None
+    assert "- beta:" not in block_of(first)
+
+    expire_window("c9-compact", cfg.cache_path)
+    search_module.expire_dump("c9-compact")
+    after = rewrite(
+        _payload(),
+        cfg=cfg,
+        session_id="c9-compact",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+    assert after is not None
+    assert "- beta:" in block_of(after), "no durable load survives compaction"
+
+
+def test_a_failure_after_a_routed_turn_keeps_stripped_state_without_a_fresh_block(tmp_path):
+    cfg = make_config(tmp_path)
+    payload = _payload()
+    first = rewrite(
+        payload,
+        cfg=cfg,
+        session_id="fail-after-route",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
+    )
+    assert first is not None
+    second = rewrite(
+        _payload(user="next request"),
+        cfg=cfg,
+        session_id="fail-after-route",
+        embed=FakeEmbedder(result=None),
+        rerank=FakeReranker(),
+    )
+    assert second is not None
+    messages = second["request"]["messages"]
+    assert not any(
+        isinstance(message.get("content"), str)
+        and message["content"].startswith(HEADER)
+        for message in messages
+    ), "failure never appends a shortlist"
+    assert "## Skills" not in messages[0]["content"], "the stripped catalog state is kept"
+    assert all(
+        "Skill catalog dropped after a routing failure" not in str(message)
+        for message in messages
+    ), "no failure marker is ever emitted"
