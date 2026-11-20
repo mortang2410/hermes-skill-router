@@ -1,39 +1,21 @@
-"""Conversation write-back with an origin-tagged plugin store (module M8, contract C1).
+"""Store-only shortlist bookkeeping with an origin-tagged plugin store (M8, C1).
 
-The injected suggestion block never entered conversation history: the run loop
-builds ``api_messages`` from ``conversation_history`` plus the system prompt and
-the middleware only replaces the outgoing payload, so the block repeated every
-turn. This module gives the block a durable home without forking the session:
-
-- a plugin-owned store (one JSON file beside the cache) carrying block bytes,
-  insertion index, origin class, window generation and block hash, keyed by
-  session id;
-- a session DB append, only for origin ``normal`` and only when the payload
-  history tail matches the session DB tail, so a detached fork on a stale
-  snapshot never appends into a moved-on parent session;
-- a plugin-side compression fence: before the append, M8 opens its own
-  ``hermes_state.SessionDB`` handle and reads the session's compression lock
-  (``get_compression_lock_holder``); while a compression is in flight the block
-  lives store-only, generation-tagged;
-- post-compaction cleanup: the appended row id is recorded, and on
-  ``post_compaction`` it is re-resolved with ``resolve_active_row_id`` (a race
-  append may have been cloned with a new id) and the result deactivated with
-  ``deactivate_message``, so no plugin block row survives past the close of
-  any window.
+The shortlist is appended to the one request the rewrite is building and to no
+later request. This module owns a JSON store beside the index cache that keeps
+the rendered block bytes, the names the block displays, its origin class and
+its window generation for bookkeeping, retry deduplication and display records
+only. It is never a suppression input: decision-time suppression reads C9
+structured tool records. No stored block is replayed into a later request, and
+this module never opens a session database handle, appends a history row, reads
+a compression lock or cleans up a row. Writes are keyed by block hash, so a
+retried middleware call records once. Any store failure fails open and never
+raises to the model call.
 
 Origin classes come from the middleware ``platform`` kwarg plus prompt shape
 (no middleware kwarg distinguishes the fork; turn ids are uuids): ``curator``
 when the platform is curator or the user message carries the curator prompt
-shape (curator-catalog-fix-study.md), ``review`` when the user message starts
-with the background-review prompt shape, else ``normal``. Only ``normal``
-appends to the DB; review and curator blocks live in the store only and never
-write a DB row under the shared parent session id. Re-insertion replays only
-same-origin, same-generation blocks, deduped by byte search, on every outgoing
-request regardless of routing success; a store or append failure for a new
-block sends the admitted blocks with the window's catalog state unchanged and
-no fresh block, never ``None``. Writes are keyed by block hash, so a retried
-middleware call appends once. Every failure fails open: this module never
-raises to the model call.
+shape, ``review`` when the user message starts with the background-review
+prompt shape, else ``normal``. Every origin is store-only.
 """
 
 from __future__ import annotations
@@ -43,7 +25,7 @@ import json
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("hermes_skill_router.writeback")
 
@@ -177,12 +159,10 @@ def _window(store: Dict[str, Any], session_id: str) -> Dict[str, Any]:
     windows = store["windows"]
     window = windows.get(session_id)
     if not isinstance(window, dict):
-        window = {"generation": 0, "blocks": [], "row_ids": []}
+        window = {"generation": 0, "blocks": []}
         windows[session_id] = window
     if not isinstance(window.get("blocks"), list):
         window["blocks"] = []
-    if not isinstance(window.get("row_ids"), list):
-        window["row_ids"] = []
     if not isinstance(window.get("generation"), int):
         window["generation"] = 0
     return window
@@ -302,79 +282,22 @@ def _already_stored(window: Dict[str, Any], origin: str, digest: str) -> bool:
     )
 
 
-def _session_db():
-    """Return a fresh ``hermes_state.SessionDB`` handle, or ``None`` when absent.
-
-    The plugin reads the DB through its own handle for the fence and the
-    tail match; the host owns the live DB. Any import or construction failure
-    fails open (store-only, no append).
-    """
-    try:
-        from hermes_state import SessionDB  # type: ignore
-
-        return SessionDB()
-    except Exception:
-        logger.debug("hermes-skill-router writeback: no session DB handle", exc_info=True)
-        return None
-
-
-def _db_tail(session_id: str, db: Any) -> Optional[List[Dict[str, Any]]]:
-    """Return the session DB's recent messages, or ``None`` on any failure."""
-    try:
-        rows = db.get_messages(session_id, include_inactive=False, include_compacted=False)
-    except Exception:
-        return None
-    if not isinstance(rows, list):
-        return None
-    tail: List[Dict[str, Any]] = []
-    for row in rows[-8:]:
-        if isinstance(row, dict) and isinstance(row.get("role"), str):
-            tail.append({"role": row["role"], "content": row.get("content")})
-    return tail
-
-
-def _payload_tail(messages: Any, block: str = "") -> List[Dict[str, Any]]:
-    """Return the payload's recent ``{role, content}`` messages, oldest first.
-
-    A trailing message whose content is *block* itself is the fresh block the
-    rewrite just appended; it is not part of the history tail the DB compares
-    against, so it is excluded.
-    """
-    tail: List[Dict[str, Any]] = []
-    if not isinstance(messages, (list, tuple)):
-        return tail
-    items = list(messages)
-    if block and items and isinstance(items[-1], dict) and items[-1].get("content") == block:
-        items = items[:-1]
-    for message in items[-8:]:
-        if isinstance(message, dict) and isinstance(message.get("role"), str):
-            tail.append({"role": message["role"], "content": message.get("content")})
-    return tail
-
-
 def admit_block(
-    payload: Any,
     session_id: str,
     block: str,
+    names: Sequence[str],
     insert_index: int,
     origin: str,
     cache_path: Any,
 ) -> bool:
-    """Store *block* for *session_id* and DB-append it when the guards pass.
+    """Record *block* and its displayed names in the plugin store. Never raises.
 
-    Returns ``True`` when the block is admitted (stored, and appended when
-    origin is ``normal``). The store write is keyed by block hash, so a
-    retried middleware call admits once. The DB append runs only for origin
-    ``normal`` and only when the payload history tail matches the session DB
-    tail; while a compression is in flight (``get_compression_lock_holder``
-    non-empty through M8's own handle) the append is skipped and the block
-    lives store-only, generation-tagged. Any failure keeps the admitted blocks
-    and returns ``False``; it never raises.
+    Returns ``True`` when the shortlist was recorded. Writes are keyed by block
+    hash, so a retried middleware call records once. No session database handle
+    is opened and no history row is written for any origin.
     """
     if not isinstance(block, str) or not block:
         return False
-    # An empty key is the single-anonymous bucket (search._key's "" fallback):
-    # a caller with neither id still gets a window, never a dropped block.
     _record_path(session_id, cache_path)
     try:
         store = _read_store(cache_path)
@@ -386,6 +309,7 @@ def admit_block(
         window["blocks"].append(
             {
                 "block": block,
+                "names": [name for name in names if isinstance(name, str)],
                 "insert_index": int(insert_index),
                 "origin": origin,
                 "generation": gen,
@@ -395,50 +319,32 @@ def admit_block(
         if not _write_store(cache_path, store):
             window["blocks"].pop()
             return False
-        if origin != ORIGIN_NORMAL:
-            return True
-        messages = payload.get("messages") if isinstance(payload, dict) else None
-        db = _session_db()
-        if db is None:
-            return True
-        try:
-            holder = db.get_compression_lock_holder(session_id)
-        except Exception:
-            holder = None
-        if holder:
-            # A compression is in flight: the append would race the clone-back,
-            # so the block stays store-only for this generation.
-            return True
-        tail = _db_tail(session_id, db)
-        if tail is None or tail != _payload_tail(messages, block):
-            logger.debug(
-                "hermes-skill-router writeback: payload tail does not match the DB tail; store-only"
-            )
-            return True
-        try:
-            row_id = db.append_message(session_id, "system", content=block)
-        except Exception:
-            logger.debug("hermes-skill-router writeback: append failed", exc_info=True)
-            return False
-        window["row_ids"].append(int(row_id))
-        _write_store(cache_path, store)  # best effort; the row is already durable
         return True
     except Exception:
         logger.debug("hermes-skill-router writeback: admit failed", exc_info=True)
         return False
 
 
-def expire_window(session_id: str, cache_path: Any) -> None:
-    """Advance the window generation and deactivate the window's block rows.
+def stored_names(session_id: str, origin: str, gen: int, cache_path: Any) -> List[str]:
+    """Return displayed names recorded for a window, for bookkeeping only."""
+    window = _window(_read_store(cache_path), session_id)
+    names: List[str] = []
+    for entry in window["blocks"]:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("origin") != origin or entry.get("generation") != gen:
+            continue
+        for name in entry.get("names") or ():
+            if isinstance(name, str) and name not in names:
+                names.append(name)
+    return names
 
-    Called from ``post_compaction``: every appended block row id is re-resolved
-    with ``resolve_active_row_id`` (a race append may have been cloned with a
-    new id) and the result deactivated with ``deactivate_message``, so no
-    plugin block row survives past the close of any window. The store entry
-    expires as the generation advances. Every store the session wrote to is
-    expired, not only the one the current setting names (the writeback
-    module owns the paths it wrote); a session with no recorded path falls
-    back to *cache_path*. Never raises.
+
+def expire_window(session_id: str, cache_path: Any) -> None:
+    """Advance the window generation and drop its stored shortlists. Never raises.
+
+    Called from ``post_compaction``. Every store the session wrote to is expired,
+    not only the one the current setting names. No database row is touched.
     """
     for path in _take_paths(session_id, cache_path):
         _expire_at(session_id, path)
@@ -451,26 +357,10 @@ def _expire_at(session_id: str, cache_path: Any) -> None:
     try:
         store = _read_store(cache_path)
         if session_id not in store.get("windows", {}):
-            # No window was ever opened for this session: nothing to deactivate
-            # and no generation to advance, and no empty store is materialized
-            # (the default-path store never springs into existence for it).
             return
         window = _window(store, session_id)
-        row_ids = [r for r in window["row_ids"] if isinstance(r, int)]
-        db = _session_db() if row_ids else None
-        if db is not None:
-            for row_id in row_ids:
-                try:
-                    active = db.resolve_active_row_id(session_id, row_id)
-                    if active is not None:
-                        db.deactivate_message(session_id, active)
-                except Exception:
-                    logger.debug(
-                        "hermes-skill-router writeback: row cleanup failed", exc_info=True
-                    )
         window["generation"] = int(window["generation"]) + 1
         window["blocks"] = []
-        window["row_ids"] = []
         window["stripped"] = False
         _write_store(cache_path, store)
     except Exception:

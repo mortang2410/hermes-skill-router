@@ -40,10 +40,9 @@ pass that reaches the end of it is abandoned with one log line naming the budget
 Suppression and the opening flag both come from the payload's own messages, never from module state.
 A message whose content opens with the block's shared first line is a block this plugin injected
 earlier in the compaction window: its suggested names are suppressed, and its presence means this is
-not the window's opening block. The opening flag and suppression also read the origin store's
-stored blocks, so a store-only replay is never a new opening block. A compaction that removes both
-leaves neither, so the names are suggestable again and pinned rows are listed again. Routing the
-same payload twice therefore returns
+not the window's opening block. The origin store is bookkeeping only: it is never a suppression
+input and no stored block is replayed into a payload. Compaction removes the payload blocks, so the
+names become suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
 the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
 
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
@@ -52,8 +51,8 @@ request clears the previous one first, so a search never ranks rows from an earl
 The display record through :mod:`hermes_skill_router.display` carries
 ``routed`` with the selected suggestion names, or ``inert`` with no names. One user turn makes several API requests: the
 request that opens the turn writes its decision, and a later request in the
-same turn ranks nothing and writes nothing, returning the re-inserted stored
-state (with the degraded note on its own when one is recomputed), so only the
+same turn ranks nothing and writes nothing, returning the window's catalog
+state without a stored shortlist (with the degraded note on its own when one is recomputed), so only the
 opening call can show a new skill. With that rule the panel shows what the turn routed rather than an inert overwrite. A new user message
 after the block opens a new turn, which records its own decision. A
 byte-identical retry of a turn's opening request is a known limit: the payload
@@ -134,9 +133,7 @@ from .writeback import (
     ORIGIN_CURATOR,
     admit_block,
     derive_origin,
-    generation,
     mark_stripped,
-    stored_blocks,
     stripped_sent,
 )
 from .curator import curator_rewrite
@@ -308,13 +305,11 @@ def _compose(
     # The tool ranks the routed half of this partition, so it remembers the rows this prompt
     # showed before any later stage can fail and leave the request as it arrived.
     remember_partition(session_id, partition, task_id=task_id)
-    # C1: the origin class (derived above) and this window's stored blocks
-    # decide what this request re-inserts. Re-insertion replays only
-    # same-origin, same-generation blocks, deduped by byte search, on every
-    # outgoing request regardless of routing success.
+    # C1/D8/D9: the shortlist is appended to this request only. The origin store
+    # keeps block bytes and names for bookkeeping; no stored block is replayed
+    # into a later request and the store is never a suppression input (C9).
     store_key = session_id or task_id or ""
-    stored = stored_blocks(store_key, origin, generation(store_key, cfg.cache_path), cfg.cache_path)
-    base_messages = _reinsert(stripped.get("messages") or (), stored)
+    stripped_messages = list(stripped.get("messages") or ())
     stripped_already = stripped_sent(store_key, cfg.cache_path)
     # A later API call inside the same user turn selects nothing new, so it
     # must not overwrite the turn's display record, routed or inert. The
@@ -323,16 +318,10 @@ def _compose(
     continuation = _turn_continuation(messages)
     if continuation:
         # Rank once per prompt: a later API call in the same user turn ranks
-        # nothing. It skips the query embed, the rerank, the learning scan
-        # and the decision log, and it writes no record, so the turn's routed
-        # record from the opening call stands. The payload it returns is the
-        # one the same call returns today when it selects nothing new: the
-        # re-inserted stored state, plus the degraded note on its own when
-        # this pass recomputes one. The degraded line is computed without
-        # building the index, so the BM25-missing part, which needs the built
-        # index, can be absent from that line; the saved-index partial-view
-        # part is checked without the index, so it still matches. Every
-        # other part matches the opening call's line.
+        # nothing, writes no record and replays no stored shortlist. It keeps
+        # the window's catalog state: stripped bytes once a stripped payload
+        # went out, the untouched payload otherwise, plus the degraded note
+        # when this pass recomputes one. No stored block is re-inserted.
         if dumped_before:
             return {"request": dict(payload)}
         note = _degraded_note(
@@ -340,31 +329,18 @@ def _compose(
             index=index,
             partial_view=index is None and is_partial_view(cfg, partition.routed),
         )
+        base = stripped_messages if stripped_already else list(payload.get("messages") or ())
         if note.strip():
-            if stored:
-                mark_stripped(store_key, cfg.cache_path)
-                return {
-                    "request": {
-                        **dict(payload),
-                        "messages": [
-                            *base_messages,
-                            {"role": "system", "content": note.strip()},
-                        ],
-                    }
-                }
+            mark_stripped(store_key, cfg.cache_path)
             return {
                 "request": {
                     **dict(payload),
-                    "messages": [
-                        *list(payload.get("messages") or ()),
-                        {"role": "system", "content": note.strip()},
-                    ],
+                    "messages": [*base, {"role": "system", "content": note.strip()}],
                 }
             }
-        if not stored:
+        if not stripped_already:
             return None
-        mark_stripped(store_key, cfg.cache_path)
-        return {"request": {**dict(payload), "messages": base_messages}}
+        return {"request": {**dict(payload), "messages": base}}
 
     def _fail(reason: str, note: str = ""):
         """Return the failure result for this pass (contract C5).
@@ -373,7 +349,7 @@ def _compose(
         is one clean dump; it puts the window in catalog mode, and every later payload in
         catalog mode repeats the full catalog unchanged. Once a stripped payload has gone
         out (a routed block, a store-failure turn, or any stripped state), every later
-        failure keeps the stripped state with the stored blocks and appends no fresh
+        failure keeps the stripped state without replaying a stored shortlist and appends no fresh
         block. No failure result is ``None`` after a stripped payload went out, and no
         marker message is ever appended (contract C5). *note* is contract C7's one line
         when a per-request call failed, which outranks every other note this turn; it
@@ -384,11 +360,11 @@ def _compose(
             _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if dumped_before:
             return {"request": dict(payload)}
-        if not previous and not stored and not stripped_already:
+        if not previous and not stripped_already:
             remember_dump(session_id, task_id=task_id)
             return None
         mark_stripped(store_key, cfg.cache_path)
-        return {"request": {**dict(payload), "messages": base_messages}}
+        return {"request": {**dict(payload), "messages": stripped_messages}}
 
     query = _query_text(messages)
     if not query:
@@ -492,7 +468,6 @@ def _compose(
     # displayed category (C5): the reader returns all displayed names, so a kept row shown
     # in any section never reappears in the window.
     suppressed = {name for block in previous for name in displayed_names(block)}
-    suppressed.update(name for _index, block in stored for name in displayed_names(block))
     eager = set(cfg.eager_skills or ())
     wanted = [name for name, _score in ranked.candidates]
     wanted.extend(name for name in partition.kept.names if name in eager)
@@ -513,66 +488,56 @@ def _compose(
         index,
         cfg,
         partition.one_shot,
-        opening=not previous and not stored,
+        opening=not previous and not stripped_already,
         paths=paths,
         note=note,
     )
     if not block:
-        # No selected suggestion and no kept row: stripping without a replacement would lose the
-        # catalog for nothing, so the whole request is returned untouched, unless the window
-        # already holds admitted blocks: then the re-inserted blocks ride with the window's
-        # catalog state unchanged and no fresh block (C1 re-insertion on every outgoing
-        # request regardless of routing success). A same-turn continuation keeps
-        # the turn's routed record: this call selected nothing new only because
-        # the turn's block is already admitted, so an inert write here would
-        # hide what the turn routed.
+        # No selected suggestion and no kept row: stripping without a replacement would
+        # lose the catalog for nothing. Keep the window's catalog state (stripped bytes
+        # once a stripped payload went out) and append nothing; no stored shortlist is
+        # replayed. A same-turn continuation keeps the turn's routed record.
         if not continuation:
             _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
-        if not stored:
+        if not stripped_already:
             return None
-        mark_stripped(store_key, cfg.cache_path)
-        return {"request": {**dict(payload), "messages": base_messages}}
+        base = stripped_messages
+        if note.strip():
+            base = [*base, {"role": "system", "content": note.strip()}]
+        return {"request": {**dict(payload), "messages": base}}
     if note.strip() and block == note.strip():
-        # The renderer returned the degraded note on its own: no row is shown, so the catalog must
-        # stay. The note rides as one standalone system message on the original request, which
-        # keeps the degraded state the provider context would otherwise lose. When the window
-        # already holds admitted blocks, the re-inserted blocks ride with the window's catalog
-        # state unchanged instead (C1, same as the empty-block path above). A
-        # same-turn continuation keeps the turn's routed record, as above.
+        # The renderer returned the degraded note on its own: no row is shown, so the
+        # catalog stays unless this window already sent stripped bytes. The note rides
+        # as one standalone system message; no stored shortlist is re-inserted.
         if not continuation:
             _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
-        if stored:
-            mark_stripped(store_key, cfg.cache_path)
-            return {
-                "request": {
-                    **dict(payload),
-                    "messages": [*base_messages, {"role": "system", "content": block}],
-                }
-            }
+        base = (
+            stripped_messages
+            if stripped_already
+            else list(payload.get("messages") or ())
+        )
         return {
             "request": {
                 **dict(payload),
-                "messages": [
-                    *list(payload.get("messages") or ()),
-                    {"role": "system", "content": block},
-                ],
+                "messages": [*base, {"role": "system", "content": block}],
             }
         }
-    final_messages = [*base_messages, {"role": "system", "content": block}]
+    final_messages = [*stripped_messages, {"role": "system", "content": block}]
     admitted = admit_block(
-        payload, store_key, block, len(base_messages), origin, cfg.cache_path
+        store_key,
+        block,
+        [name for name, _score in selected],
+        len(stripped_messages),
+        origin,
+        cfg.cache_path,
     )
-    # A stripped payload goes out either way (fresh block, or admitted blocks
-    # with the catalog state unchanged on a store failure): later failures in
-    # this window keep the stripped state (C5).
+    # A stripped payload goes out either way: a fresh block, or the window's
+    # catalog state with no fresh shortlist when the store failed. Later failures
+    # in this window keep the stripped state (C5).
     mark_stripped(store_key, cfg.cache_path)
     rewritten = {
         **dict(payload),
-        "messages": (
-            final_messages
-            if admitted
-            else base_messages
-        ),
+        "messages": final_messages if admitted else stripped_messages,
     }
     _recorder(
         cfg,
@@ -700,25 +665,6 @@ def _turn_continuation(messages: Any) -> bool:
         isinstance(message, Mapping) and message.get("role") in ("assistant", "tool")
         for message in messages[last_user + 1 :]
     )
-
-
-def _reinsert(messages: Any, stored: Any) -> List[Any]:
-    """Return *messages* with every stored block replayed at its recorded index.
-
-    A stored block whose bytes already appear in a message is skipped (byte-search
-    dedupe: the conversation append already put it in history), so re-insertion
-    never duplicates a block the payload already carries. Same-origin,
-    same-generation blocks only; entries come from
-    :func:`hermes_skill_router.writeback.stored_blocks` already filtered.
-    """
-    result = list(messages)
-    for index, block in stored:
-        if any(
-            isinstance(item, Mapping) and block in _message_text(item) for item in result
-        ):
-            continue
-        result.insert(min(int(index), len(result)), {"role": "system", "content": block})
-    return result
 
 
 def _message_text(message: Any) -> str:

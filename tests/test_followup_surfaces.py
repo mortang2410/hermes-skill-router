@@ -256,9 +256,10 @@ def test_a_healthy_turn_after_a_degraded_one_writes_a_note_free_record(tmp_path,
 
     stored = read(cfg)
     assert stored["note"] == "", "a healthy turn must write a note-free record"
-    # The stale-line rule is record-scoped: turn 1's block is immutable history (C1),
-    # so the healthy turn re-inserts it byte-identical rather than clearing its text.
-    assert _last_block(second) == _last_block(first), "turn 1's block re-inserts byte-identical"
+    # The stale-line rule is record-scoped: the healthy turn writes its own fresh
+    # block with no degraded note and replays no bytes from turn 1 (D8/D9).
+    assert _last_block(second) != _last_block(first), "turn 1's block is never re-inserted"
+    assert "History incomplete" not in _last_block(second), "no stale note in the fresh block"
 
 
 # ---------------------------------------------------------------------------

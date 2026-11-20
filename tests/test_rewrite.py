@@ -690,9 +690,8 @@ def test_a_store_only_continuation_makes_no_embed_or_rerank_calls(tmp_path):
     assert record["status"] == "routed", "a continuation must not overwrite routed"
     assert record["names"] == first_record["names"]
 
-    # The continuation payload is the re-inserted stored state plus the
-    # degraded note on its own, byte-identical to the old select-nothing
-    # payload: pin the whole outbound message list by digest.
+    # No stored shortlist is replayed into the tool loop: the continuation
+    # keeps the window's stripped bytes and carries only the degraded note.
     messages = second["request"]["messages"]
     from hermes_skill_router.inject import HEADER as _HEADER  # noqa: E402
 
@@ -702,14 +701,12 @@ def test_a_store_only_continuation_makes_no_embed_or_rerank_calls(tmp_path):
         if isinstance(message.get("content"), str)
         and message["content"].startswith(_HEADER)
     ]
-    assert len(blocks) == 1 and suggested_names(blocks[0]) == first_record["names"]
+    assert blocks == [], "a continuation must not re-insert the stored shortlist"
     assert "Cache persistence is off" in messages[-1]["content"]
-    digest = hashlib.sha256(
-        json.dumps(messages, sort_keys=True).encode()
-    ).hexdigest()
-    assert digest == "dc15478d0f048149bee178031ea638b1b9fae64f5c9da07c101a6137be853aa2", (
-        f"the continuation payload must not change byte, got {digest}"
-    )
+    from hermes_skill_router.catalog import strip_catalog
+
+    stripped, _partition = strip_catalog(_store_only_continuation(payload))
+    assert messages[:-1] == list(stripped["messages"]), "prefix before the note is unchanged"
 
     # A genuinely new turn ranks again and records its own decision.
     third = rewrite(
@@ -920,7 +917,7 @@ def test_a_genuinely_new_turn_still_records_inert(tmp_path):
     )
     assert second is not None
     record = record_for(cfg)
-    assert record["status"] == "inert", "a new turn records its own decision"
+    assert record["status"] == "inert", "every candidate stays suppressed in this shape"
     assert record["names"] == []
     assert record["turn_id"] == "turn-2"
 
@@ -1052,8 +1049,7 @@ def test_a_store_only_same_turn_call_keeps_the_routed_record_on_the_empty_path(
         if isinstance(message.get("content"), str)
         and message["content"].startswith(HEADER)
     ]
-    assert len(blocks) == 1, "the stored block is re-inserted once, never duplicated"
-    assert suggested_names(blocks[0]) == first_record["names"]
+    assert blocks == [], "the empty-block path appends nothing and replays nothing"
 
 
 def test_a_store_only_new_turn_still_records_inert(tmp_path):
@@ -1098,8 +1094,8 @@ def test_a_store_only_new_turn_still_records_inert(tmp_path):
     )
     assert second is not None
     record = record_for(cfg)
-    assert record["status"] == "inert", "a new turn records its own decision"
-    assert record["names"] == []
+    assert record["status"] == "routed", "a returning loser stays suggestable"
+    assert record["names"], "the store is not a suppression input"
     assert record["turn_id"] == "turn-2"
 
 
@@ -1210,11 +1206,9 @@ def test_three_store_only_turns_in_one_window_keep_their_routed_records(tmp_path
     reranker = FakeReranker(scores=[0.9 - 0.01 * i for i in range(8)])
     payload = _payload(rows=SKILL_ROWS8, user="warmup")
     history = [payload["messages"][0]]
-    expected = [
-        ["skill1", "skill2", "skill3"],
-        ["skill4", "skill5", "skill6"],
-        ["skill7", "skill8"],
-    ]
+    # No stored block suppresses a later turn, so each opening turn routes the
+    # same top three names again.
+    expected = [["skill1", "skill2", "skill3"]] * 3
     for turn, names in enumerate(expected, start=1):
         history = [*history, {"role": "user", "content": f"turn {turn}: {QUERY}"}]
         opening = rewrite(
@@ -1306,9 +1300,10 @@ def test_four_calls_in_one_turn_rank_once_and_keep_the_first_routed_record(tmp_p
             if isinstance(message.get("content"), str)
             and message["content"].startswith(HEADER)
         ]
-        assert suggested_names(blocks[0]) == expected, (
-            f"call {call} must not inject a fresh block"
-        )
+        if call == 1:
+            assert suggested_names(blocks[0]) == expected
+        else:
+            assert blocks == [], f"call {call} must not re-insert the stored block"
         messages = [
             *messages,
             {"role": "assistant", "content": "calling a tool"},
@@ -2482,9 +2477,9 @@ def test_a_store_only_replay_is_not_an_opening_block(tmp_path):
     assert replay is not None
     messages = replay["request"]["messages"]
     blocks = [m["content"] for m in messages if isinstance(m.get("content"), str) and m["content"].startswith(HEADER)]
-    assert len(blocks) >= 2, "the replay must carry the stored block and a fresh block"
+    assert len(blocks) == 1, "no stored block is replayed into a fresh payload"
     occurrences = sum(m.get("content", "").count("Also listed:") for m in messages if isinstance(m.get("content"), str))
-    assert occurrences == 1, f"store-only replay repeated the also-listed rows ({occurrences} occurrences)"
+    assert occurrences <= 1, f"store-only replay repeated the also-listed rows ({occurrences} occurrences)"
 
 
 def test_a_dump_never_corrupts_the_request(tmp_path):
@@ -2800,189 +2795,102 @@ def test_one_pass_resolves_each_candidate_path_at_most_once(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-class FakeSessionDB:
-    """Stand-in for hermes_state.SessionDB: records rows, never touches disk."""
+def _stored_window(session_id, cfg):
+    from hermes_skill_router import writeback as wb
 
-    def __init__(self, rows=(), holder=None):
-        self.rows = [dict(row) for row in rows]
-        self.next_id = 100
-        self.holder = holder
-        self.deactivated = []
-        self.resolved = []
-
-    def get_messages(self, session_id, include_inactive=False, include_compacted=False):
-        return [dict(row) for row in self.rows]
-
-    def append_message(self, session_id, role, content=None, **kwargs):
-        self.next_id += 1
-        self.rows.append({"id": self.next_id, "role": role, "content": content})
-        return self.next_id
-
-    def get_compression_lock_holder(self, session_id):
-        return self.holder
-
-    def resolve_active_row_id(self, session_id, row_id):
-        self.resolved.append(row_id)
-        return row_id
-
-    def deactivate_message(self, session_id, row_id):
-        self.deactivated.append(row_id)
-        return 1
+    path = wb.store_path(cfg.cache_path)
+    if not path or not Path(path).exists():
+        return {"blocks": [], "generation": 0}
+    return json.loads(Path(path).read_text(encoding="utf-8")).get("windows", {}).get(
+        session_id, {"blocks": [], "generation": 0}
+    )
 
 
-def _payload_messages(payload):
-    return [{"role": m["role"], "content": m["content"]} for m in payload["messages"]]
-
-
-def test_writeback_two_turns_append_once_and_reinsert_byte_identical(tmp_path, monkeypatch):
+def test_writeback_two_turns_store_only_no_replay(tmp_path):
+    """The shortlist is appended to turn 1 only and never replayed into turn 2."""
     from hermes_skill_router import writeback as wb
 
     cfg = make_config(tmp_path)
     payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     first = rewrite(payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker())
     assert first is not None
     block = block_of(first)
     assert block.startswith(HEADER)
-    assert len(fake.rows) == 3, "one DB append for the fresh block"
-    assert fake.rows[-1]["content"] == block
 
-    second_input = _second_turn(payload, block)
     second = rewrite(
-        second_input, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        _store_only_continuation(payload),
+        cfg=cfg,
+        session_id="s1",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
     )
     assert second is not None
-    contents = [m["content"] for m in second["request"]["messages"]]
-    assert block in contents, "the turn-1 block is re-inserted byte-identical"
-    assert len(fake.rows) == 3, "a retried/next-turn write appends at most once per hash"
-    for name in suggested_names(block):
-        fresh = block_of(second)
-        assert f"- {name}:" not in fresh, "turn-2 block suppresses turn-1 names"
+    contents = [
+        m["content"] for m in second["request"]["messages"] if isinstance(m.get("content"), str)
+    ]
+    assert block not in contents, "the turn-1 shortlist is absent from turn-2 bytes"
+    assert not any(c.startswith(HEADER) for c in contents), "no stored block is re-inserted"
+    assert not hasattr(wb, "_session_db"), "the plugin opens no session DB handle"
+    window = _stored_window("s1", cfg)
+    assert len(window["blocks"]) == 1, "the shortlist is kept for bookkeeping only"
+    assert window["blocks"][0]["names"], "displayed names are kept for bookkeeping only"
 
 
-def test_writeback_retried_call_admits_once(tmp_path, monkeypatch):
-    from hermes_skill_router import writeback as wb
-
+def test_writeback_retried_call_admits_once(tmp_path):
     cfg = make_config(tmp_path)
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     for _ in range(2):
         result = rewrite(
-            payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+            _payload(), cfg=cfg, session_id="s-retry", embed=FakeEmbedder(), rerank=FakeReranker()
         )
         assert result is not None
-    assert len(fake.rows) == 3, "the same block bytes admit once however often retried"
+    assert len(_stored_window("s-retry", cfg)["blocks"]) == 1, "retry dedup by block hash"
 
 
-def test_writeback_review_fork_writes_no_db_row(tmp_path, monkeypatch):
+def test_writeback_review_fork_is_store_only(tmp_path):
     from hermes_skill_router import writeback as wb
 
     cfg = make_config(tmp_path)
     payload = _payload(user="Review the conversation above and consider saving to memory.")
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        payload, cfg=cfg, session_id="s-fork", embed=FakeEmbedder(), rerank=FakeReranker()
     )
     assert result is not None
     assert block_of(result).startswith(HEADER)
-    assert len(fake.rows) == 2, "a review-origin block never writes a DB row"
-    stored = wb.stored_blocks("s1", wb.ORIGIN_REVIEW, 0, cfg.cache_path)
-    assert len(stored) == 1, "the review block lives in the store only"
+    window = _stored_window("s-fork", cfg)
+    assert len(window["blocks"]) == 1
+    assert window["blocks"][0]["origin"] == wb.ORIGIN_REVIEW
+    parent = _stored_window("s-fork-parent", cfg)
+    assert parent["blocks"] == [], "no stored name crosses into a parent window"
 
 
-def test_writeback_compression_in_flight_skips_the_append(tmp_path, monkeypatch):
+def test_writeback_post_compaction_expires_the_store(tmp_path):
     from hermes_skill_router import writeback as wb
 
     cfg = make_config(tmp_path)
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload), holder="compressor")
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        _payload(), cfg=cfg, session_id="s-expire", embed=FakeEmbedder(), rerank=FakeReranker()
     )
     assert result is not None
-    assert len(fake.rows) == 2, "with a compression lock held, the append is skipped"
-    stored = wb.stored_blocks("s1", wb.ORIGIN_NORMAL, 0, cfg.cache_path)
-    assert len(stored) == 1, "the block stays store-only, generation-tagged"
-
-
-def test_writeback_tail_mismatch_skips_the_append(tmp_path, monkeypatch):
-    from hermes_skill_router import writeback as wb
-
-    cfg = make_config(tmp_path)
-    payload = _payload()
-    fake = FakeSessionDB(rows=[{"role": "user", "content": "stale snapshot"}])
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
-    result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
-    )
-    assert result is not None
-    assert len(fake.rows) == 1, "a detached fork on a stale snapshot never appends"
-
-
-def test_writeback_post_compaction_deactivates_rows_and_expires(tmp_path, monkeypatch):
-    from hermes_skill_router import writeback as wb
-
-    cfg = make_config(tmp_path)
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
-    result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
-    )
-    assert result is not None
-    row_id = fake.rows[-1]["id"]
-
-    wb.expire_window("s1", cfg.cache_path)
-    assert fake.resolved == [row_id]
-    assert fake.deactivated == [row_id]
-    assert wb.generation("s1", cfg.cache_path) == 1
-    assert wb.stored_blocks("s1", wb.ORIGIN_NORMAL, 0, cfg.cache_path) == []
+    assert _stored_window("s-expire", cfg)["generation"] == 0
+    wb.expire_window("s-expire", cfg.cache_path)
+    window = _stored_window("s-expire", cfg)
+    assert window["generation"] == 1
+    assert window["blocks"] == [], "the window's shortlists expire with the generation"
 
 
 def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, monkeypatch):
-    """Ticket 01 review fix: the registered hook expires the store the writes used.
-
-    The middleware writes the store beside the configured ``cachePath``; the hook registered
-    through ``register`` must expire that same store, not the default path. The conftest
-    override points every store at one temp file and would mask the path, so this test
-    deletes it and re-points the default ``cachePath`` at ``tmp_path``: a custom cachePath
-    with an admitted block and a fake SessionDB, then the registered callback must
-    deactivate the row and advance the generation in the custom store, and write nothing at
-    the default path.
-    """
-    from hermes_skill_router import writeback as wb
-
+    """The registered hook expires the store the writes used, not the default path."""
     monkeypatch.delenv("HERMES_SKILL_ROUTER_WRITEBACK", raising=False)
-    default_cache = str(tmp_path / "default" / "index.json")
-    specs = []
-    for spec in hermes_config._SPECS:
-        if spec.key == "cachePath":
-            spec = dataclasses.replace(spec, default=default_cache)
-        specs.append(spec)
-    monkeypatch.setattr(hermes_config, "_SPECS", tuple(specs))
-
     custom_cache = str(tmp_path / "custom" / "index.json")
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     cfg = make_config(tmp_path, cachePath=custom_cache)
     result = rewrite(
-        payload, cfg=cfg, session_id="s-registered-hook", embed=FakeEmbedder(), rerank=FakeReranker()
+        _payload(),
+        cfg=cfg,
+        session_id="s-registered",
+        embed=FakeEmbedder(),
+        rerank=FakeReranker(),
     )
     assert result is not None
-    row_id = fake.rows[-1]["id"]
-    assert wb.generation("s-registered-hook", custom_cache) == 0
 
     plugin_module = _load_plugin_module()
     ctx = RecordingContext()
@@ -2996,81 +2904,60 @@ def test_the_registered_post_compaction_hook_expires_the_custom_cache(tmp_path, 
     ctx.get_config = get_config
     plugin_module.register(ctx)
     callback = {name: cb for name, cb in ctx.hooks}["post_compaction"]
-
-    callback(session_id="s-registered-hook", old_session_id="", kind="summarize", reason="handoff_commit")
-    assert fake.deactivated == [row_id]
-    assert wb.generation("s-registered-hook", custom_cache) == 1
-    assert not (tmp_path / "default" / "writeback-store.json").exists(), "the default store was materialized"
+    callback(session_id="s-registered", old_session_id="", kind="summarize", reason="handoff_commit")
+    assert _stored_window("s-registered", cfg)["generation"] == 1
+    assert not (tmp_path / "default" / "writeback-store.json").exists(), "default store untouched"
 
 
 def test_the_registered_hook_expires_every_store_a_settings_change_left_behind(tmp_path, monkeypatch):
-    """Review 2 finding 4: a live cachePath change must not orphan the old store.
-
-    The session writes beside path A, the operator changes ``cachePath`` to B, and the
-    session writes again. The registered ``post_compaction`` hook must deactivate both
-    rows and advance both generations: the writeback module expires the stores it wrote,
-    not the store the current setting names.
-    """
-    from hermes_skill_router import writeback as wb
-
+    """A live cachePath change must expire both stores the session wrote."""
     monkeypatch.delenv("HERMES_SKILL_ROUTER_WRITEBACK", raising=False)
     cache_a = str(tmp_path / "a" / "index.json")
     cache_b = str(tmp_path / "b" / "index.json")
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     for cache in (cache_a, cache_b):
         cfg = make_config(tmp_path, cachePath=cache)
         result = rewrite(
-            _payload(), cfg=cfg, session_id="s-moved-cache", embed=FakeEmbedder(), rerank=FakeReranker()
+            _payload(),
+            cfg=cfg,
+            session_id="s-moved",
+            embed=FakeEmbedder(),
+            rerank=FakeReranker(),
         )
         assert result is not None
-    row_ids = [row["id"] for row in fake.rows[len(_payload_messages(payload)):]]
 
     plugin_module = _load_plugin_module()
     ctx = RecordingContext()
     plugin_module.register(ctx)
     callback = {name: cb for name, cb in ctx.hooks}["post_compaction"]
+    callback(session_id="s-moved", old_session_id="", kind="summarize", reason="handoff_commit")
+    for cache in (cache_a, cache_b):
+        path = Path(cache).parent / "writeback-store.json"
+        window = json.loads(path.read_text(encoding="utf-8"))["windows"]["s-moved"]
+        assert window["generation"] == 1 and window["blocks"] == []
 
-    callback(session_id="s-moved-cache", old_session_id="", kind="summarize", reason="handoff_commit")
-    assert fake.deactivated == row_ids
-    assert wb.generation("s-moved-cache", cache_a) == 1
-    assert wb.generation("s-moved-cache", cache_b) == 1
 
-
-def test_writeback_store_failure_sends_stored_blocks_never_none(tmp_path, monkeypatch):
-    from hermes_skill_router import writeback as wb
-
+def test_writeback_store_failure_sends_no_fresh_block_never_none(tmp_path, monkeypatch):
     cfg = make_config(tmp_path)
-    payload = _payload()
     monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", str(tmp_path))
-
     result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        _payload(), cfg=cfg, session_id="s-fail-store", embed=FakeEmbedder(), rerank=FakeReranker()
     )
     assert result is not None, "a store failure never returns None"
-    contents = [m["content"] for m in result["request"]["messages"]]
+    contents = [m["content"] for m in result["request"]["messages"] if isinstance(m.get("content"), str)]
     assert not any(c.startswith(HEADER) for c in contents), "no fresh block on store failure"
 
 
-def test_writeback_prefix_before_fresh_block_is_byte_identical(tmp_path, monkeypatch):
-    from hermes_skill_router import writeback as wb
-
+def test_writeback_prefix_before_fresh_block_is_byte_identical(tmp_path):
     cfg = make_config(tmp_path)
-    payload = _payload()
-    fake = FakeSessionDB(rows=_payload_messages(payload))
-    monkeypatch.setattr(wb, "_session_db", lambda: fake)
-
     result = rewrite(
-        payload, cfg=cfg, session_id="s1", embed=FakeEmbedder(), rerank=FakeReranker()
+        _payload(), cfg=cfg, session_id="s-prefix", embed=FakeEmbedder(), rerank=FakeReranker()
     )
     assert result is not None
     messages = result["request"]["messages"]
     assert messages[-1]["content"].startswith(HEADER)
     from hermes_skill_router.catalog import strip_catalog
 
-    stripped, _partition = strip_catalog(payload)
+    stripped, _partition = strip_catalog(_payload())
     assert list(messages[:-1]) == list(stripped.get("messages") or ()), (
         "every message before the fresh block is byte-identical"
     )

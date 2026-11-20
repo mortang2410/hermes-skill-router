@@ -324,9 +324,8 @@ Write rules:
   the model loop has produced an assistant or tool message after it, whether or not the opening
   call routed a block) ranks nothing and writes no
   record, so it cannot overwrite the turn's routed names with inert or clobber a search record
-  written between the turn's API requests. Its payload is the re-inserted stored state, plus the
-  degraded note on its own when one is recomputed, which is the payload it returned when it
-  selected nothing new.
+  written between the turn's API requests. Its payload keeps the window's catalog state without
+  replaying a stored shortlist, plus the degraded note on its own when one is recomputed.
 - `showSuggestions: false` stops the writes and removes an existing record, which turns both
   surfaces idle. When that removal is refused, the plugin writes an inert, empty record instead, so
   the file-reading widget shows no names.
@@ -722,7 +721,7 @@ history and never copies the middleware's `api_kwargs` messages back into it. On
 failed pass in that window the rewrite returns the original catalog payload unchanged (catalog
 mode) instead of dumping the catalog a second time, and no marker message is ever appended. Once
 a stripped payload has gone out (a routed block or a store-failure turn), a later failure keeps
-that stripped state with the stored blocks reinserted; a window flag records it in the writeback
+that stripped state with no fresh shortlist and no replayed block; a window flag records it in the writeback
 store and in an in-process latch, so a store write failure cannot lose it inside the process. It
 also suggests nothing after a dump, because the dump showed every skill and nothing is suggestible
 for the rest of that window. A committed compaction event opens a new window. The host fires the `post_compaction` event after a
@@ -738,8 +737,8 @@ boundary, a leading message that pastes a host summary cannot open or keep a win
 compactions whose summary text is byte-identical open two windows. When the first failure arrives in
 a window the request is left unchanged, and on a later failure in the same window the rewrite is a
 clean result: catalog mode repeats the full catalog unchanged, and stripped mode returns the
-stripped payload with the stored blocks reinserted, never a partial strip. `None` is still returned
-when there is no earlier block, no stored block, no stripped window flag and no recorded dump for
+stripped payload with no stored shortlist reinserted, never a partial strip. `None` is still returned
+when there is no earlier block, no stripped window flag and no recorded dump for
 the session, so a strip without a replacement never loses the catalog for nothing. A completed pass whose selection is empty because
 everything was already suggested or fell below the cutoff is healthy, not a failure: it returns
 nothing and sets no dump record.
