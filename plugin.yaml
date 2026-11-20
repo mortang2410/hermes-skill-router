@@ -22,6 +22,11 @@ config_schema:
     items: str
     default: []
     description: "Skill names listed in the router block and never routed."
+  skillLoadingTools:
+    type: list
+    items: str
+    default: []
+    description: "Extra tool names whose JSON arguments carry a skill name or path for decision-time loaded-skill suppression. skill_view and read_file are always parsed."
   embedBaseUrl:
     type: str
     default: "http://127.0.0.1:8012"

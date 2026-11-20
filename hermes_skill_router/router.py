@@ -114,6 +114,7 @@ from .embed import embed_texts as default_embed
 from .fusion import resolve_fusion_config
 from .inject import HEADER, displayed_names, render
 from .library import Index, PathResolver, is_partial_view, load_or_build, path_resolver, will_embed
+from .loader_records import loaded_skills, path_candidates, request_records, tool_name_set
 from .rerank import rerank as default_rerank
 from .search import (
     BUDGET_EXPIRED,
@@ -473,6 +474,19 @@ def _compose(
     # the association store's background thread under its one-attempt lock,
     # and a failure here costs the turn nothing.
     _request_learning_scan(cfg, index)
+    # C9: loaded names come from matched structured tool records in this request, not from
+    # displayed shortlist rows. One pass over the tool records, one result lookup per call,
+    # and one path map built through the memoised resolver for the rest of this pass.
+    records, results = request_records(messages)
+    known = set(index.names)
+    known.update(cfg.eager_skills or ())
+    path_map: Dict[str, str] = {}
+    if records and resolve is not None:
+        for name in path_candidates(records, known):
+            path = resolve(name)
+            if isinstance(path, str) and path:
+                path_map[name] = path
+    loaded = loaded_skills(records, results, known, path_map, tool_name_set(cfg))
     # The payload's own prior blocks plus the origin store decide both what this turn must
     # not repeat and whether the pinned rows belong here. Unique appearance covers every
     # displayed category (C5): the reader returns all displayed names, so a kept row shown
@@ -489,6 +503,7 @@ def _compose(
         cfg,
         paths,
         suppressed,
+        loaded=loaded,
     )
     _log_decision(cfg, query, ranked, selected)
     # The partition's variant chooses the header, so the block matches the prose this request lost.

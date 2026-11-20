@@ -60,7 +60,7 @@ BOOL_KEYS = {
     "channelsBm25",
     "channelsAssociations",
 }
-LIST_KEYS = {"eagerSkills", "deferredSkills"}
+LIST_KEYS = {"eagerSkills", "skillLoadingTools", "deferredSkills"}
 INT_KEYS = {
     "embedTimeoutMs",
     "rerankTimeoutMs",

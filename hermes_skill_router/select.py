@@ -38,24 +38,27 @@ def select(
     cfg: Config,
     paths: Mapping[str, str],
     suppressed: Container[str] = (),
+    loaded: Container[str] = (),
 ) -> List[Suggestion]:
     """Return the admissible suggestions, best first, capped at ``cfg.max_suggestions`` unless it is 0.
 
     *scores* and *names* are parallel, in shortlist order, and every score is a rerank probability.
     *paths* maps each candidate the caller resolved to the absolute ``SKILL.md`` path the host lookup
     returned; a name the map does not carry, or carries with an empty value, is unresolved and is
-    dropped. *suppressed* holds the names visible in the request's own prior blocks. An empty input,
-    or no admissible score at or above the cutoff, returns ``[]``. The result never names a skill
-    outside *names*, never holds a suppressed or pathless name, and never holds more than
-    ``cfg.max_suggestions`` rows when that value is not 0. A length mismatch pairs as far as both
-    sequences go, so a name without a score is never selected.
+    dropped. *suppressed* holds the names visible in the request's own prior blocks; *loaded* holds
+    the names bound by matched structured tool records (C9). Both are excluded, and a name that is
+    only displayed in a one-request shortlist with no structured load is not excluded. An empty
+    input, or no admissible score at or above the cutoff, returns ``[]``. The result never names a
+    skill outside *names*, never holds a suppressed, loaded or pathless name, and never holds more
+    than ``cfg.max_suggestions`` rows when that value is not 0. A length mismatch pairs as far as
+    both sequences go, so a name without a score is never selected.
     """
     if not scores or not names:
         return []
     cutoff = cfg.cutoff
     eligible: List[Suggestion] = []
     for score, name in zip(scores, names):
-        if name in suppressed or not paths.get(name):
+        if name in suppressed or name in loaded or not paths.get(name):
             continue
         probability = float(score)
         if probability >= cutoff:

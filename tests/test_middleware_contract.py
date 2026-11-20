@@ -824,3 +824,105 @@ def test_a_normal_block_never_reinserts_into_a_review_payload(plugin_module, end
     assert len(normal_blocks) == 1 and len(review_blocks) == 1
     assert "- beta:" in review_blocks[0][1], "no cross-origin suppression leaked into the fork"
     assert review["request"]["messages"][-1]["content"] == review_blocks[0][1]
+
+
+# ---------------------------------------------------------------------------
+# C9: decision-time suppression from structured tool records.
+# ---------------------------------------------------------------------------
+
+
+def _c9_kwargs(session_id):
+    """A unique window key per C9 test, so no dump or store state leaks between them."""
+    return {**DISPATCH_KWARGS, "session_id": session_id, "task_id": session_id}
+
+
+def _c9_callback(plugin_module, endpoints, tmp_path, session_id, **extra):
+    settings = settings_for(endpoints, tmp_path / (session_id + ".json"))
+    settings.update(extra)
+    return _callback_for(plugin_module, settings)
+
+
+def _loaded_payload(tool, arguments, content, *, call_id="c9-load"):
+    """A fresh user turn after an earlier turn loaded a skill through a tool record."""
+    payload = chat_payload()
+    payload["messages"] = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": "load the beta skill"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool, "arguments": json.dumps(arguments)},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call_id, "name": tool, "content": content},
+        {"role": "user", "content": QUERY},
+    ]
+    return payload
+
+
+def _last_text(result):
+    """The appended block (or degraded note) is the only place a suggestion can appear."""
+    if result is None:
+        return ""
+    last = result["request"]["messages"][-1]
+    return last.get("content", "") if isinstance(last, dict) else ""
+
+
+def test_a_shortlist_only_loser_stays_suggestable(plugin_module, endpoints, tmp_path):
+    """With no structured load, the routed beta is still suggested next turn."""
+    callback = _c9_callback(plugin_module, endpoints, tmp_path, "c9-control")
+    result = callback(request=chat_payload(), **_c9_kwargs("c9-control"))
+    assert result is not None
+    assert "- beta:" in _last_text(result)
+
+
+def test_a_successful_skill_view_suppresses_the_loaded_skill(plugin_module, endpoints, tmp_path):
+    callback = _c9_callback(plugin_module, endpoints, tmp_path, "c9-skill-view")
+    payload = _loaded_payload(
+        "skill_view", {"name": "beta"}, json.dumps({"success": True, "name": "beta"})
+    )
+    result = callback(request=payload, **_c9_kwargs("c9-skill-view"))
+    assert "- beta:" not in _last_text(result)
+
+
+def test_a_failed_skill_view_does_not_suppress(plugin_module, endpoints, tmp_path):
+    callback = _c9_callback(plugin_module, endpoints, tmp_path, "c9-failed-view")
+    payload = _loaded_payload(
+        "skill_view", {"name": "beta"}, json.dumps({"success": False, "name": "beta"})
+    )
+    result = callback(request=payload, **_c9_kwargs("c9-failed-view"))
+    assert "- beta:" in _last_text(result)
+
+
+def test_a_read_file_reference_suppresses_without_a_result_name(plugin_module, endpoints, tmp_path):
+    callback = _c9_callback(plugin_module, endpoints, tmp_path, "c9-read-file")
+    payload = _loaded_payload(
+        "read_file", {"path": "/skills/beta/references/rules.md"}, "# beta instructions\n"
+    )
+    result = callback(request=payload, **_c9_kwargs("c9-read-file"))
+    assert "- beta:" not in _last_text(result)
+
+
+def test_a_configured_custom_tool_suppresses_by_path(plugin_module, endpoints, tmp_path):
+    callback = _c9_callback(
+        plugin_module, endpoints, tmp_path, "c9-custom", skillLoadingTools=["custom_load"]
+    )
+    payload = _loaded_payload(
+        "custom_load", {"path": "/skills/beta/references/rules.md"}, "# beta text\n"
+    )
+    result = callback(request=payload, **_c9_kwargs("c9-custom"))
+    assert "- beta:" not in _last_text(result)
+
+
+def test_an_unconfigured_custom_tool_does_not_suppress(plugin_module, endpoints, tmp_path):
+    callback = _c9_callback(plugin_module, endpoints, tmp_path, "c9-unconfigured")
+    payload = _loaded_payload(
+        "custom_load", {"path": "/skills/beta/references/rules.md"}, "# beta text\n"
+    )
+    result = callback(request=payload, **_c9_kwargs("c9-unconfigured"))
+    assert "- beta:" in _last_text(result)

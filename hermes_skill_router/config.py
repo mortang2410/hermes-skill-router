@@ -169,6 +169,9 @@ _SPECS: Tuple[_Spec, ...] = (
     # Curator narrowing: default leaves the fork's full catalog untouched,
     # the opt-in value narrows both candidate surfaces to the delta set (C4).
     _Spec("curation", "curation_mode", "curation_mode", "default_curation"),
+    # Structured-record parser (C9): extra tool names whose JSON arguments carry a
+    # skill name or path. skill_view and read_file are always recognised.
+    _Spec("skillLoadingTools", "skill_loading_tools", "name_list", ()),
 )
 
 #: Manifest key -> default value.
@@ -248,6 +251,7 @@ class Config:
     notes: Tuple[str, ...]
     one_shot_mode: str = "oneshot_no_create_skill"
     curation_mode: str = "default_curation"
+    skill_loading_tools: Tuple[str, ...] = ()
     trap_notes: Tuple[str, ...] = ()
     switch_message_notes: Tuple[str, ...] = ()
     switch_generations: Dict[str, int] = field(default_factory=dict)

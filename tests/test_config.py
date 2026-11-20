@@ -26,6 +26,7 @@ from hermes_skill_router.config import (  # noqa: E402
 SPEC_DEFAULTS = {
     "enabled": True,
     "eagerSkills": (),
+    "skillLoadingTools": (),
     "embedBaseUrl": "http://127.0.0.1:8012",
     "embedPath": "/v1/embeddings",
     "embedModelId": "bge-m3",
@@ -76,6 +77,7 @@ SPEC_BOUNDS = {
 }
 
 FIELD_BY_KEY = {
+    "skillLoadingTools": "skill_loading_tools",
     "embedTimeoutMs": "embed_timeout_ms",
     "rerankTimeoutMs": "rerank_timeout_ms",
     "routingTimeoutMs": "routing_timeout_ms",
@@ -127,6 +129,7 @@ CONFIG_FIELDS = {
     "max_display_names",
     "document_prefix",
     "eager_skills",
+    "skill_loading_tools",
     "deferred_skills",
     "curation_mode",
     "notes",

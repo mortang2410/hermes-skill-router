@@ -425,6 +425,7 @@ partition is computed per request from the catalog rows.
 | --- | --- | --- | --- |
 | `enabled` | `true` | boolean | Master switch. False leaves every request untouched. |
 | `eagerSkills` | empty | list of skill names | Skills listed in a compaction window's opening block under `Pinned skills:`, with name, description and read path, and never routed. A name in both lists is eager. |
+| `skillLoadingTools` | empty | list of tool names | Extra tools whose JSON arguments carry a skill name or path for decision-time loaded-skill suppression. `skill_view` and `read_file` are always parsed; blanks and duplicates are removed. |
 | `embedBaseUrl` | `http://127.0.0.1:8012` | http for a loopback host only, https elsewhere, no credentials, query or fragment | Embeddings endpoint root. A rejected value falls back to the default with one warning. |
 | `embedPath` | `/v1/embeddings` | path starting with `/` | Path appended to `embedBaseUrl`. |
 | `embedModelId` | `bge-m3` | non-empty string | `model` field sent to the embeddings endpoint. Part of the index fingerprint, so a change rebuilds the cache. |
