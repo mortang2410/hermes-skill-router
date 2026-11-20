@@ -35,6 +35,9 @@ _KIND_NAME = "name"
 _KIND_PATH = "path"
 _KIND_CUSTOM = "custom"
 
+#: Result bodies that start with one of these prefixes are failed reads, never skill content.
+_ERROR_PREFIXES = ("error:", "error ", "failed to", "not found")
+
 #: The configured-name set is rebuilt only when the exact configured names change.
 _NAME_SET_CACHE: Dict[Tuple[str, ...], Dict[str, str]] = {}
 
@@ -132,8 +135,9 @@ def _result_fields(result: Any) -> Optional[Tuple[Any, Optional[str], bool]]:
 
     Hermes puts success inside the JSON result body, not on the tool message. A normal ``read_file``
     body is plain skill text with neither a success flag nor a name, which is deliberately not an
-    error. An explicit JSON failure (``success`` false, ``isError`` true or a truthy ``error`` key)
-    and a plain body that starts with an error prefix are errors.
+    error. An explicit JSON failure (``success`` false, ``isError`` true or a truthy ``error`` key),
+    a JSON body whose ``content`` starts with an error prefix, and a plain body that starts with an
+    error prefix are errors.
     """
     if result is None:
         return None
@@ -153,14 +157,19 @@ def _result_fields(result: Any) -> Optional[Tuple[Any, Optional[str], bool]]:
     if obj is not None:
         success = obj.get("success")
         name = obj.get("name")
+        body = obj.get("content")
         error = (
             success is False
             or obj.get("isError") is True
             or bool(obj.get("error"))
+            or (
+                isinstance(body, str)
+                and body.strip().lower().startswith(_ERROR_PREFIXES)
+            )
         )
         return success, name if isinstance(name, str) and name else None, error
     text = content.strip() if isinstance(content, str) else ""
-    error = text.lower().startswith(("error:", "error ", "failed to", "not found"))
+    error = text.lower().startswith(_ERROR_PREFIXES)
     return None, None, error
 
 

@@ -130,6 +130,24 @@ def test_read_file_error_and_unmatched_result_do_not_load():
     assert error == [] and unmatched == []
 
 
+def test_read_file_json_wrapped_error_does_not_load():
+    loaded = lr.loaded_skills(
+        [_call("c20", "read_file", {"path": "/skills/beta/SKILL.md"})],
+        _results(_result("c20", json.dumps({"content": "Error: file not found"}), "read_file")),
+        KNOWN, PATH_MAP, _tools(),
+    )
+    assert loaded == []
+
+
+def test_read_file_json_wrapped_content_still_loads():
+    loaded = lr.loaded_skills(
+        [_call("c21", "read_file", {"path": "/skills/beta/SKILL.md"})],
+        _results(_result("c21", json.dumps({"content": "# beta instructions\n"}), "read_file")),
+        KNOWN, PATH_MAP, _tools(),
+    )
+    assert loaded == ["beta"]
+
+
 def test_custom_tool_needs_its_exact_configured_name():
     wrong_name = lr.loaded_skills(
         [_call("c8", "other_load", {"name": "alpha"})],
