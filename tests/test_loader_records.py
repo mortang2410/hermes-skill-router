@@ -55,8 +55,20 @@ def _tools(*custom):
     return lr.tool_name_set(load({"skillLoadingTools": list(custom)}))
 
 
-def test_fixed_tool_names_are_always_recognised():
-    assert _tools() == {"skill_view": "name", "read_file": "path"}
+def test_the_cached_name_set_is_not_a_shared_mutable_dict():
+    """A mutation of one returned set must not leak into the next call with the same config.
+
+    The cache stores the dict it hands out, so a caller -- or a test's copy -- that
+    edits it under CPU load changed what a later request saw: a full-suite run
+    reported "beta" loaded for an isError-free result because the shared dict
+    gained a custom tool mid-run. Returning a copy keeps the cache an
+    implementation detail.
+    """
+    base = lr.tool_name_set(load({"skillLoadingTools": []}))
+    base["custom_load"] = "custom"
+    got = lr.tool_name_set(load({"skillLoadingTools": []}))
+    assert "custom_load" not in got, "a caller's mutation leaked through the cache"
+    assert got == {"skill_view": "name", "read_file": "path"}
 
 
 def test_custom_names_are_normalised_and_cached():
@@ -69,9 +81,13 @@ def test_custom_names_are_normalised_and_cached():
         "custom_load": "custom",
         "second": "custom",
     }
-    assert lr.tool_name_set(cfg) is tools
-    assert lr.tool_name_set(load({"skillLoadingTools": ["custom_load", "second"]})) is tools
-    assert lr.tool_name_set(load({"skillLoadingTools": ["other"]})) is not tools
+    # The cache is built once per exact configured set but every call hands out its own copy,
+    # so identity can no longer prove a cache hit; what a caller can observe is the cached dict.
+    assert lr.tool_name_set(cfg) is not tools
+    assert lr._NAME_SET_CACHE[("custom_load", "second")] == lr.tool_name_set(cfg)
+    assert lr.tool_name_set(load({"skillLoadingTools": ["custom_load", "second"]})) == tools
+    assert lr.tool_name_set(load({"skillLoadingTools": ["other"]})) != tools
+    assert ("other",) in lr._NAME_SET_CACHE
 
 
 def test_skill_view_success_with_a_known_name_loads():

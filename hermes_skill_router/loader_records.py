@@ -58,14 +58,16 @@ def tool_name_set(cfg: Config) -> Dict[str, str]:
             configured.append(name)
     key = tuple(configured)
     cached = _NAME_SET_CACHE.get(key)
-    if cached is not None:
-        return cached
-    tools: Dict[str, str] = {SKILL_VIEW: _KIND_NAME, READ_FILE: _KIND_PATH}
-    for name in configured:
-        if name not in tools:
-            tools[name] = _KIND_CUSTOM
-    _NAME_SET_CACHE[key] = tools
-    return tools
+    if cached is None:
+        tools: Dict[str, str] = {SKILL_VIEW: _KIND_NAME, READ_FILE: _KIND_PATH}
+        for name in configured:
+            if name not in tools:
+                tools[name] = _KIND_CUSTOM
+        _NAME_SET_CACHE[key] = tools
+        cached = tools
+    # A caller that edits the returned mapping must not change what a later request
+    # sees for the same config, so the cache stays an implementation detail.
+    return dict(cached)
 
 
 def request_records(messages: Any) -> Tuple[List[Any], Dict[str, Any]]:
