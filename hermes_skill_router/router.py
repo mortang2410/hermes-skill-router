@@ -331,7 +331,12 @@ def _compose(
         )
         base = stripped_messages if stripped_already else list(payload.get("messages") or ())
         if note.strip():
-            mark_stripped(store_key, cfg.cache_path)
+            # The marker describes bytes that went out: only mark when the returned
+            # messages are the stripped ones. A note-only turn that still carries the
+            # catalog must leave the window unmarked, or the next continuation drops
+            # the catalog with no block ever injected (round-2 H2).
+            if stripped_already:
+                mark_stripped(store_key, cfg.cache_path)
             return {
                 "request": {
                     **dict(payload),

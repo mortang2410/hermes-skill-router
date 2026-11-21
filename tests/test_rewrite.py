@@ -1756,6 +1756,43 @@ def test_an_empty_block_does_not_consume_the_window_dump(tmp_path):
     assert "- beta: Beta skill" in block_of(good)
 
 
+def test_a_degraded_note_continuation_does_not_mark_a_catalog_it_kept(tmp_path, monkeypatch):
+    """Round-2 H2: a continuation that still carries the catalog must not mark it stripped.
+
+    The opening pass can render only the degraded note, so no stripped bytes went out
+    and the window stays unmarked. A later API call in the same user turn recomputes
+    the note. The current code marks the window stripped there even though it returns
+    the original catalog with the note, so the next continuation drops the catalog
+    with no block ever injected. The marker must describe the bytes that went out.
+    """
+    from hermes_skill_router.writeback import stripped_sent
+
+    session = "h2-degrade-continuation"
+    cfg = make_config(tmp_path, maxSuggestions=0, cutoff=0.99)
+    payload = _payload()
+    continuation = {
+        **payload,
+        "messages": [*payload["messages"], {"role": "assistant", "content": "thinking"}],
+    }
+    embed, rerank = FakeEmbedder(), FakeReranker()
+
+    opening = rewrite(payload, cfg=cfg, embed=embed, rerank=rerank, session_id=session)
+    assert opening is not None
+    assert "## Skills" in opening["request"]["messages"][0]["content"]
+    assert not stripped_sent(session, cfg.cache_path), "the note-only opening kept the catalog"
+
+    noted = rewrite(continuation, cfg=cfg, embed=embed, rerank=rerank, session_id=session)
+    assert noted is not None
+    assert "## Skills" in noted["request"]["messages"][0]["content"], "the note rode on the catalog"
+    assert not stripped_sent(session, cfg.cache_path), "this continuation still carried the catalog"
+
+    monkeypatch.setattr(router_module, "_degraded_note", lambda *args, **kwargs: "")
+    later = rewrite(continuation, cfg=cfg, embed=embed, rerank=rerank, session_id=session)
+    assert later is None or "## Skills" in later["request"]["messages"][0]["content"], (
+        "a continuation that never stripped bytes must not drop the catalog"
+    )
+
+
 def test_a_user_message_starting_with_the_marker_does_not_silence_routing(tmp_path):
     """P3-5: only a prior routed block can act as proof that the catalog already went out.
 
