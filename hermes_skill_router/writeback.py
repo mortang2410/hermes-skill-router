@@ -186,9 +186,10 @@ def mark_stripped(session_id: str, cache_path: Any) -> None:
         _STRIPPED_FALLBACK.add((store_path(cache_path), session_id))
     _record_path(session_id, cache_path)
     try:
-        store = _read_store(cache_path)
-        _window(store, session_id)["stripped"] = True
-        _write_store(cache_path, store)
+        with _STRIPPED_LOCK:
+            store = _read_store(cache_path)
+            _window(store, session_id)["stripped"] = True
+            _write_store(cache_path, store)
     except Exception:
         logger.debug("hermes-skill-router writeback: mark stripped failed", exc_info=True)
 
@@ -304,25 +305,31 @@ def admit_block(
         return True
     _record_path(session_id, cache_path)
     try:
-        store = _read_store(cache_path)
-        window = _window(store, session_id)
-        gen = int(window["generation"])
-        digest = block_hash(block)
-        if _already_stored(window, origin, digest):
-            return True
-        window["blocks"].append(
-            {
-                "block": block,
-                "names": [name for name in names if isinstance(name, str)],
-                "insert_index": int(insert_index),
-                "origin": origin,
-                "generation": gen,
-                "hash": digest,
-            }
-        )
-        if not _write_store(cache_path, store):
-            window["blocks"].pop()
-            return False
+        # One lock owns the whole read-modify-write: every writer in this process
+        # reads the store, appends its block and publishes before the next writer
+        # starts, so a concurrent admit cannot overwrite a block just admitted.
+        # The shared path + ".tmp" is safe for the same reason: one writer uses it
+        # at a time.
+        with _STRIPPED_LOCK:
+            store = _read_store(cache_path)
+            window = _window(store, session_id)
+            gen = int(window["generation"])
+            digest = block_hash(block)
+            if _already_stored(window, origin, digest):
+                return True
+            window["blocks"].append(
+                {
+                    "block": block,
+                    "names": [name for name in names if isinstance(name, str)],
+                    "insert_index": int(insert_index),
+                    "origin": origin,
+                    "generation": gen,
+                    "hash": digest,
+                }
+            )
+            if not _write_store(cache_path, store):
+                window["blocks"].pop()
+                return False
         return True
     except Exception:
         logger.debug("hermes-skill-router writeback: admit failed", exc_info=True)
@@ -359,14 +366,15 @@ def _expire_at(session_id: str, cache_path: Any) -> None:
     with _STRIPPED_LOCK:
         _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
     try:
-        store = _read_store(cache_path)
-        if session_id not in store.get("windows", {}):
-            return
-        window = _window(store, session_id)
-        window["generation"] = int(window["generation"]) + 1
-        window["blocks"] = []
-        window["stripped"] = False
-        _write_store(cache_path, store)
+        with _STRIPPED_LOCK:
+            store = _read_store(cache_path)
+            if session_id not in store.get("windows", {}):
+                return
+            window = _window(store, session_id)
+            window["generation"] = int(window["generation"]) + 1
+            window["blocks"] = []
+            window["stripped"] = False
+            _write_store(cache_path, store)
     except Exception:
         logger.debug("hermes-skill-router writeback: expire failed", exc_info=True)
 
@@ -379,10 +387,11 @@ def forget_session_ids(session_id: str, cache_path: Any) -> None:
             _STRIPPED_FALLBACK.discard((store_path(candidate), session_id))
     for candidate in paths:
         try:
-            store = _read_store(candidate)
-            if session_id not in store.get("windows", {}):
-                continue
-            store["windows"].pop(session_id, None)
-            _write_store(candidate, store)
+            with _STRIPPED_LOCK:
+                store = _read_store(candidate)
+                if session_id not in store.get("windows", {}):
+                    continue
+                store["windows"].pop(session_id, None)
+                _write_store(candidate, store)
         except Exception:
             logger.debug("hermes-skill-router writeback: forget failed", exc_info=True)

@@ -2872,6 +2872,52 @@ def test_writeback_two_turns_store_only_no_replay(tmp_path):
     assert window["blocks"][0]["names"], "displayed names are kept for bookkeeping only"
 
 
+def test_two_concurrent_writers_never_lose_a_block(tmp_path, monkeypatch):
+    """Round-2 H3: the store read-modify-write must be serialised across writers.
+
+    The patched write sleeps briefly before publishing so an unlocked pair of
+    writers can both read the same empty store and the second publish drops the
+    first block. The probe is bounded: two threads, five-second join, one store.
+    Under the module lock both blocks survive.
+    """
+    import threading
+    import time
+    from hermes_skill_router import writeback as wb
+
+    store = tmp_path / "race-store.json"
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", str(store))
+    cache = str(tmp_path / "index.json")
+    real_write = wb._write_store
+
+    def slow_write(path, data):
+        time.sleep(0.02)
+        return real_write(path, data)
+
+    monkeypatch.setattr(wb, "_write_store", slow_write)
+    errors = []
+
+    def admit(block):
+        try:
+            wb.admit_block("race-session", block, [], 0, wb.ORIGIN_NORMAL, cache)
+        except Exception as exc:  # surface the writer's own failure in the assertion
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=admit, args=(block,)) for block in ("block-1", "block-2")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads), "the writers must finish"
+    assert errors == [], f"admit must never raise: {errors}"
+    stored = [
+        block for _index, block in wb.stored_blocks("race-session", wb.ORIGIN_NORMAL, 0, cache)
+    ]
+    assert sorted(stored) == ["block-1", "block-2"], "a concurrent writer must not lose a block"
+
+
 def test_writeback_retried_call_admits_once(tmp_path):
     cfg = make_config(tmp_path)
     for _ in range(2):
