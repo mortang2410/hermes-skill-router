@@ -86,6 +86,13 @@ def test_custom_names_are_normalised_and_cached():
     assert lr.tool_name_set(cfg) is not tools
     assert lr._NAME_SET_CACHE[("custom_load", "second")] == lr.tool_name_set(cfg)
     assert lr.tool_name_set(load({"skillLoadingTools": ["custom_load", "second"]})) == tools
+    # A cache hit must reuse the stored dict, not rebuild it: overwriting the cache entry by
+    # hand is visible only to a call that reads the cache, so this pins reuse and not just
+    # equality. The value is a string, so a shallow copy of the rebuild cannot be forged.
+    assert lr.tool_name_set(load({"skillLoadingTools": ["custom_load", "second"]})) == tools
+    lr._NAME_SET_CACHE[("custom_load", "second")] = {"skill_view": "name", "read_file": "path"}
+    rebuilt_check = lr.tool_name_set(load({"skillLoadingTools": ["custom_load", "second"]}))
+    assert "custom_load" not in rebuilt_check, "the call rebuilt instead of reading the cache"
     assert lr.tool_name_set(load({"skillLoadingTools": ["other"]})) != tools
     assert ("other",) in lr._NAME_SET_CACHE
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -156,7 +157,12 @@ def test_a_timeout_returns_none(fake):
     # any request is delivered, which made this assertion read 0. The answer still waits 0.5 s,
     # so the 300 ms budget keeps the timeout the behaviour under test.
     assert rerank(make_config(fake, rerankTimeoutMs=300), "q", ["a"]) is None
-    assert fake.count == 1
+    # Wait for the fake's own thread to record the request rather than racing it: on a loaded
+    # runner the server thread can record after the client gave up, which read 0 here.
+    deadline = time.monotonic() + 5.0
+    while fake.count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fake.count == 1, "the timeout must follow a real request, not a local refusal"
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
