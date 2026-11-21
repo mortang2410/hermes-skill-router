@@ -298,6 +298,10 @@ def admit_block(
     """
     if not isinstance(block, str) or not block:
         return False
+    if store_path(cache_path) is None:
+        # No store is configured, which is not a write failure: the block is
+        # bookkeeping-only, so the caller still injects it and nothing is recorded.
+        return True
     _record_path(session_id, cache_path)
     try:
         store = _read_store(cache_path)

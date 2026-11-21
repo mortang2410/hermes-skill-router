@@ -546,3 +546,17 @@ def test_a_credential_shaped_value_in_another_setting_is_redacted_in_its_note(ca
     assert "<redacted URL>" in note
     assert "alice" not in note and "hunter2" not in note
     assert not any("hunter2" in record.getMessage() for record in caplog.records)
+
+
+def test_a_url_shaped_value_inside_a_set_is_redacted_in_its_note(caplog):
+    config_module._LOGGED_NOTES.clear()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.config"):
+        cfg = load({"eagerSkills": {"https://alice:hunter2@example.com"}})
+
+    assert len(cfg.notes) == 1
+    note = cfg.notes[0]
+    assert note.startswith("eagerSkills: ")
+    assert "<redacted URL>" in note
+    assert "alice" not in note and "hunter2" not in note
+    assert not any("hunter2" in record.getMessage() for record in caplog.records)

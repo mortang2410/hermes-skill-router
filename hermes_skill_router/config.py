@@ -344,6 +344,8 @@ def _redact_value(value: Any) -> Any:
         return tuple(_redact_value(item) for item in value)
     if isinstance(value, list):
         return [_redact_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return {_redact_value(item) for item in value}
     return value
 
 
