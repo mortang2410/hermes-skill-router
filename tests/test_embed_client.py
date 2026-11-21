@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -100,7 +101,14 @@ def test_a_timeout_returns_none(fake):
     fake.answer(body=embeddings_body([[1.0]]), delay=0.5)
 
     assert embed_texts(make_config(fake, embedTimeoutMs=100), ["a"]) is None
-    assert fake.count == 1
+    # A 100 ms client budget is not a scheduling guarantee for the fake's server
+    # thread under a loaded runner: the handler can record the request shortly
+    # after the client gave up. Wait for that ordering instead of racing the
+    # clock, so the assertion still proves a real request caused the timeout.
+    deadline = time.monotonic() + 5.0
+    while fake.count == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fake.count == 1, "the timeout must follow a real request, not a local refusal"
 
 
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])

@@ -288,8 +288,11 @@ def test_a_dead_endpoint_turn_stays_within_the_routing_budget(tmp_path):
         assert result is None, "a dead endpoint leaves the request unchanged"
         assert read(cfg)["status"] == "inert"
         assert elapsed >= 0.7, f"the delayed endpoints must actually delay: {elapsed:.3f}s"
-        assert elapsed < 1.5, (
-            "the turn must stay within the 1.0s routing budget plus slack, "
+        # The pre-fix probe ran two full 0.8 s timeouts after a 0.8 s rank and took
+        # ~2.4 s. A 2.0 s ceiling still fails that regression while leaving a full
+        # second of slack for a loaded runner, where a 0.5 s margin flaked once.
+        assert elapsed < 2.0, (
+            "the turn must stay within the 1.0s routing budget plus load slack, "
             f"took {elapsed:.3f}s"
         )
     finally:
