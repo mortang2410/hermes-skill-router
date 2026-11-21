@@ -35,13 +35,16 @@ def _call(call_id, tool, arguments):
     }
 
 
-def _result(call_id, content, tool="skill_view"):
-    return {
+def _result(call_id, content, tool="skill_view", is_error=None):
+    row = {
         "role": "tool",
         "name": tool,
         "tool_call_id": call_id,
         "content": content,
     }
+    if is_error is not None:
+        row["isError"] = is_error
+    return row
 
 
 def _results(*rows):
@@ -146,6 +149,48 @@ def test_read_file_json_wrapped_content_still_loads():
         KNOWN, PATH_MAP, _tools(),
     )
     assert loaded == ["beta"]
+
+
+def test_every_failure_signal_is_a_load_from_one_probe():
+    """Each failure shape stops a load, and the legacy file_path fallback still loads.
+
+    The shapes come from the OCR round-2 probe of the same name: an isError flag, a
+    JSON success:false, a truthy error key, an error-prefixed plain body on a read and
+    on a custom tool, and a failed custom result. A regression that drops any one
+    branch turns exactly that case into a load.
+    """
+    cases = [
+        ("skill isError", _call("e1", "skill_view", {"name": "alpha"}), _result("e1", json.dumps({"name": "alpha"}), is_error=True), ()),
+        ("skill success:false", _call("e2", "skill_view", {"name": "alpha"}), _result("e2", json.dumps({"success": False, "name": "alpha"})), ()),
+        ("skill error key", _call("e3", "skill_view", {"name": "alpha"}), _result("e3", json.dumps({"error": "boom", "name": "alpha"})), ()),
+        ("read text prefix error not found", _call("e4", "read_file", {"path": "/skills/beta/references/rules.md"}), _result("e4", "Error: file not found"), ()),
+        # A matched result with a matched name and no failure signal is a load: this is
+        # the positive control, so the rows above fail only on their own signal.
+        ("read text succeeds", _call("e7", "read_file", {"path": "/skills/beta/SKILL.md"}), _result("e7", "# beta instructions\n"), ("beta",)),
+    ]
+    # Each label carries the parser keyword it pins (isError, success:false, error key),
+    # because pytest drops a failing row's assertion message and only the function's
+    # docstring survives in the failure output.
+    for label, call, result, expected in cases:
+        loaded = lr.loaded_skills([call], _results(result), KNOWN, PATH_MAP, _tools())
+        assert tuple(loaded) == expected, label
+    custom_cases = [
+        ("custom tool error text prefix", _result("e5", "tool error: denied")),
+        ("custom tool success:false plus error name", _result("e5", json.dumps({"success": False, "name": "alpha"}))),
+    ]
+    for label, result in custom_cases:
+        loaded = lr.loaded_skills(
+            [_call("e5", "custom_load", {"name": "alpha"})],
+            _results(result),
+            KNOWN, PATH_MAP, _tools("custom_load"),
+        )
+        assert loaded == [], label
+    legacy = lr.loaded_skills(
+        [_call("e6", "read_file", {"file_path": "/skills/alpha/SKILL.md"})],
+        _results(_result("e6", "# alpha instructions\n", "read_file")),
+        KNOWN, PATH_MAP, _tools(),
+    )
+    assert legacy == ["alpha"]
 
 
 def test_custom_tool_needs_its_exact_configured_name():

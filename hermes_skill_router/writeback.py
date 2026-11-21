@@ -373,12 +373,16 @@ def _expire_at(session_id: str, cache_path: Any) -> None:
 
 def forget_session_ids(session_id: str, cache_path: Any) -> None:
     """Drop all store state for *session_id* (end of session). Never raises."""
+    paths = _take_paths(session_id, cache_path)
     with _STRIPPED_LOCK:
-        _STRIPPED_FALLBACK.discard((store_path(cache_path), session_id))
-        _WRITTEN_PATHS.pop(session_id, None)
-    try:
-        store = _read_store(cache_path)
-        store["windows"].pop(session_id, None)
-        _write_store(cache_path, store)
-    except Exception:
-        logger.debug("hermes-skill-router writeback: forget failed", exc_info=True)
+        for candidate in paths:
+            _STRIPPED_FALLBACK.discard((store_path(candidate), session_id))
+    for candidate in paths:
+        try:
+            store = _read_store(candidate)
+            if session_id not in store.get("windows", {}):
+                continue
+            store["windows"].pop(session_id, None)
+            _write_store(candidate, store)
+        except Exception:
+            logger.debug("hermes-skill-router writeback: forget failed", exc_info=True)

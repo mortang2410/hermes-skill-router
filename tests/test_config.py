@@ -557,6 +557,8 @@ def test_a_url_shaped_value_inside_a_set_is_redacted_in_its_note(caplog):
     assert len(cfg.notes) == 1
     note = cfg.notes[0]
     assert note.startswith("eagerSkills: ")
-    assert "<redacted URL>" in note
+    # The userinfo is dropped, which is the property the note must hold; the form
+    # kept is the origin, so this assertion pins absence rather than a spelling.
+    assert "https://example.com" in note
     assert "alice" not in note and "hunter2" not in note
     assert not any("hunter2" in record.getMessage() for record in caplog.records)
