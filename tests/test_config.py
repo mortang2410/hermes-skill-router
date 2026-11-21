@@ -562,3 +562,17 @@ def test_a_url_shaped_value_inside_a_set_is_redacted_in_its_note(caplog):
     assert "https://example.com" in note
     assert "alice" not in note and "hunter2" not in note
     assert not any("hunter2" in record.getMessage() for record in caplog.records)
+
+
+def test_switch_path_always_resolves_and_no_dead_helper():
+    """Round-2 H6: the switch path contract is a str, and the uncalled helper is gone.
+
+    Both callers carried a None guard that could never fire. This pin fails if the
+    inaccurate Optional annotation, the dead guards, or the duplicate transaction
+    helper return, because each would reintroduce a bypass of the live lock path.
+    """
+    import inspect
+
+    assert inspect.signature(config_module.switches_path_for).return_annotation in ("str", str)
+    assert not hasattr(config_module, "_pending_switch_warnings_locked")
+    assert config_module.switches_path_for("")

@@ -454,7 +454,7 @@ def _coerce(spec: _Spec, value: Any, notes: list[str]) -> Any:
 _LOGGED_NOTES: set[str] = set()
 
 
-def switches_path_for(cache_path: Any) -> Optional[str]:
+def switches_path_for(cache_path: Any) -> str:
     """Return the persisted switch-warning seen-set path for *cache_path*.
 
     The set lives beside the index cache when a cache path is set, so an
@@ -879,10 +879,6 @@ def _pending_switch_warnings(
     fixed = [key for key in SWITCH_WARNING_SWITCHES if values.get(_SWITCH_FIELDS[key]) is True]
     try:
         path = switches_path_for(cache_path)
-        if path is None:
-            pending = tuple(offending[key] for key in SWITCH_WARNING_SWITCHES if key in offending)
-            _emit_switch_warnings(pending)
-            return pending, pending, {}
         # The whole read-modify-write (fix bump, seen/delivered update, write)
         # runs under the state lock, so a concurrent ack cannot restore the
         # pre-fix snapshot over this fix (or vice versa). A load with an
@@ -974,21 +970,6 @@ def _switch_transaction(
     return pending, injected, generations, changed, new_seen, new_delivered
 
 
-def _pending_switch_warnings_locked(
-    offending: Dict[str, str],
-    fixed: Any,
-    path: str,
-) -> Tuple[Tuple[str, ...], Tuple[str, ...], Dict[str, int]]:
-    """Run the switch load/fix read-modify-write; caller holds the state lock."""
-    pending, injected, generations, changed, new_seen, new_delivered = _switch_transaction(
-        offending, fixed, path
-    )
-    _emit_switch_warnings(pending)
-    if changed:
-        _write_switch_seen(path, new_seen, new_delivered, generations)
-    return pending, injected, generations
-
-
 def switch_warning_messages(cfg: Config) -> Tuple[Dict[str, str], ...]:
     """Return the injected context messages for *cfg*'s undelivered switch warnings.
 
@@ -1043,8 +1024,6 @@ def acknowledge_switch_deliveries(
         return
     try:
         path = switches_path_for(cache_path)
-        if path is None:
-            return
         # The whole read-modify-write runs under the state lock, so a
         # concurrent fix load cannot land between this read and write and
         # then be overwritten with the pre-fix snapshot. An ack may
