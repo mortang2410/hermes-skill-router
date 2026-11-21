@@ -2872,6 +2872,20 @@ def test_writeback_two_turns_store_only_no_replay(tmp_path):
     assert window["blocks"][0]["names"], "displayed names are kept for bookkeeping only"
 
 
+def test_writeback_env_override_is_expanded_and_stripped(tmp_path, monkeypatch):
+    """Round-2 H4: the store override resolves like other operator paths.
+
+    A home-relative override with surrounding whitespace must resolve to the
+    absolute home path, not a literal tilde directory under the process cwd.
+    """
+    import os
+    from hermes_skill_router import writeback as wb
+
+    monkeypatch.setenv("HERMES_SKILL_ROUTER_WRITEBACK", "  ~/store-r2.json  ")
+
+    assert wb.store_path(None) == os.path.abspath(os.path.expanduser("~/store-r2.json"))
+
+
 def test_two_concurrent_writers_never_lose_a_block(tmp_path, monkeypatch):
     """Round-2 H3: the store read-modify-write must be serialised across writers.
 

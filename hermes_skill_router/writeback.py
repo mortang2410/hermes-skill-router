@@ -79,8 +79,8 @@ def store_path(cache_path: Any) -> Optional[str]:
     way every caller resolves it.
     """
     override = os.environ.get(STORE_PATH_ENV)
-    if override:
-        return override
+    if override and override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
     if not cache_path or not isinstance(cache_path, str) or not cache_path.strip():
         return None
     directory = os.path.dirname(os.path.abspath(os.path.expanduser(cache_path.strip())))
