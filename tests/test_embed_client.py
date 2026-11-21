@@ -100,7 +100,11 @@ def test_an_http_error_returns_none(fake):
 def test_a_timeout_returns_none(fake):
     fake.answer(body=embeddings_body([[1.0]]), delay=0.5)
 
-    assert embed_texts(make_config(fake, embedTimeoutMs=100), ["a"]) is None
+    # The budget must outlast a slow socket handshake on a loaded runner: a new loopback listen
+    # socket can sit in the accept queue for a load surge, and a 100 ms budget then expires before
+    # any request is delivered, which made this assertion read 0. The answer still waits 0.5 s,
+    # so the 300 ms budget keeps the timeout the behaviour under test.
+    assert embed_texts(make_config(fake, embedTimeoutMs=300), ["a"]) is None
     # A 100 ms client budget is not a scheduling guarantee for the fake's server
     # thread under a loaded runner: the handler can record the request shortly
     # after the client gave up. Wait for that ordering instead of racing the

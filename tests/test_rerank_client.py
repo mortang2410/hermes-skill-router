@@ -151,7 +151,11 @@ def test_an_http_error_returns_none(fake):
 def test_a_timeout_returns_none(fake):
     fake.answer(body=rerank_body([0.5]), delay=0.5)
 
-    assert rerank(make_config(fake, rerankTimeoutMs=100), "q", ["a"]) is None
+    # The budget must outlast a slow socket handshake on a loaded runner: a new loopback listen
+    # socket can sit in the accept queue for a load surge, and a 100 ms budget then expires before
+    # any request is delivered, which made this assertion read 0. The answer still waits 0.5 s,
+    # so the 300 ms budget keeps the timeout the behaviour under test.
+    assert rerank(make_config(fake, rerankTimeoutMs=300), "q", ["a"]) is None
     assert fake.count == 1
 
 
