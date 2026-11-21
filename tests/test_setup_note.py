@@ -315,11 +315,53 @@ def test_a_dead_endpoint_turn_stays_within_the_routing_budget(tmp_path):
         # The endpoints answer after 0.8 s with a 5 s configured timeout. Every probe that
         # asks inside the budget must ask for what is left of it, never the full 5 s: a probe
         # that lost the deadline cap asks for the full timeout, which is the regression.
-        assert budgets and all(budget < 5.0 for budget in budgets), (
+        # An empty list is legal here: router._setup_probe returns without probing once the
+        # routing deadline is spent, so on a loaded runner this turn can skip every probe.
+        # The pin that a skipped probe still cannot ask for the full timeout is the
+        # deterministic deadline test below; this assertion covers the probes that do run.
+        assert all(budget < 5.0 for budget in budgets), (
             f"a probe asked a full 5 s timeout after the budget was spent: {budgets!r}"
         )
         # The wall clock keeps the pre-existing ~1.6 s observation as a soft bound only.
         assert elapsed < 2.0, f"the turn must stay within the routing budget plus slack: {elapsed:.3f}s"
+    finally:
+        embed.close()
+        rerank.close()
+
+
+def test_a_expired_routing_deadline_never_lets_a_probe_ask_the_full_timeout(tmp_path):
+    """Deterministic pin for the deadline cap, independent of machine load.
+
+    The dead-endpoint turn test observes the budget only when the turn still has time to
+    probe, and on a loaded runner the deadline can be spent before the probe starts, so it
+    never exercises the cap. This test sets the deadline by hand, so the capped path always
+    runs, and asserts every probe the check sends asks for the time left, never the 5 s
+    configured timeout that the pre-fix code asked for.
+    """
+    import time as _time
+
+    def dead_responder(request: Request) -> Response:
+        return Response(status=500, body={"error": "broken"}, delay=0.8)
+
+    embed = FakeEndpoint(dead_responder)
+    rerank = FakeEndpoint(dead_responder)
+    budgets = []
+    original_request = setup_check._json_request
+
+    def observing_request(url, *, body, timeout):
+        budgets.append(timeout)
+        return original_request(url, body=body, timeout=timeout)
+
+    try:
+        cfg = _config(tmp_path, embed, rerank, embedTimeoutMs=5000, rerankTimeoutMs=5000)
+        # 50 ms of routing budget left: every probe must ask for at most that, not 5 s.
+        deadline = _time.monotonic() + 0.05
+        with monkeypatch_context(setup_check, "_json_request", observing_request):
+            ready, failing = setup_check.check_setup_state(cfg, deadline=deadline)
+        assert (ready, failing) == (False, ""), "a capped probe is indeterminate, not a named failure"
+        assert budgets, "the check must still probe while budget remains"
+        assert max(budgets) <= 0.05, f"a probe asked more than the budget left: {budgets!r}"
+        assert all(budget < 5.0 for budget in budgets), f"a probe asked the full timeout: {budgets!r}"
     finally:
         embed.close()
         rerank.close()
