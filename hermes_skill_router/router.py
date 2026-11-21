@@ -15,8 +15,8 @@ the spec's order of work and nothing else:
 5. Resolve every reranked candidate's read path through the host lookup (:mod:`hermes_skill_router.tools`)
    and recover the names the request's own earlier blocks already suggested, plus whether this is a
    compaction window's opening block.
-6. Select with the suppressed set, the path map, ``cfg.cutoff`` and ``cfg.max_suggestions``
-   (:mod:`hermes_skill_router.select`), so a suppressed or pathless candidate never spends a cap slot.
+6. Select with the loaded set, the path map, ``cfg.cutoff`` and ``cfg.max_suggestions``
+   (:mod:`hermes_skill_router.select`), so a loaded or pathless candidate never spends a cap slot.
 7. Render the block with the selected rows, the kept rows, the path map and the opening flag
    (:mod:`hermes_skill_router.inject`), and append it as one new ``system`` message at the end.
 
@@ -37,13 +37,15 @@ build, which embeds the whole catalog in batches and already fails through its o
 per-request timeout is capped by the milliseconds left, so the pass cannot outlive the budget, and a
 pass that reaches the end of it is abandoned with one log line naming the budget.
 
-Suppression and the opening flag both come from the payload's own messages, never from module state.
-A message whose content opens with the block's shared first line is a block this plugin injected
-earlier in the compaction window: its suggested names are suppressed, and its presence means this is
-not the window's opening block. The origin store is bookkeeping only: it is never a suppression
-input and no stored block is replayed into a payload. Compaction removes the payload blocks, so the
-names become suggestable again and pinned rows are listed again. Routing the same payload twice therefore returns
-the same result, and the second pass of an unchanged payload is left untouched by the replay guard.
+Suppression comes only from the request's matched structured tool records (C9), never from a
+displayed block or module state. A message whose content opens with the block's shared first line
+is a block this plugin injected earlier in the compaction window: its presence means this is not
+the window's opening block and it feeds the failure logic, but its displayed names are bookkeeping
+only and never suppress. The origin store is bookkeeping for the same reason: it is never a
+suppression input and no stored block is replayed into a payload. Compaction removes the payload
+blocks, so the window opens again and pinned rows are listed again. Routing the same payload twice
+therefore returns the same result, and the second pass of an unchanged payload is left untouched by
+the replay guard.
 
 The parsed partition is kept for the session's search tool, which ranks its routed half; every
 request clears the previous one first, so a search never ranks rows from an earlier prompt (D10).
@@ -361,8 +363,9 @@ def _compose(
         rides on the inert record only, so the surfaces can say no suggestions were made.
         """
         _log_once(reason)
-        if not continuation:
-            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        # The continuation branch above returns on every path, so every failure
+        # reaching here is an opening call and always writes its inert record.
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if dumped_before:
             return {"request": dict(payload)}
         if not previous and not stripped_already:
@@ -498,9 +501,9 @@ def _compose(
         # No selected suggestion and no kept row: stripping without a replacement would
         # lose the catalog for nothing. Keep the window's catalog state (stripped bytes
         # once a stripped payload went out) and append nothing; no stored shortlist is
-        # replayed. A same-turn continuation keeps the turn's routed record.
-        if not continuation:
-            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        # replayed. A same-turn continuation keeps the turn's routed record;
+        # it returned above, so this recorder always runs for an opening call.
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         if not stripped_already:
             return None
         base = stripped_messages
@@ -511,8 +514,8 @@ def _compose(
         # The renderer returned the degraded note on its own: no row is shown, so the
         # catalog stays unless this window already sent stripped bytes. The note rides
         # as one standalone system message; no stored shortlist is re-inserted.
-        if not continuation:
-            _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
+        # Continuations returned above, so this recorder always runs here.
+        _recorder(cfg, INERT, (), session_id, turn_id, notify, note=note)()
         base = (
             stripped_messages
             if stripped_already
