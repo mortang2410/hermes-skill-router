@@ -175,31 +175,35 @@ def test_every_failure_signal_is_a_load_from_one_probe():
     on a custom tool, and a failed custom result. A regression that drops any one
     branch turns exactly that case into a load.
     """
+    # Every JSON failure shape is driven through a custom tool with a path argument,
+    # because that is the one shape where a dropped branch is observed as a load: a
+    # skill_view row with a failure branch removed reads "success is not True", which
+    # suppresses the name and hides the regression. The path shape reads only the error
+    # flag, so success:false, isError and the error key each have to fail it on their own.
     cases = [
-        ("skill isError", _call("e1", "skill_view", {"name": "alpha"}), _result("e1", json.dumps({"name": "alpha"}), is_error=True), ()),
-        ("skill success:false", _call("e2", "skill_view", {"name": "alpha"}), _result("e2", json.dumps({"success": False, "name": "alpha"})), ()),
-        ("skill error key", _call("e3", "skill_view", {"name": "alpha"}), _result("e3", json.dumps({"error": "boom", "name": "alpha"})), ()),
-        ("read text prefix error not found", _call("e4", "read_file", {"path": "/skills/beta/references/rules.md"}), _result("e4", "Error: file not found"), ()),
+        ("custom tool JSON success:false does not load", _call("e1", "custom_load", {"path": "/skills/alpha/SKILL.md"}), _result("e1", json.dumps({"success": False}), "custom_load"), ()),
+        ("custom tool JSON isError does not load", _call("e2", "custom_load", {"path": "/skills/alpha/SKILL.md"}), _result("e2", json.dumps({"isError": True, "name": "alpha"}), "custom_load"), ()),
+        ("custom tool JSON error key does not load", _call("e3", "custom_load", {"path": "/skills/alpha/SKILL.md"}), _result("e3", json.dumps({"error": "boom"}), "custom_load"), ()),
+        ("skill isError does not load", _call("e4", "skill_view", {"name": "alpha"}), _result("e4", json.dumps({"name": "alpha"}), is_error=True), ()),
+        ("read text prefix error not found does not load", _call("e5", "read_file", {"path": "/skills/beta/references/rules.md"}), _result("e5", "Error: file not found"), ()),
         # A matched result with a matched name and no failure signal is a load: this is
         # the positive control, so the rows above fail only on their own signal.
+        ("custom tool JSON success loads", _call("e6", "custom_load", {"path": "/skills/alpha/SKILL.md"}), _result("e6", json.dumps({"success": True}), "custom_load"), ("alpha",)),
         ("read text succeeds", _call("e7", "read_file", {"path": "/skills/beta/SKILL.md"}), _result("e7", "# beta instructions\n"), ("beta",)),
     ]
     # Each label carries the parser keyword it pins (isError, success:false, error key),
     # because pytest drops a failing row's assertion message and only the function's
     # docstring survives in the failure output.
     for label, call, result, expected in cases:
-        loaded = lr.loaded_skills([call], _results(result), KNOWN, PATH_MAP, _tools())
+        tools = _tools("custom_load") if call["function"]["name"] == "custom_load" else _tools()
+        loaded = lr.loaded_skills([call], _results(result), KNOWN, PATH_MAP, tools)
         assert tuple(loaded) == expected, label
     custom_cases = [
-        ("custom tool error text prefix", _result("e5", "tool error: denied")),
-        ("custom tool success:false plus error name", _result("e5", json.dumps({"success": False, "name": "alpha"}))),
+        ("custom tool name shape JSON success:false does not load", _call("e8", "custom_load", {"name": "alpha"}), _result("e8", json.dumps({"success": False, "name": "alpha"}), "custom_load")),
+        ("custom tool error text prefix does not load", _call("e9", "custom_load", {"name": "alpha"}), _result("e9", "tool error: denied", "custom_load")),
     ]
-    for label, result in custom_cases:
-        loaded = lr.loaded_skills(
-            [_call("e5", "custom_load", {"name": "alpha"})],
-            _results(result),
-            KNOWN, PATH_MAP, _tools("custom_load"),
-        )
+    for label, call, result in custom_cases:
+        loaded = lr.loaded_skills([call], _results(result), KNOWN, PATH_MAP, _tools("custom_load"))
         assert loaded == [], label
     legacy = lr.loaded_skills(
         [_call("e6", "read_file", {"file_path": "/skills/alpha/SKILL.md"})],
