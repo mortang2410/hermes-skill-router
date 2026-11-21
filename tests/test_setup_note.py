@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ for entry in (ROOT, ROOT / "tests"):
 from fake_endpoint import FakeEndpoint, Request, Response  # noqa: E402
 from hermes_skill_router import embed as embed_module  # noqa: E402
 from hermes_skill_router import rerank as rerank_module  # noqa: E402
+from hermes_skill_router import setup_check  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
 from hermes_skill_router.display import read  # noqa: E402
 from hermes_skill_router.library import Index  # noqa: E402
@@ -149,6 +151,17 @@ def _config(tmp_path, embed: FakeEndpoint, rerank: FakeEndpoint, **overrides):
     }
     settings.update(overrides)
     return load(settings)
+
+
+@contextmanager
+def monkeypatch_context(module, name, value):
+    """Swap one module attribute for the block, restoring it even when the block raises."""
+    saved = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, saved)
 
 
 def _turn(cfg, **kwargs):
@@ -282,19 +295,31 @@ def test_a_dead_endpoint_turn_stays_within_the_routing_budget(tmp_path):
             rerankTimeoutMs=5000,
             routingTimeoutMs=1000,
         )
+        # The load-proof observer is the budget each probe asks for, not the wall clock and
+        # not the request counts: the fake short-circuits after the embed failure, so a
+        # probe that ignores the deadline sends the same request count and costs ~0.6 s
+        # more, and no request-count or elapsed bound can see it under load.
+        budgets = []
+        original_request = setup_check._json_request
+
+        def observing_request(url, *, body, timeout):
+            budgets.append(timeout)
+            return original_request(url, body=body, timeout=timeout)
+
         started = time.perf_counter()
-        result = _turn(cfg)
+        with monkeypatch_context(setup_check, "_json_request", observing_request):
+            result = _turn(cfg)
         elapsed = time.perf_counter() - started
         assert result is None, "a dead endpoint leaves the request unchanged"
         assert read(cfg)["status"] == "inert"
-        assert elapsed >= 0.7, f"the delayed endpoints must actually delay: {elapsed:.3f}s"
-        # The pre-fix probe ran two full 0.8 s timeouts after a 0.8 s rank and took
-        # ~2.4 s. A 2.0 s ceiling still fails that regression while leaving a full
-        # second of slack for a loaded runner, where a 0.5 s margin flaked once.
-        assert elapsed < 2.0, (
-            "the turn must stay within the 1.0s routing budget plus load slack, "
-            f"took {elapsed:.3f}s"
+        # The endpoints answer after 0.8 s with a 5 s configured timeout. Every probe that
+        # asks inside the budget must ask for what is left of it, never the full 5 s: a probe
+        # that lost the deadline cap asks for the full timeout, which is the regression.
+        assert budgets and all(budget < 5.0 for budget in budgets), (
+            f"a probe asked a full 5 s timeout after the budget was spent: {budgets!r}"
         )
+        # The wall clock keeps the pre-existing ~1.6 s observation as a soft bound only.
+        assert elapsed < 2.0, f"the turn must stay within the routing budget plus slack: {elapsed:.3f}s"
     finally:
         embed.close()
         rerank.close()
