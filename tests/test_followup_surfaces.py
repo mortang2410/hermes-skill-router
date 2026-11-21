@@ -258,7 +258,9 @@ def test_a_healthy_turn_after_a_degraded_one_writes_a_note_free_record(tmp_path,
     assert stored["note"] == "", "a healthy turn must write a note-free record"
     # The stale-line rule is record-scoped: the healthy turn writes its own fresh
     # block with no degraded note and replays no bytes from turn 1 (D8/D9).
-    assert _last_block(second) != _last_block(first), "turn 1's block is never re-inserted"
+    # Round-2 F24: inequality alone would pass on any byte drift. Pin the
+    # absence of turn 1's exact block bytes in the fresh block.
+    assert _last_block(first) not in _last_block(second), "turn 1's block is never re-inserted"
     assert "History incomplete" not in _last_block(second), "no stale note in the fresh block"
 
 
@@ -406,9 +408,22 @@ import plugin, { summary } from './plugin.mjs'
     + """
 const NOTE = __NOTE__
 const STAMP = '2026-11-10T07:20:31Z'
+const record = { at: STAMP, names: ['alpha', 'beta'], note: NOTE, origin: 'turn', status: 'routed', turn_id: 'turn-1' }
 const out = {}
-out.summary = summary({ at: STAMP, names: ['alpha', 'beta'], note: NOTE, origin: 'turn', status: 'routed', turn_id: 'turn-1' })
-out.cleared = summary({ at: STAMP, names: ['alpha', 'beta'], note: '', origin: 'turn', status: 'routed', turn_id: 'turn-1' })
+out.summary = summary(record)
+out.cleared = summary({ ...record, note: '' })
+// Round-2 F19: actually mount and render the pane; summary alone never paints it.
+const panes = []
+plugin.register({
+  register: descriptor => panes.push(descriptor),
+  rest: async () => record,
+  onEvent: () => {}
+})
+globalThis.__t8Result = { data: record, isPending: false, error: null }
+const pane = panes[0].render()
+// The pane descriptor returns a lazy element; invoke its component so the
+// hooks run and the note paragraph is in the tree the way a mount would paint it.
+out.rendered = text(typeof pane.type === 'function' ? pane.type(pane.props) : pane)
 console.log(JSON.stringify(out))
 """
 )
@@ -485,7 +500,8 @@ def test_the_desktop_pane_renders_the_multi_part_note_without_truncation(tmp_pat
     driver = DESKTOP_DRIVER.replace("__NOTE__", json.dumps(MULTI_PART_NOTE))
     out = _run_node_driver(tmp_path / "desktop", driver, files)
 
-    assert out["summary"]["note"] == MULTI_PART_NOTE, "the pane must carry the full multi-part line"
+    assert out["summary"]["note"] == MULTI_PART_NOTE, "the summary must carry the full note"
+    assert MULTI_PART_NOTE in out["rendered"], "the mounted pane must paint the full multi-part line"
     assert out["cleared"]["note"] == "", "a note-free record must not resurrect the degraded line"
 
     source = DESKTOP_PLUGIN_PATH.read_text(encoding="utf-8")

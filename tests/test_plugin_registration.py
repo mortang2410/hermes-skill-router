@@ -512,7 +512,12 @@ def test_hermes_plugins_validate_accepts_the_manifest(tmp_path):
         capture_output=True,
         text=True,
         timeout=180,
-        env={**os.environ, "HERMES_HOME": str(tmp_path / "hermes-home")},
+        env={
+            **os.environ,
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            # Round-2 F22: never let validate trigger lazy installs or network access.
+            "HERMES_DISABLE_LAZY_INSTALLS": "1",
+        },
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -520,9 +525,9 @@ def test_hermes_plugins_validate_accepts_the_manifest(tmp_path):
     assert "declared middleware" in completed.stdout
 
 
-def test_the_resolved_host_catalogue_contains_post_compaction(hermes):
-    """The host the suite resolved can deliver the hook the plugin registers (C26)."""
-    assert "post_compaction" in hermes.plugins.VALID_HOOKS
+def test_the_resolved_host_catalogue_contains_both_registered_hooks(hermes):
+    """Round-2 F48: the host accepts every hook the plugin registers (C26)."""
+    assert {"post_compaction", "on_session_end"} <= set(hermes.plugins.VALID_HOOKS)
 
 
 def test_the_resolver_skips_when_no_host_resolves(monkeypatch):
@@ -538,9 +543,12 @@ def test_the_resolver_skips_when_no_host_resolves(monkeypatch):
 
 def test_the_resolver_reads_the_launcher_shim_when_the_report_lacks_the_line(monkeypatch):
     """A paused-update banner can leave the report without the install line; the shim still names it."""
-    real = resolve_host_tree()
     module = sys.modules[__name__]
+    # Round-2 F47: clear the override, force the launcher path, and make the shim
+    # the only possible source of the answer so the fallback is actually exercised.
+    monkeypatch.delenv("HERMES_AGENT_ROOT", raising=False)
     monkeypatch.setattr(module, "_HOST_TREE", {})
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/hermes")
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -548,8 +556,10 @@ def test_the_resolver_reads_the_launcher_shim_when_the_report_lacks_the_line(mon
             args, 0, stdout="hermes: update banner\n", stderr=""
         ),
     )
+    shim_tree = ROOT
+    monkeypatch.setattr(module, "_shim_install", lambda launcher: shim_tree)
 
-    assert resolve_host_tree() == real
+    assert resolve_host_tree() == shim_tree
 
 
 def test_manifest_load_warns_once_about_the_unknown_field(hermes, caplog):
@@ -724,6 +734,10 @@ def test_a_chat_completions_dispatch_routes_the_same_payload(
     assert set(explicit) == {"request"}
     assert "## Skills" not in explicit["request"]["messages"][0]["content"]
     assert "<available_skills>" not in explicit["request"]["messages"][0]["content"]
+    # Round-2 F21: stripping alone is not the contract; a suggestion block must
+    # replace the catalog on the same request.
+    assert explicit["request"]["messages"][-1]["content"].startswith("Skills routed for this request")
+    assert "- beta:" in explicit["request"]["messages"][-1]["content"]
 
     without_mode = {key: value for key, value in DISPATCH_KWARGS.items() if key != "api_mode"}
     defaulted = callback(request=_catalog_payload(), **without_mode)
@@ -734,15 +748,24 @@ def test_a_chat_completions_dispatch_routes_the_same_payload(
 def test_three_requests_warn_once_about_an_unknown_eager_skill(
     plugin_module, catalog_endpoints, tmp_path, caplog
 ):
-    from hermes_skill_router import catalog as catalog_module
-
-    catalog_module._LOGGED.clear()
+    # Round-2 F20: the plugin loads its own catalog copy; clearing the top-level
+    # set and watching the top-level logger cannot observe this warning at all.
+    prefix = plugin_module.__name__ + "."
+    plugin_catalogs = [
+        module
+        for name, module in list(sys.modules.items())
+        if name.startswith(prefix) and name.endswith(".catalog") and hasattr(module, "_LOGGED")
+    ]
+    assert plugin_catalogs, "the plugin must have loaded its own catalog copy"
+    for module in plugin_catalogs:
+        module._LOGGED.clear()
+    plugin_catalog = plugin_catalogs[0]
     settings = _catalog_settings(catalog_endpoints, tmp_path / "suggestions.json")
     settings["eagerSkills"] = ["typo-skill"]
     callback = _callback(plugin_module, settings)
     payload = _catalog_payload()
 
-    with caplog.at_level(logging.WARNING, logger="hermes_skill_router.catalog"):
+    with caplog.at_level(logging.WARNING, logger=plugin_catalog.logger.name):
         for _ in range(3):
             callback(request=payload, **DISPATCH_KWARGS)
 

@@ -11,7 +11,6 @@ query, the scored shortlist, the cutoff, the suggestions and the stage timings.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -26,7 +25,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from hermes_skill_router import config as hermes_config  # noqa: E402
 from hermes_skill_router import inject as inject_module  # noqa: E402
 from hermes_skill_router import library as library_module  # noqa: E402
 from hermes_skill_router import router as router_module  # noqa: E402
@@ -229,6 +227,12 @@ def _fresh_process_state(monkeypatch):
     monkeypatch.setattr(router_module, "_LOGGED", set())
     monkeypatch.setattr(library_module, "_MEMO", {})
     monkeypatch.setattr(inject_module, "_PINNED_WARNED", set())
+    # Round-2 F54: the writeback latches are process state too. Without this
+    # clear a stripped mark from an earlier test reaches the next window.
+    from hermes_skill_router import writeback as writeback_module
+    with writeback_module._STRIPPED_LOCK:
+        writeback_module._STRIPPED_FALLBACK.clear()
+    writeback_module._WRITTEN_PATHS.clear()
     monkeypatch.setattr(router_module, "skill_path", lambda name: f"/skills/{name}/SKILL.md")
 
 
@@ -2835,8 +2839,9 @@ def _stored_window(session_id, cfg):
     from hermes_skill_router import writeback as wb
 
     path = wb.store_path(cfg.cache_path)
-    if not path or not Path(path).exists():
-        return {"blocks": [], "generation": 0}
+    # Round-2 F15: a missing store must fail here, not silently look like an
+    # empty window and let every store assertion pass vacuously.
+    assert path and Path(path).exists(), f"the writeback store must be configured: {path}"
     return json.loads(Path(path).read_text(encoding="utf-8")).get("windows", {}).get(
         session_id, {"blocks": [], "generation": 0}
     )
@@ -3075,7 +3080,10 @@ def test_a_second_turn_after_a_routed_block_does_not_re_dump(tmp_path):
         second_input, cfg=cfg, index=index, embed=FakeEmbedder(result=None), rerank=FakeReranker()
     )
 
-    assert second is None or "## Skills" not in second["request"]["messages"][0]["content"]
+    # Round-2 F14: a re-dump returns None and the middleware keeps the original
+    # catalog; that is the regression this test names, so a None result fails.
+    assert second is not None, "a routed turn must keep its stripped state, not re-dump"
+    assert "## Skills" not in second["request"]["messages"][0]["content"]
 
 
 

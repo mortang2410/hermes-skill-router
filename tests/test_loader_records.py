@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from hermes_skill_router import loader_records as lr  # noqa: E402
-from hermes_skill_router.config import Config, load  # noqa: E402
+from hermes_skill_router.config import load  # noqa: E402
 from hermes_skill_router.select import select  # noqa: E402
 
 KNOWN = {"alpha", "beta"}
@@ -59,7 +59,7 @@ def test_fixed_tool_names_are_always_recognised():
     assert _tools() == {"skill_view": "name", "read_file": "path"}
 
 
-def test_custom_names_are_normalised_and_cached(monkeypatch):
+def test_custom_names_are_normalised_and_cached():
     cfg = load({"skillLoadingTools": [" custom_load ", "custom_load", "", "second"]})
     assert cfg.skill_loading_tools == ("custom_load", "second")
     tools = lr.tool_name_set(cfg)

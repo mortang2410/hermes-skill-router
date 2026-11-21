@@ -819,26 +819,40 @@ def test_a_review_shaped_request_routes_and_keeps_its_tools(plugin_module, endpo
     assert [block for _index, block in stored] == [rewritten["messages"][-1]["content"]]
 
 
-def test_prior_review_blocks_reinsert_and_suppress_without_carrying_them(
+def test_a_prior_review_block_is_not_reinserted_from_the_store(
     plugin_module, endpoints, tmp_path
 ):
-    """The fork's earlier block is too old for the digest tail: the origin store carries it.
+    """Round-2 F17: the origin store is bookkeeping only, never a replay source.
 
-    Turn 2's payload does not carry turn 1's block (the routed fork replays a digest),
-    yet the block re-inserts byte-identical and its names stay suppressed.
+    The fork's earlier block is absent from turn 2's digest-only payload. The
+    store still carries it, but the router must render from the payload it got:
+    turn 2 presents a different catalog, so turn 1's bytes must not reappear.
     """
+    from hermes_skill_router import writeback as wb
+
     callback = _callback_for(plugin_module, settings_for(endpoints, tmp_path / "suggestions.json"))
     kwargs = _review_kwargs("session-review-2", "task-review-2")
 
     first = callback(request=_review_payload(), **kwargs)
     block = first["request"]["messages"][-1]["content"]
     assert "- beta:" in block
+    gen = wb.generation("session-review-2", None)
+    stored = wb.stored_blocks("session-review-2", wb.ORIGIN_REVIEW, gen, None)
+    assert [text for _index, text in stored] == [block], "the store keeps the block for bookkeeping"
 
-    second = callback(request=_review_payload(), **kwargs)
+    digest_payload = _review_payload()
+    digest_payload["messages"][0] = {
+        "role": "system",
+        "content": SYSTEM.replace("    - beta: Beta skill\n", ""),
+    }
+    second = callback(request=digest_payload, **kwargs)
     assert second is not None
-    contents = [message["content"] for message in second["request"]["messages"]]
-    assert block in contents, "the stored review block re-inserts byte-identical"
-    assert sum(content.count("- beta:") for content in contents) == 1, "beta never repeats"
+    contents = [
+        message["content"]
+        for message in second["request"]["messages"]
+        if isinstance(message.get("content"), str)
+    ]
+    assert block not in contents, "a stored block must never be re-inserted into a later request"
 
 
 def test_a_normal_block_never_reinserts_into_a_review_payload(plugin_module, endpoints, tmp_path):
@@ -902,11 +916,17 @@ def _loaded_payload(tool, arguments, content, *, call_id="c9-load"):
 
 
 def _last_text(result):
-    """The appended block (or degraded note) is the only place a suggestion can appear."""
-    if result is None:
-        return ""
+    """The appended block (or degraded note) is the only place a suggestion can appear.
+
+    Round-2 F18: an absence assertion over an empty string cannot distinguish a
+    suppressed row from a rewrite that never ran, so a missing result fails here
+    and every suppression test must account for its real no-block outcome.
+    """
+    assert result is not None, "a suppression check needs a real rewrite result"
     last = result["request"]["messages"][-1]
-    return last.get("content", "") if isinstance(last, dict) else ""
+    content = last.get("content", "") if isinstance(last, dict) else ""
+    assert isinstance(content, str) and content.strip(), "the rewrite must emit a real last message"
+    return content
 
 
 def test_a_shortlist_only_loser_stays_suggestable(plugin_module, endpoints, tmp_path):
