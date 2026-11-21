@@ -259,16 +259,52 @@ def _stand_in(callback, request, **context):
 # ---------------------------------------------------------------------------
 
 
+def _reset_shared_router_state():
+    """Clear process-wide router state in every module copy, including the plugin's own.
+
+    Loading the plugin entry point creates a second copy of every submodule under its
+    package prefix, with its own dump set, health gate, stripped latch and log-once set.
+    A first failure in an earlier test marks one of those copies, and resetting only the
+    top-level module leaves the next rewrite in a dumped window or with a poisoned
+    endpoint. Every test starts from a clean window by resetting each copy here.
+    """
+    for name, module in list(sys.modules.items()):
+        if not (
+            name == "hermes_skill_router"
+            or name.startswith("hermes_skill_router.")
+            or ".hermes_skill_router." in name
+        ):
+            continue
+        if module is None:
+            continue
+        clear_dumps = getattr(module, "clear_dumps", None)
+        if callable(clear_dumps):
+            clear_dumps()
+        health = getattr(module, "HEALTH", None)
+        if health is not None and hasattr(health, "reset"):
+            health.reset()
+        logged = getattr(module, "_LOGGED", None)
+        if isinstance(logged, set):
+            logged.clear()
+        fallback = getattr(module, "_STRIPPED_FALLBACK", None)
+        if isinstance(fallback, set):
+            lock = getattr(module, "_STRIPPED_LOCK", None)
+            if lock is not None:
+                with lock:
+                    fallback.clear()
+            else:
+                fallback.clear()
+
+
 @pytest.fixture(autouse=True)
 def _host_paths(monkeypatch):
-    """The host lookup resolves every name, and no dump record leaks between tests."""
+    """The host lookup resolves every name, and no shared state leaks between tests."""
     from hermes_skill_router import router as router_module
-    from hermes_skill_router import search as search_module
 
     # The broadcast is best effort and imports the host's gateway stack, which this process cannot
     # load; the display record is the seam these tests assert.
     monkeypatch.setattr(router_module, "_broadcast", lambda turn_id: None)
-    search_module.clear_dumps()
+    _reset_shared_router_state()
     resolver = lambda name: f"/skills/{name}/SKILL.md"
     for module_name, module in list(sys.modules.items()):
         if module_name.endswith("router") and hasattr(module, "skill_path"):
@@ -926,3 +962,40 @@ def test_an_unconfigured_custom_tool_does_not_suppress(plugin_module, endpoints,
     )
     result = callback(request=payload, **_c9_kwargs("c9-unconfigured"))
     assert "- beta:" in _last_text(result)
+
+
+class TestPluginModuleSharedStateIsReset:
+    """Round-2 H1: a first-failure dump mark in the plugin's own search copy must not survive.
+
+    An earlier test that drives the plugin through its own module copy leaves a dump mark in that
+    copy's private dumped set. The top-level module's clear_dumps() cannot reach it, so the next
+    rewrite sees a window that was already dumped and returns the payload unchanged. The
+    class-scoped fixture plants the mark before the method-scoped autouse fixture runs, so the
+    rewrite must still see a clean window. Without the fixture reset this test fails with an
+    unchanged payload (and no routed block), which is the full-suite failure's first symptom.
+    """
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _plant_dump_mark(cls, plugin_module):
+        prefix = plugin_module.__name__ + "."
+        for name, module in list(sys.modules.items()):
+            if (
+                name.startswith(prefix)
+                and name.endswith(".search")
+                and hasattr(module, "remember_dump")
+            ):
+                module.remember_dump("session-1")
+
+    def test_a_routed_rewrite_survives_a_poisoned_previous_test(
+        self, plugin_module, endpoints, tmp_path
+    ):
+        callback = _callback_for(
+            plugin_module, settings_for(endpoints, tmp_path / "suggestions.json")
+        )
+        result = callback(request=chat_payload(), **DISPATCH_KWARGS)
+
+        assert result is not None, "the poisoned dump mark suppressed the whole rewrite"
+        assert result["request"]["messages"][-1]["content"].startswith(
+            "Skills routed for this request"
+        ), "the rewrite must route a fresh window, not return the catalog unchanged"
